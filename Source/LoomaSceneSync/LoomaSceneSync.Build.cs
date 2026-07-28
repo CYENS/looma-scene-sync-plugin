@@ -19,6 +19,12 @@ public class LoomaSceneSync : ModuleRules
         {
             "WebSockets",
             "Json",
+            // Generation-job REST calls (submit/select/regenerate/cancel, queue
+            // hydrate) and candidate/selected-image downloads.
+            "HTTP",
+            "JsonUtilities",
+            // Decode downloaded PNGs into UTexture2D (FImageUtils / IImageWrapper).
+            "ImageWrapper",
         });
     }
 }

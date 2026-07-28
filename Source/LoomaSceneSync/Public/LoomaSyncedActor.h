@@ -30,6 +30,10 @@ public:
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
     FString AssetId;
 
+    /** Generation job this instance came from, if it was spawned with one (else empty). */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    FString JobId;
+
     /** Display name from the catalog. */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
     FString DisplayName;

@@ -3,8 +3,14 @@
 #include "Dom/JsonObject.h"
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"
+#include "HttpModule.h"
+#include "Interfaces/IHttpRequest.h"
+#include "Interfaces/IHttpResponse.h"
 #include "IWebSocket.h"
+#include "LoomaGenerationHandle.h"
+#include "LoomaGenerationTypes.h"
 #include "LoomaSyncedActor.h"
+#include "LoomaWireConvert.h"
 #include "Misc/Guid.h"
 #include "Modules/ModuleManager.h"
 #include "Serialization/JsonReader.h"
@@ -19,70 +25,6 @@ namespace
 constexpr float ReconnectDelay = 2.0f;     // seconds between connection attempts
 constexpr float TransientInterval = 0.033f; // ~30 Hz live streaming
 constexpr int32 StillFramesForFinal = 10;   // rest frames before the final commit
-
-// --- Wire <-> UE conversion --------------------------------------------------
-// Wire: right-handed, Y-up, meters, quat [x,y,z,w]. UE: left-handed, Z-up, cm.
-//
-// Must match glTFRuntime's DEFAULT SceneBasis (glTFRuntimeParser.h,
-// FglTFRuntimeConfig::GetMatrix), which maps glTF -> UE as
-//   (x, y, z) -> (-z, x, y)      [glTF -Z forward -> UE +X forward, Y-up -> Z-up]
-// so mesh geometry and our actor transforms agree. The map flips handedness
-// (det = -1), so a rotation conjugates as: vector part through the axis map,
-// then negated; w unchanged:  q_UE = (qz, -qx, -qy, qw).
-
-FTransform WireToUe(const TSharedPtr<FJsonObject>& T)
-{
-    auto Num = [](const TArray<TSharedPtr<FJsonValue>>& A, int32 I, double Fallback) {
-        return A.IsValidIndex(I) ? A[I]->AsNumber() : Fallback;
-    };
-    const TArray<TSharedPtr<FJsonValue>>* P = nullptr;
-    const TArray<TSharedPtr<FJsonValue>>* Q = nullptr;
-    const TArray<TSharedPtr<FJsonValue>>* S = nullptr;
-    T->TryGetArrayField(TEXT("p"), P);
-    T->TryGetArrayField(TEXT("q"), Q);
-    T->TryGetArrayField(TEXT("s"), S);
-
-    FVector Location = FVector::ZeroVector;
-    FQuat Rotation = FQuat::Identity;
-    FVector Scale = FVector::OneVector;
-    if (P)
-    {
-        Location = FVector(-Num(*P, 2, 0) * 100.0, Num(*P, 0, 0) * 100.0, Num(*P, 1, 0) * 100.0);
-    }
-    if (Q)
-    {
-        Rotation = FQuat(Num(*Q, 2, 0), -Num(*Q, 0, 0), -Num(*Q, 1, 0), Num(*Q, 3, 1));
-        Rotation.Normalize();
-    }
-    if (S)
-    {
-        Scale = FVector(Num(*S, 2, 1), Num(*S, 0, 1), Num(*S, 1, 1));
-    }
-    return FTransform(Rotation, Location, Scale);
-}
-
-TSharedRef<FJsonObject> UeToWire(const FTransform& T)
-{
-    const FVector L = T.GetLocation();
-    const FQuat Q = T.GetRotation();
-    const FVector S = T.GetScale3D();
-
-    auto Arr = [](std::initializer_list<double> Values) {
-        TArray<TSharedPtr<FJsonValue>> Out;
-        for (double V : Values)
-        {
-            Out.Add(MakeShared<FJsonValueNumber>(V));
-        }
-        return Out;
-    };
-
-    // Inverse of the map above: UE (X, Y, Z) -> wire (Y, Z, -X).
-    TSharedRef<FJsonObject> Obj = MakeShared<FJsonObject>();
-    Obj->SetArrayField(TEXT("p"), Arr({ L.Y / 100.0, L.Z / 100.0, -L.X / 100.0 }));
-    Obj->SetArrayField(TEXT("q"), Arr({ -Q.Y, -Q.Z, Q.X, Q.W }));
-    Obj->SetArrayField(TEXT("s"), Arr({ S.Y, S.Z, S.X }));
-    return Obj;
-}
 } // namespace
 
 // --- Lifecycle ---------------------------------------------------------------
@@ -107,6 +49,9 @@ void ULoomaSceneSyncSubsystem::Deinitialize()
         Socket.Reset();
     }
     Tracked.Empty();
+    JobHandles.Empty();
+    PendingHandleReplays.Empty();
+    SuggestedTransforms.Empty();
     Super::Deinitialize();
 }
 
@@ -122,14 +67,20 @@ void ULoomaSceneSyncSubsystem::Connect()
         Hello->SetStringField(TEXT("clientId"), ClientId);
         Hello->SetStringField(TEXT("role"), TEXT("unreal"));
         SendJson(Hello);
+        OnSyncConnected.Broadcast();
+        // The WS never replays generation events to late joiners — pull the
+        // current queue over REST so cached jobs reflect all clients.
+        HydrateGenerationQueue();
     });
     Socket->OnConnectionError().AddWeakLambda(this, [this](const FString& Error) {
         UE_LOG(LogLoomaSync, Warning, TEXT("Connection error: %s (retrying)"), *Error);
         ReconnectCooldown = ReconnectDelay;
+        OnSyncDisconnected.Broadcast();
     });
     Socket->OnClosed().AddWeakLambda(this, [this](int32 Code, const FString& Reason, bool bWasClean) {
         UE_LOG(LogLoomaSync, Warning, TEXT("Socket closed (%d %s), retrying"), Code, *Reason);
         ReconnectCooldown = ReconnectDelay;
+        OnSyncDisconnected.Broadcast();
     });
     Socket->OnMessage().AddUObject(this, &ULoomaSceneSyncSubsystem::OnRawMessage);
     Socket->Connect();
@@ -183,6 +134,10 @@ void ULoomaSceneSyncSubsystem::OnRawMessage(const FString& Text)
     {
         HandleTransform(Msg);
     }
+    else if (Type == TEXT("generation"))
+    {
+        HandleGeneration(Msg);
+    }
     bApplyingRemote = false;
 }
 
@@ -227,7 +182,7 @@ void ULoomaSceneSyncSubsystem::UpsertRemoteObject(const TSharedPtr<FJsonObject>&
 
     const TSharedPtr<FJsonObject>* TField = nullptr;
     const FTransform Transform =
-        Obj->TryGetObjectField(TEXT("t"), TField) ? WireToUe(*TField) : FTransform::Identity;
+        Obj->TryGetObjectField(TEXT("t"), TField) ? LoomaWireToUe(*TField) : FTransform::Identity;
 
     if (FLoomaTrackedActor* Existing = Tracked.Find(Guid))
     {
@@ -257,6 +212,9 @@ void ULoomaSceneSyncSubsystem::UpsertRemoteObject(const TSharedPtr<FJsonObject>&
     Actor->Guid = Guid;
     Actor->AssetId = Obj->GetStringField(TEXT("assetId"));
     Actor->DisplayName = Obj->GetStringField(TEXT("name"));
+    // A spawn may carry the generation job that produced it (see SpawnSyncedAsset)
+    // so a Blueprint orb can match this real model to its placeholder.
+    Obj->TryGetStringField(TEXT("jobId"), Actor->JobId);
 #if WITH_EDITOR
     Actor->SetActorLabel(Actor->DisplayName.IsEmpty() ? Guid : Actor->DisplayName);
 #endif
@@ -318,7 +276,7 @@ void ULoomaSceneSyncSubsystem::HandleTransform(const TSharedPtr<FJsonObject>& Ms
         {
             continue;
         }
-        const FTransform Target = WireToUe(*TField);
+        const FTransform Target = LoomaWireToUe(*TField);
         if (ALoomaSyncedActor* Actor = Entry->Actor.Get())
         {
             Actor->SetRemoteTarget(Target, /*bSnap=*/!bTransient);
@@ -354,6 +312,10 @@ void ULoomaSceneSyncSubsystem::OnSyncedActorDestroyed(AActor* DestroyedActor)
 
 void ULoomaSceneSyncSubsystem::Tick(float DeltaTime)
 {
+    // Before anything else, and regardless of connection state: a handle created
+    // last frame for an already-known job has had a frame to be bound.
+    FlushPendingHandleReplays();
+
     if (ReconnectCooldown > 0.0f)
     {
         ReconnectCooldown -= DeltaTime;
@@ -435,7 +397,7 @@ void ULoomaSceneSyncSubsystem::SendTransforms(const TArray<FString>& Guids, bool
         }
         TSharedRef<FJsonObject> Obj = MakeShared<FJsonObject>();
         Obj->SetStringField(TEXT("guid"), Guid);
-        Obj->SetObjectField(TEXT("t"), UeToWire(Actor->GetActorTransform()));
+        Obj->SetObjectField(TEXT("t"), LoomaUeToWire(Actor->GetActorTransform()));
         Objects.Add(MakeShared<FJsonValueObject>(Obj));
     }
     if (Objects.Num() == 0)
@@ -461,7 +423,8 @@ bool ULoomaSceneSyncSubsystem::IsTickable() const
 
 // --- Local spawning (Unreal -> web) -------------------------------------------
 
-ALoomaSyncedActor* ULoomaSceneSyncSubsystem::SpawnSyncedAsset(const FString& AssetId, const FString& Name, const FTransform& Transform)
+ALoomaSyncedActor* ULoomaSceneSyncSubsystem::SpawnSyncedAsset(const FString& AssetId, const FString& Name,
+    const FTransform& Transform, const FString& JobId)
 {
     UWorld* World = GetGameInstance() ? GetGameInstance()->GetWorld() : nullptr;
     if (!World)
@@ -480,6 +443,7 @@ ALoomaSyncedActor* ULoomaSceneSyncSubsystem::SpawnSyncedAsset(const FString& Ass
     Actor->Guid = FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphens).ToLower();
     Actor->AssetId = AssetId;
     Actor->DisplayName = Name.IsEmpty() ? AssetId : Name;
+    Actor->JobId = JobId;
     Actor->OnDestroyed.AddDynamic(this, &ULoomaSceneSyncSubsystem::OnSyncedActorDestroyed);
     Actor->LoadMeshFromUrl(FString::Printf(TEXT("http://%s/static/%s.glb"), *BackendHost, *AssetId));
 
@@ -492,7 +456,13 @@ ALoomaSyncedActor* ULoomaSceneSyncSubsystem::SpawnSyncedAsset(const FString& Ass
     Obj->SetStringField(TEXT("guid"), Actor->Guid);
     Obj->SetStringField(TEXT("assetId"), AssetId);
     Obj->SetStringField(TEXT("name"), Actor->DisplayName);
-    Obj->SetObjectField(TEXT("t"), UeToWire(Transform));
+    Obj->SetObjectField(TEXT("t"), LoomaUeToWire(Transform));
+    if (!JobId.IsEmpty())
+    {
+        // Tells peers which generation job this instance came from, so they can
+        // match it to a placeholder of their own.
+        Obj->SetStringField(TEXT("jobId"), JobId);
+    }
 
     TSharedRef<FJsonObject> Msg = MakeShared<FJsonObject>();
     Msg->SetStringField(TEXT("type"), TEXT("spawn"));
@@ -510,4 +480,306 @@ void ULoomaSceneSyncSubsystem::DespawnSyncedActor(ALoomaSyncedActor* Actor)
     {
         Actor->Destroy(); // OnSyncedActorDestroyed broadcasts the despawn
     }
+}
+
+// --- Generation jobs ----------------------------------------------------------
+
+void ULoomaSceneSyncSubsystem::HandleGeneration(const TSharedPtr<FJsonObject>& Msg)
+{
+    const TSharedPtr<FJsonObject>* JobField = nullptr;
+    if (!Msg->TryGetObjectField(TEXT("job"), JobField) || !JobField)
+    {
+        return;
+    }
+    const FLoomaGenerationJob Job = LoomaParseGenerationJob(*JobField);
+    if (Job.JobId.IsEmpty())
+    {
+        return;
+    }
+    ApplyJob(Job);
+}
+
+void ULoomaSceneSyncSubsystem::ApplyJob(const FLoomaGenerationJob& InJob)
+{
+    FLoomaGenerationJob Job = InJob;
+    // The suggested spawn pose is set once, at submit, and never cleared — but the
+    // backend announces the job before storing it, so early events arrive without
+    // one. Learn it the first time we see it, then merge it into every later
+    // snapshot so the cache, the hub-wide events and the handles all agree.
+    if (Job.bHasSuggestedTransform)
+    {
+        SuggestedTransforms.Add(Job.JobId, Job.SuggestedTransform);
+    }
+    else if (const FTransform* Known = SuggestedTransforms.Find(Job.JobId))
+    {
+        Job.SuggestedTransform = *Known;
+        Job.bHasSuggestedTransform = true;
+    }
+
+    Jobs.Add(Job.JobId, Job);
+    OnGenerationJobUpdated.Broadcast(Job);
+    switch (Job.State)
+    {
+    case ELoomaJobState::AwaitingImage:
+        OnGenerationImagesReady.Broadcast(Job);
+        break;
+    case ELoomaJobState::Done:
+        OnGenerationJobDone.Broadcast(Job);
+        break;
+    case ELoomaJobState::Failed:
+        OnGenerationJobFailed.Broadcast(Job);
+        break;
+    default:
+        break;
+    }
+
+    // Then the per-job listeners, if anyone asked for a handle on this job.
+    if (const TObjectPtr<ULoomaGenerationHandle>* Found = JobHandles.Find(Job.JobId))
+    {
+        if (ULoomaGenerationHandle* Handle = Found->Get())
+        {
+            Handle->Apply(Job);
+        }
+    }
+}
+
+void ULoomaSceneSyncSubsystem::NoteSuggestedTransform(const FString& JobId, const FTransform& SuggestedTransform)
+{
+    if (JobId.IsEmpty())
+    {
+        return;
+    }
+    SuggestedTransforms.Add(JobId, SuggestedTransform);
+
+    // Patch a snapshot that already landed without the pose, plus any handle
+    // already handed out, so nothing has to wait for the next event.
+    if (FLoomaGenerationJob* Cached = Jobs.Find(JobId))
+    {
+        Cached->SuggestedTransform = SuggestedTransform;
+        Cached->bHasSuggestedTransform = true;
+    }
+    if (const TObjectPtr<ULoomaGenerationHandle>* Found = JobHandles.Find(JobId))
+    {
+        if (ULoomaGenerationHandle* Handle = Found->Get())
+        {
+            Handle->SeedTransform(SuggestedTransform);
+        }
+    }
+}
+
+ULoomaGenerationHandle* ULoomaSceneSyncSubsystem::GetGenerationHandle(const FString& JobId)
+{
+    if (JobId.IsEmpty())
+    {
+        return nullptr;
+    }
+    if (const TObjectPtr<ULoomaGenerationHandle>* Found = JobHandles.Find(JobId))
+    {
+        if (ULoomaGenerationHandle* Existing = Found->Get())
+        {
+            return Existing;
+        }
+    }
+
+    ULoomaGenerationHandle* Handle = NewObject<ULoomaGenerationHandle>(this);
+    Handle->JobId = JobId;
+    JobHandles.Add(JobId, Handle);
+
+    // If the job is already known, replay it — but next tick, so the caller has
+    // this frame to bind its events. Submitting a new job hits neither branch:
+    // there is nothing cached yet, and the first real event arrives over the WS.
+    if (Jobs.Contains(JobId))
+    {
+        PendingHandleReplays.AddUnique(JobId);
+    }
+    return Handle;
+}
+
+void ULoomaSceneSyncSubsystem::FlushPendingHandleReplays()
+{
+    if (PendingHandleReplays.IsEmpty())
+    {
+        return;
+    }
+    TArray<FString> Pending = MoveTemp(PendingHandleReplays);
+    PendingHandleReplays.Reset();
+    for (const FString& JobId : Pending)
+    {
+        const TObjectPtr<ULoomaGenerationHandle>* Found = JobHandles.Find(JobId);
+        ULoomaGenerationHandle* Handle = Found ? Found->Get() : nullptr;
+        const FLoomaGenerationJob* Known = Jobs.Find(JobId);
+        // Skip if a live event already reached the handle first — it carried at
+        // least as fresh a snapshot as the cache, and re-applying would repeat
+        // OnUpdated for no reason.
+        if (Handle && Known && !Handle->bHasApplied)
+        {
+            Handle->Apply(*Known);
+        }
+    }
+}
+
+void ULoomaSceneSyncSubsystem::HydrateGenerationQueue()
+{
+    const TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Request = FHttpModule::Get().CreateRequest();
+    Request->SetURL(GetRestBase() + TEXT("/generate"));
+    Request->SetVerb(TEXT("GET"));
+    Request->OnProcessRequestComplete().BindWeakLambda(this,
+        [this](FHttpRequestPtr Req, FHttpResponsePtr Resp, bool bOk) {
+            if (!bOk || !Resp.IsValid() || Resp->GetResponseCode() >= 300)
+            {
+                UE_LOG(LogLoomaSync, Warning, TEXT("GET /generate hydrate failed (%d)"),
+                    Resp.IsValid() ? Resp->GetResponseCode() : 0);
+                return;
+            }
+            TArray<TSharedPtr<FJsonValue>> Items;
+            const TSharedRef<TJsonReader<TCHAR>> Reader = TJsonReaderFactory<TCHAR>::Create(Resp->GetContentAsString());
+            if (!FJsonSerializer::Deserialize(Reader, Items))
+            {
+                return;
+            }
+            int32 Count = 0;
+            for (const TSharedPtr<FJsonValue>& V : Items)
+            {
+                const FLoomaGenerationJob Job = LoomaParseGenerationJob(V->AsObject());
+                if (!Job.JobId.IsEmpty())
+                {
+                    ApplyJob(Job);
+                    ++Count;
+                }
+            }
+            UE_LOG(LogLoomaSync, Log, TEXT("Hydrated %d generation job(s)"), Count);
+        });
+    Request->ProcessRequest();
+}
+
+void ULoomaSceneSyncSubsystem::SendRest(const FString& Verb, const FString& Path, const TSharedPtr<FJsonObject>& Body)
+{
+    const TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Request = FHttpModule::Get().CreateRequest();
+    Request->SetURL(GetRestBase() + Path);
+    Request->SetVerb(Verb);
+    if (Body.IsValid())
+    {
+        Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
+        FString BodyText;
+        const TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
+            TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&BodyText);
+        FJsonSerializer::Serialize(Body.ToSharedRef(), Writer);
+        Request->SetContentAsString(BodyText);
+    }
+    Request->OnProcessRequestComplete().BindWeakLambda(this,
+        [Verb, Path](FHttpRequestPtr Req, FHttpResponsePtr Resp, bool bOk) {
+            if (!bOk || !Resp.IsValid() || Resp->GetResponseCode() >= 300)
+            {
+                UE_LOG(LogLoomaSync, Warning, TEXT("REST %s %s failed (%d)"),
+                    *Verb, *Path, Resp.IsValid() ? Resp->GetResponseCode() : 0);
+            }
+            // On success the resulting state arrives over the WS `generation` event.
+        });
+    Request->ProcessRequest();
+}
+
+bool ULoomaSceneSyncSubsystem::GetGenerationJob(const FString& JobId, FLoomaGenerationJob& OutJob) const
+{
+    if (const FLoomaGenerationJob* Found = Jobs.Find(JobId))
+    {
+        OutJob = *Found;
+        return true;
+    }
+    return false;
+}
+
+TArray<FLoomaGenerationJob> ULoomaSceneSyncSubsystem::GetAllGenerationJobs() const
+{
+    TArray<FLoomaGenerationJob> Out;
+    Jobs.GenerateValueArray(Out);
+    return Out;
+}
+
+ALoomaSyncedActor* ULoomaSceneSyncSubsystem::FindSyncedActorByJobId(const FString& JobId) const
+{
+    if (JobId.IsEmpty())
+    {
+        return nullptr;
+    }
+    for (const TPair<FString, FLoomaTrackedActor>& Pair : Tracked)
+    {
+        if (ALoomaSyncedActor* Actor = Pair.Value.Actor.Get())
+        {
+            if (Actor->JobId == JobId)
+            {
+                return Actor;
+            }
+        }
+    }
+    return nullptr;
+}
+
+void ULoomaSceneSyncSubsystem::SelectImage(const FString& JobId, const FString& ImageId)
+{
+    if (JobId.IsEmpty() || ImageId.IsEmpty())
+    {
+        return;
+    }
+    const TSharedRef<FJsonObject> Body = MakeShared<FJsonObject>();
+    Body->SetStringField(TEXT("image_id"), ImageId);
+    SendRest(TEXT("POST"), FString::Printf(TEXT("/generate/%s/select"), *JobId), Body);
+}
+
+void ULoomaSceneSyncSubsystem::RegenerateImages(const FString& JobId, const FString& Prompt, int32 NImages)
+{
+    if (JobId.IsEmpty())
+    {
+        return;
+    }
+    const TSharedRef<FJsonObject> Body = MakeShared<FJsonObject>();
+    if (!Prompt.IsEmpty())
+    {
+        Body->SetStringField(TEXT("prompt"), Prompt);
+    }
+    if (NImages > 0)
+    {
+        Body->SetNumberField(TEXT("n_images"), NImages);
+    }
+    SendRest(TEXT("POST"), FString::Printf(TEXT("/generate/%s/regenerate"), *JobId), Body);
+}
+
+void ULoomaSceneSyncSubsystem::CancelGeneration(const FString& JobId)
+{
+    if (JobId.IsEmpty())
+    {
+        return;
+    }
+    SendRest(TEXT("DELETE"), FString::Printf(TEXT("/generate/%s"), *JobId), nullptr);
+}
+
+FString ULoomaSceneSyncSubsystem::GetRestBase() const
+{
+    return FString::Printf(TEXT("http://%s"), *BackendHost);
+}
+
+FString ULoomaSceneSyncSubsystem::ResolveBackendUrl(const FString& PathOrUrl) const
+{
+    if (PathOrUrl.IsEmpty())
+    {
+        return FString();
+    }
+    if (PathOrUrl.StartsWith(TEXT("http://")) || PathOrUrl.StartsWith(TEXT("https://")))
+    {
+        return PathOrUrl; // already absolute
+    }
+    FString Path = PathOrUrl;
+    if (!Path.StartsWith(TEXT("/")))
+    {
+        Path = TEXT("/") + Path;
+    }
+    // Drop the web proxy prefix: "/api/static/x.png" -> "/static/x.png".
+    if (Path.StartsWith(TEXT("/api/")))
+    {
+        Path = Path.RightChop(4);
+    }
+    else if (Path == TEXT("/api"))
+    {
+        Path = TEXT("/");
+    }
+    return GetRestBase() + Path;
 }
