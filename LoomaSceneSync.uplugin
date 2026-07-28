@@ -1,0 +1,24 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "0.1.0",
+  "FriendlyName": "Looma Scene Sync",
+  "Description": "Bidirectional realtime scene sync with the LoomaXR web app (WebSocket relay + runtime GLB loading).",
+  "Category": "Networking",
+  "CreatedBy": "LoomaXR",
+  "CanContainContent": false,
+  "IsBetaVersion": true,
+  "Modules": [
+    {
+      "Name": "LoomaSceneSync",
+      "Type": "Runtime",
+      "LoadingPhase": "Default"
+    }
+  ],
+  "Plugins": [
+    {
+      "Name": "glTFRuntime",
+      "Enabled": true
+    }
+  ]
+}
