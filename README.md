@@ -15,7 +15,7 @@ this plugin lives in [looma-xr-asset-demo](https://github.com/CYENS/looma-xr-ass
 | `ALoomaSyncedActor` | An actor whose transform/lifetime mirrors an object in the web scene |
 | `LoomaWireConvert` | Wire↔UE transform conversion, shared by the scene-sync layer and the generation-job parser |
 | `ELoomaJobState` / `LoomaGenerationTypes` | Text→3D job lifecycle, mirroring the backend's `JobState` vocabulary |
-| `ULoomaGenerationHandle` | One generation job's events, scoped to that job |
+| `ULoomaGenerationHandle` | One generation job's events, scoped to that job — raw state events plus per-stage ones (queued / generating images / awaiting selection / generating asset / generated), and the calls to drive the job |
 | `ULoomaSubmitGenerationAction` | Async Blueprint node — submit a text→3D job (`POST /generate`) |
 | `ULoomaDownloadImageAction` | Async Blueprint node — download a candidate/selected image, decode to a transient `UTexture2D` |
 

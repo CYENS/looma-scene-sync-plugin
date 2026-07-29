@@ -16,9 +16,12 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FLoomaSubmitFailed, const FString&, 
  * Async Blueprint node: submit a text->3D generation job (POST /generate).
  *
  * OnSubmitted fires with the new job_id and a ULoomaGenerationHandle for it —
- * bind the handle's events (OnUpdated / OnImagesReady / OnDone / OnFailed) to
- * follow just this job. The subsystem's OnGenerationJob* events remain available
- * if you'd rather see every job on the hub and filter by id yourself.
+ * bind the handle's events to follow just this job. Either family works: the raw
+ * state events (OnUpdated / OnImagesReady / OnDone / OnFailed) or the per-stage
+ * ones (OnQueueUpdate / OnGeneratingImagesUpdate / OnAwaitingImageSelection /
+ * OnGeneratingAssetUpdate / OnAssetGenerated), which break the values that matter
+ * at each stage out onto their own pins. The subsystem's OnGenerationJob* events
+ * remain available if you'd rather see every job on the hub and filter by id.
  */
 UCLASS()
 class LOOMASCENESYNC_API ULoomaSubmitGenerationAction : public UBlueprintAsyncActionBase

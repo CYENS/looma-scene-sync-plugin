@@ -21,6 +21,25 @@ enum class ELoomaJobState : uint8
     Cancelled      UMETA(DisplayName = "Cancelled"),
 };
 
+/**
+ * Which stage a Queued job is waiting on.
+ *
+ * A job passes through Queued twice: once before its candidate images are
+ * rendered, and again after a candidate is picked, because the backend's
+ * `select()` returns the job to `queued` rather than straight to `running`
+ * (backend/app/generator.py). Carried by ULoomaGenerationHandle::OnQueueUpdate so
+ * a Blueprint can tell the two apart without inspecting the job itself.
+ */
+UENUM(BlueprintType)
+enum class ELoomaQueuePhase : uint8
+{
+    /** Waiting for the GPU to render candidate images. */
+    Images UMETA(DisplayName = "Images"),
+
+    /** A candidate was picked; waiting for the GPU to reconstruct the 3D asset. */
+    Asset  UMETA(DisplayName = "Asset"),
+};
+
 /** One candidate reference image produced for a job (before 3D reconstruction). */
 USTRUCT(BlueprintType)
 struct FLoomaGeneratedImage
