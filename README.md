@@ -39,7 +39,7 @@ composes across a parent chain.
 
 | Wire component | Unreal |
 | --- | --- |
-| `model` | `UStaticMeshComponent` built from `http://<BackendHost>/static/<assetId>.glb` via glTFRuntime (the whole node tree merged into one mesh). The wire's `url` is ignored — the path is rebuilt from `assetId`. Lifted so its bounding-box floor sits on the node origin, matching the web client |
+| `model` | `UStaticMeshComponent` built from `http://<BackendHost>/static/<assetId>.glb` via glTFRuntime (the whole node tree merged into one mesh). The wire's `url` is ignored inbound — the path is rebuilt from `assetId` — but a spawn from Unreal **does** emit one (`WebAssetPrefix` + `/static/<assetId>.glb`), because a web peer renders nothing without it and the hub will not invent it. Lifted so its bounding-box floor sits on the node origin, matching the web client |
 | `mesh` | `UStaticMeshComponent` with an `/Engine/BasicShapes` primitive — box / sphere / plane / cylinder. `size` is an **extent in metres**, so the primitive is measured and scaled to fit; pivot is the node origin (a box at y = 0 sits half in the floor, as in the browser) |
 | `material` | A `UMaterialInstanceDynamic` on the sibling `mesh`, from `BasicShapeMaterial`: `color` (sRGB hex → linear) and `roughness`. Never applied to a `model`, which carries its own materials. `metalness` has no parameter to drive and is ignored |
 | `light` | `UPointLightComponent` / `USpotLightComponent` / `UDirectionalLightComponent`. Aim convention: **the node's local −Y is the beam direction** |

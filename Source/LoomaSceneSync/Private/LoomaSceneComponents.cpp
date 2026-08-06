@@ -150,11 +150,17 @@ FLinearColor LoomaParseColor(const FString& Hex, const FLinearColor& Fallback)
     return FLinearColor::FromSRGBColor(FColor::FromHex(Hex));
 }
 
-TSharedRef<FJsonObject> LoomaMakeModelComponent(const FString& AssetId, const FString& JobId)
+TSharedRef<FJsonObject> LoomaMakeModelComponent(const FString& AssetId, const FString& JobId,
+    const FString& WebUrl)
 {
     TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
     Out->SetStringField(TEXT("type"), TEXT("model"));
     Out->SetStringField(TEXT("assetId"), AssetId);
+    if (!WebUrl.IsEmpty())
+    {
+        // For the browser, which cannot rebuild this path for itself. See the header.
+        Out->SetStringField(TEXT("url"), WebUrl);
+    }
     if (!JobId.IsEmpty())
     {
         // On the component, not on the node: the hub keeps a known component's extra

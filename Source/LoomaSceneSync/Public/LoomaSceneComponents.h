@@ -227,5 +227,15 @@ LOOMASCENESYNC_API FLoomaNodeComponents LoomaParseComponents(const TArray<TShare
  */
 LOOMASCENESYNC_API FLinearColor LoomaParseColor(const FString& Hex, const FLinearColor& Fallback);
 
-/** Build the `model` component a spawn originating in Unreal puts on the wire. */
-LOOMASCENESYNC_API TSharedRef<FJsonObject> LoomaMakeModelComponent(const FString& AssetId, const FString& JobId);
+/**
+ * Build the `model` component a spawn originating in Unreal puts on the wire.
+ *
+ * `WebUrl` is emitted even though this client *ignores* `url` on the way in, and the
+ * asymmetry is load-bearing: a web client loads the GLB from `url` and renders
+ * nothing at all without it (`model.jsx` returns null), while the hub never
+ * synthesises one — a field absent from the payload stays absent, or every read of a
+ * scene would differ from what is stored and rewrite the row. So a spawn from Unreal
+ * carrying only `assetId` arrives in the browser as an object with no geometry.
+ */
+LOOMASCENESYNC_API TSharedRef<FJsonObject> LoomaMakeModelComponent(const FString& AssetId, const FString& JobId,
+    const FString& WebUrl);

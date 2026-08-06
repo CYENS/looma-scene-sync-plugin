@@ -390,6 +390,18 @@ FLoomaNodeRenderContext ULoomaSceneSyncSubsystem::MakeRenderContext(const FLooma
     return Context;
 }
 
+FString ULoomaSceneSyncSubsystem::MakeWebAssetUrl(const FString& AssetId) const
+{
+    // Backend-relative and proxy-prefixed, because this is for the browser, not for
+    // us: "/api/static/chair_01.glb". The datalake convention is <assetId>.glb — the
+    // same assumption this plugin already makes when it fetches a GLB of its own.
+    if (AssetId.IsEmpty() || WebAssetPrefix.IsEmpty())
+    {
+        return FString();
+    }
+    return FString::Printf(TEXT("%s/static/%s.glb"), *WebAssetPrefix, *AssetId);
+}
+
 void ULoomaSceneSyncSubsystem::HandleDespawn(const TSharedPtr<FJsonObject>& Msg)
 {
     const TArray<TSharedPtr<FJsonValue>>* Ids = nullptr;
@@ -734,7 +746,9 @@ ALoomaSyncedActor* ULoomaSceneSyncSubsystem::SpawnSyncedAsset(const FString& Ass
     Node->SetStringField(TEXT("name"), Actor->DisplayName);
     Node->SetObjectField(TEXT("t"), LoomaUeToWire(Transform));
     TArray<TSharedPtr<FJsonValue>> ComponentValues;
-    ComponentValues.Add(MakeShared<FJsonValueObject>(LoomaMakeModelComponent(AssetId, JobId)));
+    // The url is for the web client's benefit only — it renders nothing without one.
+    ComponentValues.Add(MakeShared<FJsonValueObject>(
+        LoomaMakeModelComponent(AssetId, JobId, MakeWebAssetUrl(AssetId))));
     Node->SetArrayField(TEXT("components"), ComponentValues);
 
     TSharedRef<FJsonObject> Msg = MakeShared<FJsonObject>();

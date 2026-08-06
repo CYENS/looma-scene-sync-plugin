@@ -217,6 +217,16 @@ public:
     UPROPERTY(Config)
     bool bBaseAlignModels = true;
 
+    /**
+     * Prefix a **web** client needs in front of `/static/...` — the Vite proxy path,
+     * i.e. the backend's `LOOMA_PUBLIC_API_PREFIX`. Only used to fill in the `url` of
+     * a `model` component we spawn, since the browser cannot rebuild that path itself
+     * and the hub will not invent it. Empty emits no url, which leaves a
+     * UE-originated spawn invisible in the browser.
+     */
+    UPROPERTY(Config)
+    FString WebAssetPrefix = TEXT("/api");
+
 private:
     void Connect();
     void SendJson(const TSharedRef<FJsonObject>& Msg);
@@ -248,6 +258,8 @@ private:
     void DropNode(const FString& NodeId);
     /** What ApplyComponents needs from outside the node: the GLB url and the config. */
     FLoomaNodeRenderContext MakeRenderContext(const FLoomaNodeComponents& Components) const;
+    /** The backend-relative GLB path a *web* peer loads, for a `model` we put on the wire. */
+    FString MakeWebAssetUrl(const FString& AssetId) const;
 
     // Generation helpers
     void HydrateGenerationQueue();
