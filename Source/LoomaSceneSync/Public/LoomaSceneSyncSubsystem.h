@@ -55,7 +55,7 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE(FLoomaSyncConnectionEvent);
  * (M(L1 L2)M^-1 = (M L1 M^-1)(M L2 M^-1)), so each node's local transform converts
  * independently and UE attachment composes the world pose as three.js does.
  */
-UCLASS(Config = Game)
+UCLASS()
 class LOOMASCENESYNC_API ULoomaSceneSyncSubsystem : public UGameInstanceSubsystem, public FTickableGameObject
 {
     GENERATED_BODY()
@@ -94,6 +94,38 @@ public:
 
     UFUNCTION(BlueprintPure, Category = "Looma")
     bool IsSyncConnected() const;
+
+    // --- Connection control / diagnostics -------------------------------------
+
+    /**
+     * Drop the socket (if any) and connect again straight away, re-reading
+     * Project Settings > Plugins > Looma Scene Sync — so this is also how a changed
+     * backend address takes effect. Console: `Looma.Reconnect`.
+     *
+     * Scene state is kept: the hub answers a fresh connection with the whole `scene`
+     * document, which reconciles what we hold and drops what it no longer has.
+     */
+    UFUNCTION(BlueprintCallable, Category = "Looma")
+    void Reconnect();
+
+    /** The hub URL this client uses: the REST base, ws(s) scheme, `/ws/scene`. */
+    UFUNCTION(BlueprintPure, Category = "Looma")
+    FString GetSceneSyncUrl() const;
+
+    /**
+     * One line: state, hub URL, REST base, and what we are holding. Cheap — it reports
+     * the socket, it does not talk to the backend. Console: `Looma.Status`.
+     */
+    UFUNCTION(BlueprintPure, Category = "Looma")
+    FString GetConnectionStatusText() const;
+
+    /**
+     * Log `GetConnectionStatusText()`, then `GET /health` and log whether the backend
+     * answered — which separates "the socket is down" from "nothing is listening".
+     * Console: `Looma.Status`.
+     */
+    UFUNCTION(BlueprintCallable, Category = "Looma")
+    void LogConnectionStatus();
 
     // --- Generation jobs (observe) -------------------------------------------
 
@@ -178,7 +210,10 @@ public:
 
     // --- Backend URLs --------------------------------------------------------
 
-    /** REST/asset base for direct (non-proxied) access, e.g. "http://127.0.0.1:8000". */
+    /**
+     * REST/asset base for direct (non-proxied) access, e.g. "http://127.0.0.1:8000" —
+     * the settings' Backend URL, normalised (scheme filled in, no trailing slash).
+     */
     UFUNCTION(BlueprintPure, Category = "Looma")
     FString GetRestBase() const;
 
@@ -190,45 +225,15 @@ public:
     UFUNCTION(BlueprintPure, Category = "Looma")
     FString ResolveBackendUrl(const FString& PathOrUrl) const;
 
-    /**
-     * host:port of the FastAPI backend. Override in Config/DefaultGame.ini:
-     *   [/Script/LoomaSceneSync.LoomaSceneSyncSubsystem]
-     *   BackendHost=192.168.1.10:8000
-     * Prefer an explicit IP over "localhost": UE's WebSocket client may
-     * resolve localhost to IPv6 (::1) while uvicorn listens on IPv4 only.
-     */
-    UPROPERTY(Config)
-    FString BackendHost = TEXT("127.0.0.1:8000");
-
-    /**
-     * Trim on every light's wire intensity. The units already match 1:1 (three.js is
-     * in candela for point/spot and lux for directional, and so is UE), so this exists
-     * only because the two renderers' exposure and tone mapping differ — see
-     * ALoomaSyncedActor::ApplyLight. Same .ini section as BackendHost.
-     */
-    UPROPERTY(Config)
-    float LightIntensityScale = 1.0f;
-
-    /**
-     * Lift a `model`'s GLB so its bounding-box floor sits on the node origin, matching
-     * the web client (frontend/src/scene/pivot.js). False restores the pre-v3 Unreal
-     * behaviour — the GLB centred on the node origin, i.e. half-buried at floor level.
-     */
-    UPROPERTY(Config)
-    bool bBaseAlignModels = true;
-
-    /**
-     * Prefix a **web** client needs in front of `/static/...` — the Vite proxy path,
-     * i.e. the backend's `LOOMA_PUBLIC_API_PREFIX`. Only used to fill in the `url` of
-     * a `model` component we spawn, since the browser cannot rebuild that path itself
-     * and the hub will not invent it. Empty emits no url, which leaves a
-     * UE-originated spawn invisible in the browser.
-     */
-    UPROPERTY(Config)
-    FString WebAssetPrefix = TEXT("/api");
+    // Every knob lives on ULoomaSceneSyncSettings — Project Settings > Plugins >
+    // Looma Scene Sync — and is read live from there, so an edit needs no restart.
 
 private:
     void Connect();
+    /** Clear the handlers and close the socket, so a dead one cannot fire a retry. */
+    void CloseSocket();
+    /** A settings edit landed: reconnect if the backend address moved. */
+    void OnSettingsChanged();
     void SendJson(const TSharedRef<FJsonObject>& Msg);
 
     // Inbound — one handler per wire message (see the class comment).
@@ -279,6 +284,12 @@ private:
     void FlushPendingHandleReplays();
 
     TSharedPtr<IWebSocket> Socket;
+    /** The URL the current socket was created with — what a reconnect compares against. */
+    FString SocketUrl;
+    /** Connect() has been called and the socket has neither opened nor failed yet. */
+    bool bConnecting = false;
+    /** Our binding on ULoomaSceneSyncSettings::OnSettingsChanged, released on teardown. */
+    FDelegateHandle SettingsChangedHandle;
     FString ClientId;
     TMap<FString, FLoomaTrackedActor> Tracked; // node id -> actor + last-sent cache
     TMap<FString, FLoomaGenerationJob> Jobs;   // jobId -> latest job snapshot

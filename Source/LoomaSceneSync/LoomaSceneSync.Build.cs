@@ -11,6 +11,8 @@ public class LoomaSceneSync : ModuleRules
             "Core",
             "CoreUObject",
             "Engine",
+            // ULoomaSceneSyncSettings — Project Settings > Plugins > Looma Scene Sync.
+            "DeveloperSettings",
             // Runtime GLB loading straight from the backend's /static URLs.
             "glTFRuntime",
         });

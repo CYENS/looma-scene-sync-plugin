@@ -12,6 +12,7 @@
 #include "LoomaGenerationTypes.h"
 #include "LoomaSceneComponents.h"
 #include "LoomaSceneSyncLog.h"
+#include "LoomaSceneSyncSettings.h"
 #include "LoomaSyncedActor.h"
 #include "LoomaWireConvert.h"
 #include "Misc/Guid.h"
@@ -26,6 +27,38 @@ namespace
 constexpr float ReconnectDelay = 2.0f;     // seconds between connection attempts
 constexpr float TransientInterval = 0.033f; // ~30 Hz live streaming
 constexpr int32 StillFramesForFinal = 10;   // rest frames before the final commit
+
+/**
+ * The settings' backend address as an absolute http(s) base with no trailing slash.
+ * Accepts a bare "host:port" (the plugin's original format), a full URL with a path
+ * prefix (a reverse proxy or tunnel), or a ws(s) URL — which is the same base with
+ * the other scheme.
+ */
+FString NormalizeRestBase(const FString& Configured)
+{
+    FString Base = Configured.TrimStartAndEnd();
+    if (Base.IsEmpty())
+    {
+        return TEXT("http://127.0.0.1:8000");
+    }
+    if (Base.StartsWith(TEXT("wss://")))
+    {
+        Base = TEXT("https://") + Base.RightChop(6);
+    }
+    else if (Base.StartsWith(TEXT("ws://")))
+    {
+        Base = TEXT("http://") + Base.RightChop(5);
+    }
+    else if (!Base.StartsWith(TEXT("http://")) && !Base.StartsWith(TEXT("https://")))
+    {
+        Base = TEXT("http://") + Base;
+    }
+    while (Base.EndsWith(TEXT("/")))
+    {
+        Base.LeftChopInline(1);
+    }
+    return Base;
+}
 } // namespace
 
 // --- Lifecycle ---------------------------------------------------------------
@@ -35,20 +68,16 @@ void ULoomaSceneSyncSubsystem::Initialize(FSubsystemCollectionBase& Collection)
     Super::Initialize(Collection);
     ClientId = FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphens).ToLower();
     FModuleManager::Get().LoadModuleChecked(TEXT("WebSockets"));
+    SettingsChangedHandle = ULoomaSceneSyncSettings::OnSettingsChanged().AddUObject(
+        this, &ULoomaSceneSyncSubsystem::OnSettingsChanged);
     Connect();
 }
 
 void ULoomaSceneSyncSubsystem::Deinitialize()
 {
-    if (Socket.IsValid())
-    {
-        Socket->OnConnected().Clear();
-        Socket->OnConnectionError().Clear();
-        Socket->OnClosed().Clear();
-        Socket->OnMessage().Clear();
-        Socket->Close();
-        Socket.Reset();
-    }
+    ULoomaSceneSyncSettings::OnSettingsChanged().Remove(SettingsChangedHandle);
+    SettingsChangedHandle.Reset();
+    CloseSocket();
     Tracked.Empty();
     JobHandles.Empty();
     PendingHandleReplays.Empty();
@@ -57,13 +86,33 @@ void ULoomaSceneSyncSubsystem::Deinitialize()
     Super::Deinitialize();
 }
 
+void ULoomaSceneSyncSubsystem::CloseSocket()
+{
+    if (!Socket.IsValid())
+    {
+        return;
+    }
+    // Clear first: a socket we are abandoning must not schedule a retry from its own
+    // OnClosed, which would race the connection we are about to make.
+    Socket->OnConnected().Clear();
+    Socket->OnConnectionError().Clear();
+    Socket->OnClosed().Clear();
+    Socket->OnMessage().Clear();
+    Socket->Close();
+    Socket.Reset();
+    bConnecting = false;
+}
+
 void ULoomaSceneSyncSubsystem::Connect()
 {
-    const FString Url = FString::Printf(TEXT("ws://%s/ws/scene"), *BackendHost);
-    Socket = FWebSocketsModule::Get().CreateWebSocket(Url, TEXT(""));
+    CloseSocket();
+    SocketUrl = GetSceneSyncUrl();
+    Socket = FWebSocketsModule::Get().CreateWebSocket(SocketUrl, TEXT(""));
+    bConnecting = true;
 
     Socket->OnConnected().AddWeakLambda(this, [this]() {
-        UE_LOG(LogLoomaSync, Log, TEXT("Connected to %s"), *BackendHost);
+        bConnecting = false;
+        UE_LOG(LogLoomaSync, Log, TEXT("Connected to %s"), *SocketUrl);
         TSharedRef<FJsonObject> Hello = MakeShared<FJsonObject>();
         Hello->SetStringField(TEXT("type"), TEXT("hello"));
         Hello->SetStringField(TEXT("clientId"), ClientId);
@@ -75,11 +124,13 @@ void ULoomaSceneSyncSubsystem::Connect()
         HydrateGenerationQueue();
     });
     Socket->OnConnectionError().AddWeakLambda(this, [this](const FString& Error) {
-        UE_LOG(LogLoomaSync, Warning, TEXT("Connection error: %s (retrying)"), *Error);
+        bConnecting = false;
+        UE_LOG(LogLoomaSync, Warning, TEXT("Connection error on %s: %s (retrying)"), *SocketUrl, *Error);
         ReconnectCooldown = ReconnectDelay;
         OnSyncDisconnected.Broadcast();
     });
     Socket->OnClosed().AddWeakLambda(this, [this](int32 Code, const FString& Reason, bool bWasClean) {
+        bConnecting = false;
         UE_LOG(LogLoomaSync, Warning, TEXT("Socket closed (%d %s), retrying"), Code, *Reason);
         ReconnectCooldown = ReconnectDelay;
         OnSyncDisconnected.Broadcast();
@@ -105,6 +156,134 @@ void ULoomaSceneSyncSubsystem::SendJson(const TSharedRef<FJsonObject>& Msg)
 bool ULoomaSceneSyncSubsystem::IsSyncConnected() const
 {
     return Socket.IsValid() && Socket->IsConnected();
+}
+
+// --- Connection control / diagnostics ----------------------------------------
+
+void ULoomaSceneSyncSubsystem::Reconnect()
+{
+    ReconnectCooldown = 0.0f; // no waiting: the caller asked for it now
+    UE_LOG(LogLoomaSync, Display, TEXT("Reconnecting to %s"), *GetSceneSyncUrl());
+    // Closing our own socket clears its handlers, so nothing else will say we dropped —
+    // and a UI bound to OnSyncDisconnected must not be left showing "connected".
+    const bool bWasConnected = IsSyncConnected();
+    Connect();
+    if (bWasConnected)
+    {
+        OnSyncDisconnected.Broadcast();
+    }
+}
+
+void ULoomaSceneSyncSubsystem::OnSettingsChanged()
+{
+    // Only the backend address needs a new socket, and only when it actually moved —
+    // every other knob is read where it is used.
+    if (GetSceneSyncUrl() != SocketUrl)
+    {
+        UE_LOG(LogLoomaSync, Display, TEXT("Backend moved to %s"), *GetRestBase());
+        Reconnect();
+    }
+}
+
+FString ULoomaSceneSyncSubsystem::GetSceneSyncUrl() const
+{
+    // Same base, WebSocket scheme: http -> ws, https -> wss.
+    FString Url = GetRestBase();
+    if (Url.StartsWith(TEXT("https://")))
+    {
+        Url = TEXT("wss://") + Url.RightChop(8);
+    }
+    else if (Url.StartsWith(TEXT("http://")))
+    {
+        Url = TEXT("ws://") + Url.RightChop(7);
+    }
+    return Url + TEXT("/ws/scene");
+}
+
+FString ULoomaSceneSyncSubsystem::GetConnectionStatusText() const
+{
+    FString State;
+    if (IsSyncConnected())
+    {
+        State = TEXT("CONNECTED");
+    }
+    else if (bConnecting)
+    {
+        State = TEXT("CONNECTING");
+    }
+    else if (ReconnectCooldown > 0.0f)
+    {
+        State = FString::Printf(TEXT("DISCONNECTED (retry in %.1fs)"), ReconnectCooldown);
+    }
+    else
+    {
+        State = Socket.IsValid() ? TEXT("DISCONNECTED") : TEXT("NO SOCKET");
+    }
+
+    // The socket's URL, not the settings' — after an edit they differ until the
+    // reconnect lands, and the useful answer is where we are actually pointed.
+    const FString HubUrl = SocketUrl.IsEmpty() ? GetSceneSyncUrl() : SocketUrl;
+    const FString RestBase = GetRestBase();
+    return FString::Printf(TEXT("%s | hub %s | rest %s | %d node(s), scene %s | %d job(s)"),
+        *State,
+        *HubUrl,
+        *RestBase,
+        Tracked.Num(),
+        ActiveSceneId.IsEmpty() ? TEXT("<unsaved>") : *ActiveSceneId,
+        Jobs.Num());
+}
+
+void ULoomaSceneSyncSubsystem::LogConnectionStatus()
+{
+    UE_LOG(LogLoomaSync, Display, TEXT("Looma Scene Sync: %s"), *GetConnectionStatusText());
+
+    // A socket can be down for three different reasons — nothing listening, the wrong
+    // host, or the right host with the wrong path prefix. One REST call tells them
+    // apart, but only if we check *what* answered: a reverse proxy that serves the web
+    // app at the root answers /health with 200 and an index.html, which reads as
+    // healthy while the hub URL points at nothing that speaks WebSocket.
+    const FString RestBase = GetRestBase();
+    const FString HealthUrl = RestBase + TEXT("/health");
+    const TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Request = FHttpModule::Get().CreateRequest();
+    Request->SetURL(HealthUrl);
+    Request->SetVerb(TEXT("GET"));
+    Request->SetTimeout(5.0f);
+    Request->OnProcessRequestComplete().BindWeakLambda(this,
+        [HealthUrl, RestBase](FHttpRequestPtr Req, FHttpResponsePtr Resp, bool bOk) {
+            if (!bOk || !Resp.IsValid())
+            {
+                UE_LOG(LogLoomaSync, Warning, TEXT("Backend %s unreachable — is the backend running, ")
+                                              TEXT("and is the Backend URL right?"), *HealthUrl);
+                return;
+            }
+            const int32 Code = Resp->GetResponseCode();
+            const FString Body = Resp->GetContentAsString();
+            const FString Excerpt = Body.Left(120).Replace(TEXT("\r"), TEXT("")).Replace(TEXT("\n"), TEXT(" "));
+            if (Code >= 300)
+            {
+                UE_LOG(LogLoomaSync, Warning, TEXT("Backend %s answered %d: %s"), *HealthUrl, Code, *Excerpt);
+                return;
+            }
+
+            TSharedPtr<FJsonObject> Json;
+            const TSharedRef<TJsonReader<TCHAR>> Reader = TJsonReaderFactory<TCHAR>::Create(Body);
+            FString Status;
+            if (FJsonSerializer::Deserialize(Reader, Json) && Json.IsValid() &&
+                Json->TryGetStringField(TEXT("status"), Status))
+            {
+                int32 Assets = 0;
+                Json->TryGetNumberField(TEXT("assets"), Assets);
+                UE_LOG(LogLoomaSync, Display, TEXT("Backend %s OK (%d): status %s, %d asset(s)"), *HealthUrl, Code,
+                    *Status, Assets);
+                return;
+            }
+            UE_LOG(LogLoomaSync, Warning,
+                TEXT("Backend %s answered %d but not with the backend's /health JSON — something else is ")
+                TEXT("serving that address (a web app, usually). If the API sits behind a path prefix, ")
+                TEXT("the Backend URL must include it, e.g. %s/api. Got: %s"),
+                *HealthUrl, Code, *RestBase, *Excerpt);
+        });
+    Request->ProcessRequest();
 }
 
 // --- Inbound -----------------------------------------------------------------
@@ -378,14 +557,15 @@ void ULoomaSceneSyncSubsystem::DropNode(const FString& NodeId)
 
 FLoomaNodeRenderContext ULoomaSceneSyncSubsystem::MakeRenderContext(const FLoomaNodeComponents& Components) const
 {
+    const ULoomaSceneSyncSettings& Settings = ULoomaSceneSyncSettings::Get();
     FLoomaNodeRenderContext Context;
-    Context.LightIntensityScale = LightIntensityScale;
-    Context.bBaseAlignModels = bBaseAlignModels;
+    Context.LightIntensityScale = Settings.LightIntensityScale;
+    Context.bBaseAlignModels = Settings.bBaseAlignModels;
     if (Components.bHasModel && !Components.Model.AssetId.IsEmpty())
     {
         // Rebuilt from assetId, never taken from the component's `url`: that url is the
         // browser's /api-proxied relative path, which a native client cannot use.
-        Context.ModelUrl = FString::Printf(TEXT("http://%s/static/%s.glb"), *BackendHost, *Components.Model.AssetId);
+        Context.ModelUrl = FString::Printf(TEXT("%s/static/%s.glb"), *GetRestBase(), *Components.Model.AssetId);
     }
     return Context;
 }
@@ -395,6 +575,7 @@ FString ULoomaSceneSyncSubsystem::MakeWebAssetUrl(const FString& AssetId) const
     // Backend-relative and proxy-prefixed, because this is for the browser, not for
     // us: "/api/static/chair_01.glb". The datalake convention is <assetId>.glb — the
     // same assumption this plugin already makes when it fetches a GLB of its own.
+    const FString& WebAssetPrefix = ULoomaSceneSyncSettings::Get().WebAssetPrefix;
     if (AssetId.IsEmpty() || WebAssetPrefix.IsEmpty())
     {
         return FString();
@@ -1041,7 +1222,7 @@ void ULoomaSceneSyncSubsystem::CancelGeneration(const FString& JobId)
 
 FString ULoomaSceneSyncSubsystem::GetRestBase() const
 {
-    return FString::Printf(TEXT("http://%s"), *BackendHost);
+    return NormalizeRestBase(ULoomaSceneSyncSettings::Get().BackendUrl);
 }
 
 FString ULoomaSceneSyncSubsystem::ResolveBackendUrl(const FString& PathOrUrl) const
