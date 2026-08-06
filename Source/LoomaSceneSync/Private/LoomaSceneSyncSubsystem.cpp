@@ -1,6 +1,7 @@
 #include "LoomaSceneSyncSubsystem.h"
 
 #include "Dom/JsonObject.h"
+#include "Dom/JsonValue.h"
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"
 #include "HttpModule.h"
@@ -9,6 +10,8 @@
 #include "IWebSocket.h"
 #include "LoomaGenerationHandle.h"
 #include "LoomaGenerationTypes.h"
+#include "LoomaSceneComponents.h"
+#include "LoomaSceneSyncLog.h"
 #include "LoomaSyncedActor.h"
 #include "LoomaWireConvert.h"
 #include "Misc/Guid.h"
@@ -17,8 +20,6 @@
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
 #include "WebSocketsModule.h"
-
-DEFINE_LOG_CATEGORY_STATIC(LogLoomaSync, Log, All);
 
 namespace
 {
@@ -52,6 +53,7 @@ void ULoomaSceneSyncSubsystem::Deinitialize()
     JobHandles.Empty();
     PendingHandleReplays.Empty();
     SuggestedTransforms.Empty();
+    ActiveSceneId.Reset();
     Super::Deinitialize();
 }
 
@@ -118,9 +120,9 @@ void ULoomaSceneSyncSubsystem::OnRawMessage(const FString& Text)
     const FString Type = Msg->GetStringField(TEXT("type"));
 
     bApplyingRemote = true;
-    if (Type == TEXT("snapshot"))
+    if (Type == TEXT("scene"))
     {
-        HandleSnapshot(Msg);
+        HandleScene(Msg);
     }
     else if (Type == TEXT("spawn"))
     {
@@ -134,147 +136,302 @@ void ULoomaSceneSyncSubsystem::OnRawMessage(const FString& Text)
     {
         HandleTransform(Msg);
     }
+    else if (Type == TEXT("reparent"))
+    {
+        HandleReparent(Msg);
+    }
+    else if (Type == TEXT("patch"))
+    {
+        HandlePatch(Msg);
+    }
     else if (Type == TEXT("generation"))
     {
         HandleGeneration(Msg);
     }
+    else
+    {
+        // Not an error — the hub may speak messages a newer backend added — but
+        // silence here is how "the plugin ignores half the protocol" hid for two
+        // format versions.
+        UE_LOG(LogLoomaSync, Verbose, TEXT("Ignoring unknown message type '%s'"), *Type);
+    }
     bApplyingRemote = false;
 }
 
-void ULoomaSceneSyncSubsystem::HandleSnapshot(const TSharedPtr<FJsonObject>& Msg)
+void ULoomaSceneSyncSubsystem::HandleScene(const TSharedPtr<FJsonObject>& Msg)
 {
-    const TArray<TSharedPtr<FJsonValue>>* Objects = nullptr;
-    if (!Msg->TryGetArrayField(TEXT("objects"), Objects))
+    const TArray<TSharedPtr<FJsonValue>>* Nodes = nullptr;
+    if (!Msg->TryGetArrayField(TEXT("nodes"), Nodes) || !Nodes)
     {
         return;
     }
-    UE_LOG(LogLoomaSync, Log, TEXT("Snapshot: %d object(s)"), Objects->Num());
-    for (const TSharedPtr<FJsonValue>& V : *Objects)
+    // `sceneId` is null for an unsaved working scene, and TryGet leaves the old value
+    // in place on a null — so clear it first.
+    ActiveSceneId.Reset();
+    Msg->TryGetStringField(TEXT("sceneId"), ActiveSceneId);
+
+    // The hub owns the live scene: this is the whole document, sent on connect and
+    // whenever someone activates or clears a scene. So it *replaces* what we hold
+    // rather than merging into it — anything the hub no longer has, we no longer have.
+    TSet<FString> Incoming;
+    Incoming.Reserve(Nodes->Num());
+    for (const TSharedPtr<FJsonValue>& Value : *Nodes)
     {
-        UpsertRemoteObject(V->AsObject());
+        const TSharedPtr<FJsonObject> Node = Value.IsValid() ? Value->AsObject() : nullptr;
+        FString NodeId;
+        if (Node.IsValid() && Node->TryGetStringField(TEXT("id"), NodeId) && !NodeId.IsEmpty())
+        {
+            Incoming.Add(NodeId);
+        }
     }
+
+    TArray<FString> Stale;
+    for (const TPair<FString, FLoomaTrackedActor>& Pair : Tracked)
+    {
+        if (!Incoming.Contains(Pair.Key))
+        {
+            Stale.Add(Pair.Key);
+        }
+    }
+    for (const FString& NodeId : Stale)
+    {
+        DropNode(NodeId);
+    }
+
+    UpsertNodes(*Nodes);
+
+    UE_LOG(LogLoomaSync, Log, TEXT("Scene%s: %d node(s) applied, %d dropped"),
+        ActiveSceneId.IsEmpty() ? TEXT(" (unsaved)") : *FString::Printf(TEXT(" '%s'"), *ActiveSceneId),
+        Nodes->Num(), Stale.Num());
 }
 
 void ULoomaSceneSyncSubsystem::HandleSpawn(const TSharedPtr<FJsonObject>& Msg)
 {
-    const TArray<TSharedPtr<FJsonValue>>* Objects = nullptr;
-    if (!Msg->TryGetArrayField(TEXT("objects"), Objects))
+    const TArray<TSharedPtr<FJsonValue>>* Nodes = nullptr;
+    if (!Msg->TryGetArrayField(TEXT("nodes"), Nodes) || !Nodes)
     {
         return;
     }
-    for (const TSharedPtr<FJsonValue>& V : *Objects)
+    // Structural ops are re-broadcast to every client *including the sender*, so this
+    // also sees our own spawns come back normalised. UpsertNode is idempotent.
+    UpsertNodes(*Nodes);
+}
+
+void ULoomaSceneSyncSubsystem::UpsertNodes(const TArray<TSharedPtr<FJsonValue>>& Nodes)
+{
+    // One pass is enough: the hub orders spawns parents-first, even when the sender
+    // listed them the other way round.
+    for (const TSharedPtr<FJsonValue>& Value : Nodes)
     {
-        UpsertRemoteObject(V->AsObject());
+        UpsertNode(Value.IsValid() ? Value->AsObject() : nullptr);
+    }
+    ResolvePendingParents();
+}
+
+void ULoomaSceneSyncSubsystem::UpsertNode(const TSharedPtr<FJsonObject>& Node)
+{
+    if (!Node.IsValid())
+    {
+        return;
+    }
+    FString NodeId;
+    if (!Node->TryGetStringField(TEXT("id"), NodeId) || NodeId.IsEmpty())
+    {
+        return; // a node with no id cannot be addressed, parented or transformed
+    }
+
+    // `parent` is null for a root, which TryGet reports as absent — an empty string.
+    FString ParentId;
+    Node->TryGetStringField(TEXT("parent"), ParentId);
+
+    // **`t` is parent-local**, not a world pose. The axis/unit conversion is per node
+    // and unchanged; only its meaning is (see LoomaWireConvert.h).
+    const TSharedPtr<FJsonObject>* TField = nullptr;
+    const FTransform Local =
+        Node->TryGetObjectField(TEXT("t"), TField) ? LoomaWireToUe(*TField) : FTransform::Identity;
+
+    const TArray<TSharedPtr<FJsonValue>>* ComponentArray = nullptr;
+    Node->TryGetArrayField(TEXT("components"), ComponentArray);
+    const FLoomaNodeComponents Components = LoomaParseComponents(ComponentArray);
+
+    FString Name;
+    Node->TryGetStringField(TEXT("name"), Name);
+
+    ALoomaSyncedActor* Actor = FindSyncedActor(NodeId);
+    const bool bFresh = Actor == nullptr;
+    if (bFresh)
+    {
+        Tracked.Remove(NodeId); // a stale entry whose actor was garbage collected
+
+        UWorld* World = GetGameInstance() ? GetGameInstance()->GetWorld() : nullptr;
+        if (!World)
+        {
+            return;
+        }
+        FActorSpawnParameters Params;
+        Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+        // Spawned at the origin: the pose is set below, by ApplyParent, once we know
+        // what it is relative to.
+        Actor = World->SpawnActor<ALoomaSyncedActor>(FVector::ZeroVector, FRotator::ZeroRotator, Params);
+        if (!Actor)
+        {
+            return;
+        }
+        Actor->Id = NodeId;
+        Actor->OnDestroyed.AddDynamic(this, &ULoomaSceneSyncSubsystem::OnSyncedActorDestroyed);
+
+        FLoomaTrackedActor Entry;
+        Entry.Actor = Actor;
+        Tracked.Add(NodeId, Entry);
+    }
+
+    Actor->DisplayName = Name.IsEmpty() ? NodeId : Name;
+#if WITH_EDITOR
+    Actor->SetActorLabel(Actor->DisplayName);
+#endif
+    Actor->ApplyComponents(Components, MakeRenderContext(Components));
+    ApplyParent(*Actor, ParentId, Local, /*bSnap=*/true);
+
+    if (FLoomaTrackedActor* Entry = Tracked.Find(NodeId))
+    {
+        // Seed the outbound diff with the pose we just applied, so mirroring a remote
+        // spawn doesn't read as local motion on the next tick.
+        Entry->LastSent = Actor->GetLocalTransform();
+        Entry->bMoving = false;
+        Entry->StillFrames = 0;
+    }
+
+    if (bFresh)
+    {
+        UE_LOG(LogLoomaSync, Log, TEXT("Node '%s' (%s)%s: %s at local %s"),
+            *Actor->DisplayName, *NodeId,
+            ParentId.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" under %s"), *ParentId),
+            Components.IsEmpty() ? TEXT("empty (transform only)") : *FString::Printf(TEXT("%s%s%s"),
+                Components.bHasModel ? TEXT("model ") : TEXT(""),
+                Components.bHasMesh ? TEXT("mesh ") : TEXT(""),
+                Components.bHasLight ? TEXT("light") : TEXT("")),
+            *Local.GetLocation().ToString());
     }
 }
 
-void ULoomaSceneSyncSubsystem::UpsertRemoteObject(const TSharedPtr<FJsonObject>& Obj)
+void ULoomaSceneSyncSubsystem::ApplyParent(ALoomaSyncedActor& Actor, const FString& ParentId,
+    const FTransform& Local, bool bSnap)
 {
-    if (!Obj.IsValid())
-    {
-        return;
-    }
-    const FString Guid = Obj->GetStringField(TEXT("guid"));
-    if (Guid.IsEmpty())
-    {
-        return;
-    }
+    // Record the id even when it cannot be resolved: the hub guarantees parents-first
+    // and turns a spawn naming an unknown parent into a root, so this is belt and
+    // braces — the node becomes a root now, and ResolvePendingParents picks it up if
+    // the parent does turn up later.
+    Actor.ParentId = ParentId;
 
-    const TSharedPtr<FJsonObject>* TField = nullptr;
-    const FTransform Transform =
-        Obj->TryGetObjectField(TEXT("t"), TField) ? LoomaWireToUe(*TField) : FTransform::Identity;
-
-    if (FLoomaTrackedActor* Existing = Tracked.Find(Guid))
+    ALoomaSyncedActor* Parent = ParentId.IsEmpty() ? nullptr : FindSyncedActor(ParentId);
+    if (Parent && Parent != &Actor)
     {
-        if (ALoomaSyncedActor* Actor = Existing->Actor.Get())
+        if (Actor.GetAttachParentActor() != Parent)
         {
-            Actor->SetRemoteTarget(Transform, /*bSnap=*/true);
-            Existing->LastSent = Transform;
-            return;
+            Actor.AttachToActor(Parent, FAttachmentTransformRules::KeepRelativeTransform);
         }
-        Tracked.Remove(Guid);
     }
-
-    UWorld* World = GetGameInstance() ? GetGameInstance()->GetWorld() : nullptr;
-    if (!World)
+    else if (Actor.GetAttachParentActor() != nullptr)
     {
-        return;
+        Actor.DetachFromActor(FDetachmentTransformRules::KeepRelativeTransform);
     }
 
-    FActorSpawnParameters Params;
-    Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-    ALoomaSyncedActor* Actor = World->SpawnActor<ALoomaSyncedActor>(Transform.GetLocation(), Transform.GetRotation().Rotator(), Params);
-    if (!Actor)
+    // Set the pose *after* attaching, because it is relative to whatever we just
+    // attached to. UE composes parent scale x child relative location the same way
+    // three.js does, so this is the same world pose the browser shows.
+    Actor.SetRemoteTarget(Local, bSnap);
+}
+
+void ULoomaSceneSyncSubsystem::ResolvePendingParents()
+{
+    for (const TPair<FString, FLoomaTrackedActor>& Pair : Tracked)
     {
-        return;
+        ALoomaSyncedActor* Actor = Pair.Value.Actor.Get();
+        if (!Actor || Actor->ParentId.IsEmpty() || Actor->GetAttachParentActor() != nullptr)
+        {
+            continue;
+        }
+        if (ALoomaSyncedActor* Parent = FindSyncedActor(Actor->ParentId))
+        {
+            // Its transform is already the parent-local one, so attaching keeping the
+            // relative transform reinterprets the same numbers under the parent —
+            // which is exactly what they always meant.
+            UE_LOG(LogLoomaSync, Verbose, TEXT("Node '%s' found parent '%s' late — attaching"),
+                *Actor->Id, *Actor->ParentId);
+            Actor->AttachToActor(Parent, FAttachmentTransformRules::KeepRelativeTransform);
+        }
     }
-    Actor->SetActorTransform(Transform); // includes scale
-    Actor->Guid = Guid;
-    Actor->AssetId = Obj->GetStringField(TEXT("assetId"));
-    Actor->DisplayName = Obj->GetStringField(TEXT("name"));
-    // A spawn may carry the generation job that produced it (see SpawnSyncedAsset)
-    // so a Blueprint orb can match this real model to its placeholder.
-    Obj->TryGetStringField(TEXT("jobId"), Actor->JobId);
-#if WITH_EDITOR
-    Actor->SetActorLabel(Actor->DisplayName.IsEmpty() ? Guid : Actor->DisplayName);
-#endif
-    Actor->OnDestroyed.AddDynamic(this, &ULoomaSceneSyncSubsystem::OnSyncedActorDestroyed);
-    Actor->LoadMeshFromUrl(FString::Printf(TEXT("http://%s/static/%s.glb"), *BackendHost, *Actor->AssetId));
+}
 
-    UE_LOG(LogLoomaSync, Log, TEXT("Spawned '%s' (%s) at %s rot %s scale %s"),
-        *Actor->DisplayName, *Guid,
-        *Transform.GetLocation().ToString(),
-        *Transform.GetRotation().Rotator().ToString(),
-        *Transform.GetScale3D().ToString());
-
+void ULoomaSceneSyncSubsystem::DropNode(const FString& NodeId)
+{
     FLoomaTrackedActor Entry;
-    Entry.Actor = Actor;
-    Entry.LastSent = Transform;
-    Tracked.Add(Guid, Entry);
+    if (!Tracked.RemoveAndCopyValue(NodeId, Entry))
+    {
+        return;
+    }
+    if (ALoomaSyncedActor* Actor = Entry.Actor.Get())
+    {
+        Actor->Destroy(); // bApplyingRemote suppresses the despawn echo
+    }
+}
+
+FLoomaNodeRenderContext ULoomaSceneSyncSubsystem::MakeRenderContext(const FLoomaNodeComponents& Components) const
+{
+    FLoomaNodeRenderContext Context;
+    Context.LightIntensityScale = LightIntensityScale;
+    Context.bBaseAlignModels = bBaseAlignModels;
+    if (Components.bHasModel && !Components.Model.AssetId.IsEmpty())
+    {
+        // Rebuilt from assetId, never taken from the component's `url`: that url is the
+        // browser's /api-proxied relative path, which a native client cannot use.
+        Context.ModelUrl = FString::Printf(TEXT("http://%s/static/%s.glb"), *BackendHost, *Components.Model.AssetId);
+    }
+    return Context;
 }
 
 void ULoomaSceneSyncSubsystem::HandleDespawn(const TSharedPtr<FJsonObject>& Msg)
 {
-    const TArray<TSharedPtr<FJsonValue>>* Guids = nullptr;
-    if (!Msg->TryGetArrayField(TEXT("guids"), Guids))
+    const TArray<TSharedPtr<FJsonValue>>* Ids = nullptr;
+    if (!Msg->TryGetArrayField(TEXT("ids"), Ids) || !Ids)
     {
         return;
     }
-    for (const TSharedPtr<FJsonValue>& V : *Guids)
+    // The cascade to descendants is already expanded by the hub: a client deletes the
+    // one node the user picked, and everyone else is told its children went too.
+    for (const TSharedPtr<FJsonValue>& Value : *Ids)
     {
-        FLoomaTrackedActor Entry;
-        if (Tracked.RemoveAndCopyValue(V->AsString(), Entry))
+        if (Value.IsValid())
         {
-            if (ALoomaSyncedActor* Actor = Entry.Actor.Get())
-            {
-                Actor->Destroy(); // bApplyingRemote suppresses the despawn echo
-            }
+            DropNode(Value->AsString());
         }
     }
 }
 
 void ULoomaSceneSyncSubsystem::HandleTransform(const TSharedPtr<FJsonObject>& Msg)
 {
-    const TArray<TSharedPtr<FJsonValue>>* Objects = nullptr;
-    if (!Msg->TryGetArrayField(TEXT("objects"), Objects))
+    const TArray<TSharedPtr<FJsonValue>>* Nodes = nullptr;
+    if (!Msg->TryGetArrayField(TEXT("nodes"), Nodes) || !Nodes)
     {
         return;
     }
     bool bTransient = false;
     Msg->TryGetBoolField(TEXT("transient"), bTransient);
 
-    for (const TSharedPtr<FJsonValue>& V : *Objects)
+    for (const TSharedPtr<FJsonValue>& Value : *Nodes)
     {
-        const TSharedPtr<FJsonObject> Obj = V->AsObject();
-        if (!Obj.IsValid())
+        const TSharedPtr<FJsonObject> Node = Value.IsValid() ? Value->AsObject() : nullptr;
+        if (!Node.IsValid())
         {
             continue;
         }
-        FLoomaTrackedActor* Entry = Tracked.Find(Obj->GetStringField(TEXT("guid")));
+        FString NodeId;
+        Node->TryGetStringField(TEXT("id"), NodeId);
+        FLoomaTrackedActor* Entry = Tracked.Find(NodeId);
         const TSharedPtr<FJsonObject>* TField = nullptr;
-        if (!Entry || !Obj->TryGetObjectField(TEXT("t"), TField))
+        if (!Entry || !Node->TryGetObjectField(TEXT("t"), TField))
         {
-            continue;
+            continue; // an id we don't know yet is dropped — spawns arrive parents-first
         }
         const FTransform Target = LoomaWireToUe(*TField);
         if (ALoomaSyncedActor* Actor = Entry->Actor.Get())
@@ -289,21 +446,127 @@ void ULoomaSceneSyncSubsystem::HandleTransform(const TSharedPtr<FJsonObject>& Ms
     }
 }
 
-void ULoomaSceneSyncSubsystem::OnSyncedActorDestroyed(AActor* DestroyedActor)
+void ULoomaSceneSyncSubsystem::HandleReparent(const TSharedPtr<FJsonObject>& Msg)
 {
-    ALoomaSyncedActor* Actor = Cast<ALoomaSyncedActor>(DestroyedActor);
-    if (!Actor || Actor->Guid.IsEmpty())
+    const TArray<TSharedPtr<FJsonValue>>* Nodes = nullptr;
+    if (!Msg->TryGetArrayField(TEXT("nodes"), Nodes) || !Nodes)
     {
         return;
     }
-    const bool bWasTracked = Tracked.Remove(Actor->Guid) > 0;
+    for (const TSharedPtr<FJsonValue>& Value : *Nodes)
+    {
+        const TSharedPtr<FJsonObject> Node = Value.IsValid() ? Value->AsObject() : nullptr;
+        if (!Node.IsValid())
+        {
+            continue;
+        }
+        FString NodeId;
+        if (!Node->TryGetStringField(TEXT("id"), NodeId))
+        {
+            continue;
+        }
+        ALoomaSyncedActor* Actor = FindSyncedActor(NodeId);
+        if (!Actor)
+        {
+            continue;
+        }
+        FString ParentId;
+        Node->TryGetStringField(TEXT("parent"), ParentId);
+
+        // The message carries the node's *new* parent-local pose, worked out
+        // pose-preservingly by whoever moved the edge — so the object stays where it
+        // was on screen instead of jumping into its new parent's frame.
+        const TSharedPtr<FJsonObject>* TField = nullptr;
+        const FTransform Local = Node->TryGetObjectField(TEXT("t"), TField)
+            ? LoomaWireToUe(*TField)
+            : Actor->GetLocalTransform();
+        ApplyParent(*Actor, ParentId, Local, /*bSnap=*/true);
+
+        if (FLoomaTrackedActor* Entry = Tracked.Find(NodeId))
+        {
+            Entry->LastSent = Actor->GetLocalTransform();
+            Entry->bMoving = false;
+            Entry->StillFrames = 0;
+        }
+    }
+}
+
+void ULoomaSceneSyncSubsystem::HandlePatch(const TSharedPtr<FJsonObject>& Msg)
+{
+    const TArray<TSharedPtr<FJsonValue>>* Nodes = nullptr;
+    if (!Msg->TryGetArrayField(TEXT("nodes"), Nodes) || !Nodes)
+    {
+        return;
+    }
+    for (const TSharedPtr<FJsonValue>& Value : *Nodes)
+    {
+        const TSharedPtr<FJsonObject> Node = Value.IsValid() ? Value->AsObject() : nullptr;
+        if (!Node.IsValid())
+        {
+            continue;
+        }
+        FString NodeId;
+        if (!Node->TryGetStringField(TEXT("id"), NodeId))
+        {
+            continue;
+        }
+        ALoomaSyncedActor* Actor = FindSyncedActor(NodeId);
+        if (!Actor)
+        {
+            continue;
+        }
+
+        // A patch sets a node's *own* fields: its name and its components. Parent moves
+        // are `reparent`, poses are `transform`, and `id` is not editable at all.
+        FString Name;
+        if (Node->TryGetStringField(TEXT("name"), Name) && !Name.IsEmpty())
+        {
+            Actor->DisplayName = Name;
+#if WITH_EDITOR
+            Actor->SetActorLabel(Name);
+#endif
+        }
+
+        // A component edit arrives as the node's **whole** components array — there are
+        // no per-component ids, by design. Absent means "not touched"; an empty array
+        // means "clear them", which is why TryGetArrayField's result matters and not
+        // just the array's length.
+        const TArray<TSharedPtr<FJsonValue>>* ComponentArray = nullptr;
+        if (Node->TryGetArrayField(TEXT("components"), ComponentArray))
+        {
+            const FLoomaNodeComponents Components = LoomaParseComponents(ComponentArray);
+            Actor->ApplyComponents(Components, MakeRenderContext(Components));
+        }
+    }
+}
+
+ALoomaSyncedActor* ULoomaSceneSyncSubsystem::FindSyncedActor(const FString& NodeId) const
+{
+    if (NodeId.IsEmpty())
+    {
+        return nullptr;
+    }
+    const FLoomaTrackedActor* Entry = Tracked.Find(NodeId);
+    return Entry ? Entry->Actor.Get() : nullptr;
+}
+
+void ULoomaSceneSyncSubsystem::OnSyncedActorDestroyed(AActor* DestroyedActor)
+{
+    ALoomaSyncedActor* Actor = Cast<ALoomaSyncedActor>(DestroyedActor);
+    if (!Actor || Actor->Id.IsEmpty())
+    {
+        return;
+    }
+    const bool bWasTracked = Tracked.Remove(Actor->Id) > 0;
     if (bWasTracked && !bApplyingRemote)
     {
+        // Just the one node: the hub expands the cascade to its descendants and hands
+        // the full list back to everyone, us included.
         TSharedRef<FJsonObject> Msg = MakeShared<FJsonObject>();
         Msg->SetStringField(TEXT("type"), TEXT("despawn"));
-        TArray<TSharedPtr<FJsonValue>> Guids;
-        Guids.Add(MakeShared<FJsonValueString>(Actor->Guid));
-        Msg->SetArrayField(TEXT("guids"), Guids);
+        TArray<TSharedPtr<FJsonValue>> Ids;
+        Ids.Add(MakeShared<FJsonValueString>(Actor->Id));
+        Msg->SetArrayField(TEXT("ids"), Ids);
         SendJson(Msg);
     }
 }
@@ -353,7 +616,9 @@ void ULoomaSceneSyncSubsystem::TickOutbound(float DeltaTime)
             continue; // remote-driven right now — never echo it back
         }
 
-        const FTransform Current = Actor->GetActorTransform();
+        // Parent-local, like the wire: a child dragged inside its parent must report
+        // its own motion, and a child carried *by* its parent must report none.
+        const FTransform Current = Actor->GetLocalTransform();
         const bool bChanged = !Current.Equals(Entry.LastSent, /*Tolerance=*/0.01f);
         if (bChanged)
         {
@@ -384,30 +649,31 @@ void ULoomaSceneSyncSubsystem::TickOutbound(float DeltaTime)
     }
 }
 
-void ULoomaSceneSyncSubsystem::SendTransforms(const TArray<FString>& Guids, bool bTransient)
+void ULoomaSceneSyncSubsystem::SendTransforms(const TArray<FString>& NodeIds, bool bTransient)
 {
-    TArray<TSharedPtr<FJsonValue>> Objects;
-    for (const FString& Guid : Guids)
+    TArray<TSharedPtr<FJsonValue>> Nodes;
+    for (const FString& NodeId : NodeIds)
     {
-        const FLoomaTrackedActor* Entry = Tracked.Find(Guid);
-        ALoomaSyncedActor* Actor = Entry ? Entry->Actor.Get() : nullptr;
+        ALoomaSyncedActor* Actor = FindSyncedActor(NodeId);
         if (!Actor)
         {
             continue;
         }
-        TSharedRef<FJsonObject> Obj = MakeShared<FJsonObject>();
-        Obj->SetStringField(TEXT("guid"), Guid);
-        Obj->SetObjectField(TEXT("t"), LoomaUeToWire(Actor->GetActorTransform()));
-        Objects.Add(MakeShared<FJsonValueObject>(Obj));
+        TSharedRef<FJsonObject> Node = MakeShared<FJsonObject>();
+        Node->SetStringField(TEXT("id"), NodeId);
+        // Relative, for an attached actor as much as a root: the wire's `t` is always
+        // parent-local, and the hub folds it into the live document verbatim.
+        Node->SetObjectField(TEXT("t"), LoomaUeToWire(Actor->GetLocalTransform()));
+        Nodes.Add(MakeShared<FJsonValueObject>(Node));
     }
-    if (Objects.Num() == 0)
+    if (Nodes.Num() == 0)
     {
         return;
     }
     TSharedRef<FJsonObject> Msg = MakeShared<FJsonObject>();
     Msg->SetStringField(TEXT("type"), TEXT("transform"));
     Msg->SetBoolField(TEXT("transient"), bTransient);
-    Msg->SetArrayField(TEXT("objects"), Objects);
+    Msg->SetArrayField(TEXT("nodes"), Nodes);
     SendJson(Msg);
 }
 
@@ -439,36 +705,43 @@ ALoomaSyncedActor* ULoomaSceneSyncSubsystem::SpawnSyncedAsset(const FString& Ass
     {
         return nullptr;
     }
-    Actor->SetActorTransform(Transform);
-    Actor->Guid = FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphens).ToLower();
-    Actor->AssetId = AssetId;
+    Actor->Id = FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphens).ToLower();
     Actor->DisplayName = Name.IsEmpty() ? AssetId : Name;
     Actor->JobId = JobId;
+    Actor->SetLocalTransform(Transform); // a root, so local == world
     Actor->OnDestroyed.AddDynamic(this, &ULoomaSceneSyncSubsystem::OnSyncedActorDestroyed);
-    Actor->LoadMeshFromUrl(FString::Printf(TEXT("http://%s/static/%s.glb"), *BackendHost, *AssetId));
+#if WITH_EDITOR
+    Actor->SetActorLabel(Actor->DisplayName);
+#endif
+
+    // The GLB is a component of this node now, not a property of the actor.
+    FLoomaNodeComponents Components;
+    Components.bHasModel = true;
+    Components.Model.AssetId = AssetId;
+    Components.Model.JobId = JobId;
+    Actor->ApplyComponents(Components, MakeRenderContext(Components));
 
     FLoomaTrackedActor Entry;
     Entry.Actor = Actor;
     Entry.LastSent = Transform;
-    Tracked.Add(Actor->Guid, Entry);
+    Tracked.Add(Actor->Id, Entry);
 
-    TSharedRef<FJsonObject> Obj = MakeShared<FJsonObject>();
-    Obj->SetStringField(TEXT("guid"), Actor->Guid);
-    Obj->SetStringField(TEXT("assetId"), AssetId);
-    Obj->SetStringField(TEXT("name"), Actor->DisplayName);
-    Obj->SetObjectField(TEXT("t"), LoomaUeToWire(Transform));
-    if (!JobId.IsEmpty())
-    {
-        // Tells peers which generation job this instance came from, so they can
-        // match it to a placeholder of their own.
-        Obj->SetStringField(TEXT("jobId"), JobId);
-    }
+    TSharedRef<FJsonObject> Node = MakeShared<FJsonObject>();
+    Node->SetStringField(TEXT("id"), Actor->Id);
+    // Explicitly null rather than omitted: `parent` is a required field, and a spawn
+    // from Unreal lands at the root.
+    Node->SetField(TEXT("parent"), MakeShared<FJsonValueNull>());
+    Node->SetStringField(TEXT("name"), Actor->DisplayName);
+    Node->SetObjectField(TEXT("t"), LoomaUeToWire(Transform));
+    TArray<TSharedPtr<FJsonValue>> ComponentValues;
+    ComponentValues.Add(MakeShared<FJsonValueObject>(LoomaMakeModelComponent(AssetId, JobId)));
+    Node->SetArrayField(TEXT("components"), ComponentValues);
 
     TSharedRef<FJsonObject> Msg = MakeShared<FJsonObject>();
     Msg->SetStringField(TEXT("type"), TEXT("spawn"));
-    TArray<TSharedPtr<FJsonValue>> Objects;
-    Objects.Add(MakeShared<FJsonValueObject>(Obj));
-    Msg->SetArrayField(TEXT("objects"), Objects);
+    TArray<TSharedPtr<FJsonValue>> Nodes;
+    Nodes.Add(MakeShared<FJsonValueObject>(Node));
+    Msg->SetArrayField(TEXT("nodes"), Nodes);
     SendJson(Msg);
 
     return Actor;

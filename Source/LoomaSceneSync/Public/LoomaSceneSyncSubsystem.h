@@ -2,19 +2,21 @@
 
 #include "CoreMinimal.h"
 #include "LoomaGenerationTypes.h"
+#include "LoomaSyncedActor.h"
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "Tickable.h"
 #include "LoomaSceneSyncSubsystem.generated.h"
 
-class ALoomaSyncedActor;
 class IWebSocket;
 class FJsonObject;
+class FJsonValue;
 class ULoomaGenerationHandle;
 
-/** Per-actor bookkeeping for the outbound motion diff. */
+/** Per-node bookkeeping for the outbound motion diff. */
 struct FLoomaTrackedActor
 {
     TWeakObjectPtr<ALoomaSyncedActor> Actor;
+    /** Parent-local, like everything on the wire — a child's diff must not see its parent's motion. */
     FTransform LastSent;
     int32 StillFrames = 0;
     bool bMoving = false;
@@ -27,21 +29,31 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FLoomaGenerationJobEvent, const FLoo
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FLoomaSyncConnectionEvent);
 
 /**
- * Client of the LoomaXR scene-sync hub (backend /ws/scene).
+ * Client of the LoomaXR scene-sync hub (backend /ws/scene), speaking **scene format
+ * v3** — the normative contract is looma-xr-asset-demo/docs/scene-format.md.
  *
- * Inbound: hello -> snapshot -> spawn/despawn/transform messages become
- * ALoomaSyncedActor instances whose meshes load at runtime from
- * http://<BackendHost>/static/<assetId>.glb (glTFRuntime).
+ * A scene is a flat list of nodes with parent pointers: `{id, parent, name, t,
+ * components?}`. There is one kind of node — an object with a transform — and what it
+ * renders comes from its components, so every node becomes one ALoomaSyncedActor
+ * attached to its parent's actor, and `t` is applied as a **parent-local** transform.
  *
- * Outbound: every tick, each tracked actor's transform is diffed against a
- * last-sent cache — any motion (editor/PIE gizmo, physics, sequencer, code)
- * streams as transient transforms at <=30 Hz, with one final commit after the
- * actor comes to rest. Works in packaged builds (no editor delegates).
+ * Inbound: hello -> `scene` (the whole document, on connect and on activation), then
+ * `spawn` / `despawn` / `transform` / `reparent` / `patch`. Structural ops are
+ * re-broadcast by the hub from its own normalised state to *every* client including
+ * the sender, so all of them are applied idempotently.
+ *
+ * Outbound: every tick, each tracked actor's parent-local transform is diffed against
+ * a last-sent cache — any motion (editor/PIE gizmo, physics, sequencer, code) streams
+ * as transient transforms at <=30 Hz, with one final commit after the actor comes to
+ * rest. Works in packaged builds (no editor delegates).
  *
  * Wire convention: right-handed, Y-up, meters, quaternion [x,y,z,w]
  * (three.js/glTF native). Conversion to UE (left-handed, Z-up, cm) is
  * (x,y,z) -> (-z,x,y) x100, matching glTFRuntime's DEFAULT SceneBasis
- * (FglTFRuntimeConfig::GetMatrix) so meshes and transforms agree.
+ * (FglTFRuntimeConfig::GetMatrix) so meshes and transforms agree. It stays valid
+ * per node under hierarchy: a change of basis composes across a parent chain
+ * (M(L1 L2)M^-1 = (M L1 M^-1)(M L2 M^-1)), so each node's local transform converts
+ * independently and UE attachment composes the world pose as three.js does.
  */
 UCLASS(Config = Game)
 class LOOMASCENESYNC_API ULoomaSceneSyncSubsystem : public UGameInstanceSubsystem, public FTickableGameObject
@@ -59,19 +71,26 @@ public:
     virtual bool IsTickable() const override;
 
     /**
-     * Spawn a datalake asset here and on every connected peer (the web app).
+     * Spawn a datalake asset here and on every connected peer (the web app), as a
+     * root node carrying one `model` component.
      *
      * Pass the JobId when placing a generated model so the actor — and the `spawn`
      * every peer receives — records which job produced it. That is what makes
      * `FindSyncedActorByJobId` / the handle's `Find Spawned Actor` resolve later.
+     * It rides *inside* the `model` component, because the hub keeps a known
+     * component's extra keys but strips node-level fields it does not know.
      */
     UFUNCTION(BlueprintCallable, Category = "Looma")
     ALoomaSyncedActor* SpawnSyncedAsset(const FString& AssetId, const FString& Name, const FTransform& Transform,
         const FString& JobId = TEXT(""));
 
-    /** Remove a synced actor here and on every connected peer. */
+    /** Remove a synced actor here and on every connected peer. The hub cascades to its children. */
     UFUNCTION(BlueprintCallable, Category = "Looma")
     void DespawnSyncedActor(ALoomaSyncedActor* Actor);
+
+    /** The actor for a node id, or null if this client does not have that node. */
+    UFUNCTION(BlueprintCallable, Category = "Looma")
+    ALoomaSyncedActor* FindSyncedActor(const FString& NodeId) const;
 
     UFUNCTION(BlueprintPure, Category = "Looma")
     bool IsSyncConnected() const;
@@ -181,19 +200,54 @@ public:
     UPROPERTY(Config)
     FString BackendHost = TEXT("127.0.0.1:8000");
 
+    /**
+     * Trim on every light's wire intensity. The units already match 1:1 (three.js is
+     * in candela for point/spot and lux for directional, and so is UE), so this exists
+     * only because the two renderers' exposure and tone mapping differ — see
+     * ALoomaSyncedActor::ApplyLight. Same .ini section as BackendHost.
+     */
+    UPROPERTY(Config)
+    float LightIntensityScale = 1.0f;
+
+    /**
+     * Lift a `model`'s GLB so its bounding-box floor sits on the node origin, matching
+     * the web client (frontend/src/scene/pivot.js). False restores the pre-v3 Unreal
+     * behaviour — the GLB centred on the node origin, i.e. half-buried at floor level.
+     */
+    UPROPERTY(Config)
+    bool bBaseAlignModels = true;
+
 private:
     void Connect();
     void SendJson(const TSharedRef<FJsonObject>& Msg);
 
-    // Inbound
+    // Inbound — one handler per wire message (see the class comment).
     void OnRawMessage(const FString& Text);
-    void HandleSnapshot(const TSharedPtr<FJsonObject>& Msg);
+    /** The whole document: reconcile against what we hold, dropping nodes it no longer has. */
+    void HandleScene(const TSharedPtr<FJsonObject>& Msg);
     void HandleSpawn(const TSharedPtr<FJsonObject>& Msg);
     void HandleDespawn(const TSharedPtr<FJsonObject>& Msg);
     void HandleTransform(const TSharedPtr<FJsonObject>& Msg);
+    void HandleReparent(const TSharedPtr<FJsonObject>& Msg);
+    void HandlePatch(const TSharedPtr<FJsonObject>& Msg);
     void HandleGeneration(const TSharedPtr<FJsonObject>& Msg);
-    /** Spawn-or-update from one wire object (used by snapshot and spawn). */
-    void UpsertRemoteObject(const TSharedPtr<FJsonObject>& Obj);
+
+    /** Spawn-or-update from one whole wire node (used by `scene` and `spawn`). */
+    void UpsertNode(const TSharedPtr<FJsonObject>& Node);
+    /** Apply a batch of whole nodes, parents first, then resolve any late parents. */
+    void UpsertNodes(const TArray<TSharedPtr<FJsonValue>>& Nodes);
+    /** Attach (or detach) an actor to its parent and set its parent-local pose. */
+    void ApplyParent(ALoomaSyncedActor& Actor, const FString& ParentId, const FTransform& Local, bool bSnap);
+    /**
+     * Attach anything still waiting for a parent we hadn't seen yet. The hub orders
+     * spawns parents-first, so this should never fire — it is the defensive half of
+     * "a node whose parent is unknown becomes a root".
+     */
+    void ResolvePendingParents();
+    /** Destroy an actor and forget it, without echoing a despawn back to the hub. */
+    void DropNode(const FString& NodeId);
+    /** What ApplyComponents needs from outside the node: the GLB url and the config. */
+    FLoomaNodeRenderContext MakeRenderContext(const FLoomaNodeComponents& Components) const;
 
     // Generation helpers
     void HydrateGenerationQueue();
@@ -207,15 +261,18 @@ private:
 
     // Outbound motion diff
     void TickOutbound(float DeltaTime);
-    void SendTransforms(const TArray<FString>& Guids, bool bTransient);
+    void SendTransforms(const TArray<FString>& NodeIds, bool bTransient);
 
     /** Deliver the cached state to handles created for an already-known job. */
     void FlushPendingHandleReplays();
 
     TSharedPtr<IWebSocket> Socket;
     FString ClientId;
-    TMap<FString, FLoomaTrackedActor> Tracked; // guid -> actor + last-sent cache
+    TMap<FString, FLoomaTrackedActor> Tracked; // node id -> actor + last-sent cache
     TMap<FString, FLoomaGenerationJob> Jobs;   // jobId -> latest job snapshot
+
+    /** Which saved scene the hub says is live (`sceneId`); empty for an unsaved one. */
+    FString ActiveSceneId;
 
     /** jobId -> per-job event handle. Only jobs a caller asked about get one. */
     UPROPERTY()

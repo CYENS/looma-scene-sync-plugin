@@ -12,7 +12,8 @@ this plugin lives in [looma-xr-asset-demo](https://github.com/CYENS/looma-xr-ass
 | Unit | Purpose |
 | --- | --- |
 | `ULoomaSceneSyncSubsystem` | Owns the WebSocket connection, dispatches scene messages, loads GLBs at runtime, spawns synced assets |
-| `ALoomaSyncedActor` | An actor whose transform/lifetime mirrors an object in the web scene |
+| `ALoomaSyncedActor` | One scene **node**: a transform, with the engine components its wire components ask for |
+| `LoomaSceneComponents` | The wire's `components` array parsed into keyed specs (`model` / `mesh` / `material` / `light`) |
 | `LoomaWireConvert` | Wire↔UE transform conversion, shared by the scene-sync layer and the generation-job parser |
 | `ELoomaJobState` / `LoomaGenerationTypes` | Text→3D job lifecycle, mirroring the backend's `JobState` vocabulary |
 | `ULoomaGenerationHandle` | One generation job's events, scoped to that job — raw state events plus per-stage ones (queued / generating images / awaiting selection / generating asset / generated), and the calls to drive the job |
@@ -20,6 +21,46 @@ this plugin lives in [looma-xr-asset-demo](https://github.com/CYENS/looma-xr-ass
 | `ULoomaDownloadImageAction` | Async Blueprint node — download a candidate/selected image, decode to a transient `UTexture2D` |
 
 Module `LoomaSceneSync` is `Runtime`, loading phase `Default`.
+
+## The scene format
+
+This plugin speaks **scene format v3**. The normative contract is
+`docs/scene-format.md` in looma-xr-asset-demo; what follows is only how it lands in Unreal.
+
+A scene is a **flat list of nodes with parent pointers** — `{id, parent, name, t, components?}`.
+There is one kind of node, an object with a transform, and what it *is* comes from the components
+attached to it. So one node is one `ALoomaSyncedActor`, attached to its parent's actor, whose root
+is a plain `USceneComponent`; a node with no components is an empty object, and a perfectly
+ordinary one, because its children's transforms are relative to it.
+
+**`t` is parent-local.** World poses are composed by UE attachment, exactly as three.js composes
+them in the browser. The axis/unit conversion is unchanged and still per node — a change of basis
+composes across a parent chain.
+
+| Wire component | Unreal |
+| --- | --- |
+| `model` | `UStaticMeshComponent` built from `http://<BackendHost>/static/<assetId>.glb` via glTFRuntime (the whole node tree merged into one mesh). The wire's `url` is ignored — the path is rebuilt from `assetId`. Lifted so its bounding-box floor sits on the node origin, matching the web client |
+| `mesh` | `UStaticMeshComponent` with an `/Engine/BasicShapes` primitive — box / sphere / plane / cylinder. `size` is an **extent in metres**, so the primitive is measured and scaled to fit; pivot is the node origin (a box at y = 0 sits half in the floor, as in the browser) |
+| `material` | A `UMaterialInstanceDynamic` on the sibling `mesh`, from `BasicShapeMaterial`: `color` (sRGB hex → linear) and `roughness`. Never applied to a `model`, which carries its own materials. `metalness` has no parameter to drive and is ignored |
+| `light` | `UPointLightComponent` / `USpotLightComponent` / `UDirectionalLightComponent`. Aim convention: **the node's local −Y is the beam direction** |
+| anything else | **Skipped, with the node kept** — logged once per type. That rule is what lets a new component type ship without a coordinated release across three clients |
+
+### Light intensity
+
+three.js in its physically-correct mode (which the web client uses, `decay = 2`) measures point
+and spot lights in **candela** and directional lights in **lux**. UE measures a local light in
+whichever `ELightUnits` it is told, and a directional light in lux. So the conversion is **1:1 in
+matching units** — `IntensityUnits = Candelas` for point/spot, the bare number for directional —
+with no magic constant.
+
+What does *not* match is exposure: UE's auto-exposure and tone mapper are not three.js's, so the
+same candela value can read brighter or darker on screen. `LightIntensityScale` (config, default
+`1.0`) is the trim for that, and the only place a fudge factor belongs.
+
+`distance: 0` means "no falloff limit" in three.js, which UE cannot express — a local light is
+always clamped at its attenuation radius — so it maps to 10 m. `angle` is a half-angle in both
+engines (radians vs degrees), and `penumbra` becomes the inner cone: `inner = outer × (1 −
+penumbra)`.
 
 ### Coordinate conventions
 
