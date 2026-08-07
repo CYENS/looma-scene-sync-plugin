@@ -16,10 +16,19 @@ class ULoomaGenerationHandle;
 struct FLoomaTrackedActor
 {
     TWeakObjectPtr<ALoomaSyncedActor> Actor;
-    /** Parent-local, like everything on the wire — a child's diff must not see its parent's motion. */
+    /**
+     * Parent-local, like everything on the wire — a child's diff must not see its
+     * parent's motion. The world pose while the actor hangs off something the wire
+     * cannot name, which is the pose we report for it (see TickOutbound).
+     */
     FTransform LastSent;
     int32 StillFrames = 0;
     bool bMoving = false;
+    /**
+     * Attached to an actor that is not a node, as of the last poll. Held only so the
+     * warning about it fires on the rising edge — once per attachment, not per tick.
+     */
+    bool bForeignParent = false;
 };
 
 /** Fired for generation-job lifecycle changes. Carries the full job snapshot. */
@@ -45,7 +54,9 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE(FLoomaSyncConnectionEvent);
  * Outbound: every tick, each tracked actor's parent-local transform is diffed against
  * a last-sent cache — any motion (editor/PIE gizmo, physics, sequencer, code) streams
  * as transient transforms at <=30 Hz, with one final commit after the actor comes to
- * rest. Works in packaged builds (no editor delegates).
+ * rest. The same poll diffs each actor's *attachment* against the parent the hub last
+ * told us, so re-parenting in the World Outliner reports a `reparent`, ahead of any
+ * pose for that node. Works in packaged builds (no editor delegates).
  *
  * Wire convention: right-handed, Y-up, meters, quaternion [x,y,z,w]
  * (three.js/glTF native). Conversion to UE (left-handed, Z-up, cm) is
@@ -279,6 +290,12 @@ private:
     // Outbound motion diff
     void TickOutbound(float DeltaTime);
     void SendTransforms(const TArray<FString>& NodeIds, bool bTransient);
+    /**
+     * Report an attachment change made here: each node's new parent (null for a root)
+     * with the pose it should keep under it. No transient/final split — a re-parent is
+     * structural, it happens once per gesture, and there is nothing to stream.
+     */
+    void SendReparent(const TArray<FString>& NodeIds);
 
     /** Deliver the cached state to handles created for an already-known job. */
     void FlushPendingHandleReplays();

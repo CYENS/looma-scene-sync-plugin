@@ -59,6 +59,38 @@ FString NormalizeRestBase(const FString& Configured)
     }
     return Base;
 }
+
+/**
+ * The node an attachment names on the wire — pass GetAttachParentActor() — or null if
+ * it names none, which is what a root is.
+ *
+ * Only another node can be a parent: the wire addresses parents by node id, and an
+ * attachment to anything else has no id to name. That covers a plain level actor and
+ * also an ALoomaSyncedActor someone dropped into the map by hand, which never went
+ * through the hub and so has no `Id` — as unnameable as an AStaticMeshActor.
+ */
+ALoomaSyncedActor* WireParentNode(AActor* AttachedTo)
+{
+    ALoomaSyncedActor* Parent = Cast<ALoomaSyncedActor>(AttachedTo);
+    return (Parent && !Parent->Id.IsEmpty()) ? Parent : nullptr;
+}
+
+/**
+ * The pose to put on the wire for this actor: parent-local under a node, its **world**
+ * pose otherwise.
+ *
+ * For a root the two are the same value — an unattached root component's relative
+ * transform *is* its world transform — so this only bites in one case: an actor
+ * attached to something the wire cannot name. There we report the node as a root
+ * (see TickOutbound), and a root's `t` is a world pose, so it must be read as one.
+ * Anything else would send the browser a pose measured in a frame it has never heard
+ * of. A node parent stays strictly local, which is the invariant that keeps a child
+ * from re-broadcasting its parent's motion as its own.
+ */
+FTransform WirePose(const ALoomaSyncedActor& Actor)
+{
+    return WireParentNode(Actor.GetAttachParentActor()) ? Actor.GetLocalTransform() : Actor.GetActorTransform();
+}
 } // namespace
 
 // --- Lifecycle ---------------------------------------------------------------
@@ -792,6 +824,7 @@ void ULoomaSceneSyncSubsystem::TickOutbound(float DeltaTime)
     SinceLastTransientSend += DeltaTime;
     const bool bMaySendTransient = SinceLastTransientSend >= TransientInterval;
 
+    TArray<FString> Reparented;
     TArray<FString> Moved;
     TArray<FString> Settled;
 
@@ -804,14 +837,85 @@ void ULoomaSceneSyncSubsystem::TickOutbound(float DeltaTime)
             It.RemoveCurrent();
             continue;
         }
+        if (Actor->IsActorBeingDestroyed())
+        {
+            // On its way out: its despawn is already on the wire (OnSyncedActorDestroyed
+            // fires inside Destroy), and the detaching and re-posing UE does on the way
+            // down is teardown, not an edit anyone made.
+            continue;
+        }
         if (Actor->HasRemoteTarget())
         {
             continue; // remote-driven right now — never echo it back
         }
 
+        // --- Attachment, before pose -----------------------------------------
+        // `ParentId` is written only by ApplyParent, which only the inbound paths
+        // reach, so it *is* "the parent the hub last told us" — the baseline to diff
+        // the attachment against, with no second copy of the truth to keep in step.
+        // The equal case, which is every node on every other tick, costs a pointer
+        // walk and one string compare (an empty-string test for a root).
+        AActor* const AttachedTo = Actor->GetAttachParentActor();
+        ALoomaSyncedActor* const WireParent = WireParentNode(AttachedTo);
+
+        // Attached to something that is not a node — decided on HAM-160: the node stays
+        // a **root** on the wire and reports its **world** pose, so the browser draws it
+        // where it visibly is, which is the only honest reading available. The
+        // attachment is kept here and simply not described: a root whose world pose the
+        // level happens to drive still reports that pose correctly, because WirePose
+        // reads it in world space. (One asymmetry to know about: a node moved *out of*
+        // another node onto a stray actor does send `reparent: null`, and the hub's echo
+        // of that runs ApplyParent, which detaches it here too.)
+        //
+        // Edge-triggered off the tracked entry, so this warns once per attachment
+        // rather than once per tick.
+        const bool bForeignParent = AttachedTo != nullptr && WireParent == nullptr;
+        if (bForeignParent != Entry.bForeignParent)
+        {
+            Entry.bForeignParent = bForeignParent;
+            if (bForeignParent)
+            {
+                UE_LOG(LogLoomaSync, Warning,
+                    TEXT("Node '%s' is attached to '%s', which is not a synced node — the wire has no id ")
+                    TEXT("for it, so a parent edge cannot be expressed. Reporting the node as a root at ")
+                    TEXT("its world pose; attach it to another synced actor if the edge itself should sync."),
+                    *Actor->Id, *AttachedTo->GetName());
+            }
+        }
+
+        const bool bParentChanged = WireParent
+            ? WireParent->Id != Actor->ParentId
+            : !Actor->ParentId.IsEmpty();
+        if (bParentChanged)
+        {
+            // A detach nobody asked for: the old parent was destroyed here, and
+            // AActor::Destroy detaches its children on the way out. Its despawn is
+            // already sent and the hub cascades that to this node, so reporting the
+            // orphan as re-parented to the root is a message about a node that is
+            // about to vanish. (The actor itself is not being destroyed, so the guard
+            // above does not catch this — the parent's entry is simply gone.)
+            const bool bOrphaned = !WireParent && !FindSyncedActor(Actor->ParentId);
+
+            // Re-seat the baseline exactly as inbound HandleReparent does, whether or
+            // not we report it. UE attached keeping the world pose, so the node's
+            // relative transform moved without the node moving: leave that in
+            // LastSent and the very next diff sends it as a `transform`, which the hub
+            // relays verbatim under the node's *old* parent. That spurious message —
+            // not the missing reparent — is what corrupts the stored scene.
+            Actor->ParentId = WireParent ? WireParent->Id : FString();
+            Entry.LastSent = WirePose(*Actor);
+            Entry.bMoving = false;
+            Entry.StillFrames = 0;
+            if (!bOrphaned)
+            {
+                Reparented.Add(It.Key());
+            }
+            continue;
+        }
+
         // Parent-local, like the wire: a child dragged inside its parent must report
         // its own motion, and a child carried *by* its parent must report none.
-        const FTransform Current = Actor->GetLocalTransform();
+        const FTransform Current = WirePose(*Actor);
         const bool bChanged = !Current.Equals(Entry.LastSent, /*Tolerance=*/0.01f);
         if (bChanged)
         {
@@ -831,6 +935,13 @@ void ULoomaSceneSyncSubsystem::TickOutbound(float DeltaTime)
         }
     }
 
+    // Structure first: a pose in the same tick belongs to whatever hierarchy this
+    // establishes. (Nothing re-parented above is in Moved or Settled — its baseline
+    // was re-seated — but a *sibling* pose could be, and the ordering is free.)
+    if (Reparented.Num() > 0)
+    {
+        SendReparent(Reparented);
+    }
     if (Moved.Num() > 0)
     {
         SinceLastTransientSend = 0.0f;
@@ -855,8 +966,11 @@ void ULoomaSceneSyncSubsystem::SendTransforms(const TArray<FString>& NodeIds, bo
         TSharedRef<FJsonObject> Node = MakeShared<FJsonObject>();
         Node->SetStringField(TEXT("id"), NodeId);
         // Relative, for an attached actor as much as a root: the wire's `t` is always
-        // parent-local, and the hub folds it into the live document verbatim.
-        Node->SetObjectField(TEXT("t"), LoomaUeToWire(Actor->GetLocalTransform()));
+        // parent-local, and the hub folds it into the live document verbatim. The pose
+        // read here must be the same quantity the diff in TickOutbound compared, or a
+        // node attached to a non-node would be measured in one frame and reported in
+        // another — hence WirePose on both sides rather than GetLocalTransform.
+        Node->SetObjectField(TEXT("t"), LoomaUeToWire(WirePose(*Actor)));
         Nodes.Add(MakeShared<FJsonValueObject>(Node));
     }
     if (Nodes.Num() == 0)
@@ -866,6 +980,53 @@ void ULoomaSceneSyncSubsystem::SendTransforms(const TArray<FString>& NodeIds, bo
     TSharedRef<FJsonObject> Msg = MakeShared<FJsonObject>();
     Msg->SetStringField(TEXT("type"), TEXT("transform"));
     Msg->SetBoolField(TEXT("transient"), bTransient);
+    Msg->SetArrayField(TEXT("nodes"), Nodes);
+    SendJson(Msg);
+}
+
+void ULoomaSceneSyncSubsystem::SendReparent(const TArray<FString>& NodeIds)
+{
+    TArray<TSharedPtr<FJsonValue>> Nodes;
+    for (const FString& NodeId : NodeIds)
+    {
+        ALoomaSyncedActor* Actor = FindSyncedActor(NodeId);
+        if (!Actor)
+        {
+            continue;
+        }
+        TSharedRef<FJsonObject> Node = MakeShared<FJsonObject>();
+        Node->SetStringField(TEXT("id"), NodeId);
+        // Explicitly null rather than omitted: `parent` is a required field of the op —
+        // "no parent" is a value here, not a field we had nothing to say about — and it
+        // is the only way to tell the hub a node has left the hierarchy.
+        if (Actor->ParentId.IsEmpty())
+        {
+            Node->SetField(TEXT("parent"), MakeShared<FJsonValueNull>());
+        }
+        else
+        {
+            Node->SetStringField(TEXT("parent"), Actor->ParentId);
+        }
+        // The node's pose *under its new parent*, which is the whole point of sending
+        // one: it is what keeps the object still on screen across the move. We get it
+        // for free — UE attached keeping the world pose, so the relative transform it
+        // left behind is already the pose-preserving value the web works out by hand
+        // (`localUnder` in frontend/src/commands.js).
+        Node->SetObjectField(TEXT("t"), LoomaUeToWire(WirePose(*Actor)));
+        Nodes.Add(MakeShared<FJsonValueObject>(Node));
+    }
+    if (Nodes.Num() == 0)
+    {
+        return;
+    }
+    // Fire and forget. The hub drops a move naming a parent it does not know (and one
+    // that would close a loop, which the Outliner will not let you build) and
+    // broadcasts nothing back — so we would hold an edge it does not have. Deliberately
+    // not reconciled: tracking in-flight reparents to await an ack is a lot of
+    // machinery for a case the editor makes hard to reach, and the next `scene`
+    // message, which is the whole document, corrects us anyway.
+    TSharedRef<FJsonObject> Msg = MakeShared<FJsonObject>();
+    Msg->SetStringField(TEXT("type"), TEXT("reparent"));
     Msg->SetArrayField(TEXT("nodes"), Nodes);
     SendJson(Msg);
 }
