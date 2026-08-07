@@ -38,6 +38,14 @@ ordinary one, because its children's transforms are relative to it.
 them in the browser. The axis/unit conversion is unchanged and still per node — a change of basis
 composes across a parent chain.
 
+**Structure edited in Unreal is reported back.** The same per-tick poll that diffs each actor's
+pose also diffs its *attachment* against the parent the hub last named, so dragging a row onto
+another in the World Outliner sends a `reparent` — carrying the node's new parent-local pose, and
+ahead of any `transform` for it, so the object stays put in both clients. Attaching to an actor
+that is **not** a synced node cannot be expressed (the wire addresses parents by node id and there
+is none for a stray level actor): the node is reported as a root at its **world** pose, with one
+warning naming the actor. Component edits are not reported outbound yet.
+
 | Wire component | Unreal |
 | --- | --- |
 | `model` | `UStaticMeshComponent` built from `<BackendUrl>/static/<assetId>.glb` via glTFRuntime (the whole node tree merged into one mesh). The wire's `url` is ignored inbound — the path is rebuilt from `assetId` — but a spawn from Unreal **does** emit one (`WebAssetPrefix` + `/static/<assetId>.glb`), because a web peer renders nothing without it and the hub will not invent it. Lifted so its bounding-box floor sits on the node origin, matching the web client |
