@@ -3,9 +3,15 @@
 Unreal Engine 5.6 runtime plugin providing bidirectional realtime scene sync between Unreal
 and the LoomaXR web app — a WebSocket relay, runtime GLB loading, and text→3D generation jobs.
 
-Part of the [LoomaXR](https://github.com/CYENS/hamlet-loomaxr) project. The canonical source of
-this plugin lives in [looma-xr-asset-demo](https://github.com/CYENS/looma-xr-asset-demo) at
-`unreal/LoomaSceneSync`, which consumes this repo as a submodule.
+Part of the [LoomaXR](https://github.com/CYENS/hamlet-loomaxr) project. This repository is the
+plugin's only home. It is developed in the UE 5.8 viewer's checkout of it,
+`code/looma-xr-viewer-ue58/Plugins/LoomaSceneSync` in the umbrella repo — that is the project
+it is built and tested against. The UE 5.6 viewer (`code/looma-xr-viewer`) consumes it as a
+second submodule, so a change here reaches a consumer only once its gitlink is bumped.
+
+The protocol it implements is specified in
+[looma-xr-asset-demo](https://github.com/CYENS/looma-xr-asset-demo): `docs/scene-format.md`
+(normative) and `docs/unreal-sync.md` (UE design notes).
 
 ## Contents
 
