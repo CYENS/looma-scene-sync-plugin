@@ -29,7 +29,18 @@ The protocol it implements is specified in
 | `ULoomaSubmitGenerationAction` | Async Blueprint node — submit a text→3D job (`POST /generate`) |
 | `ULoomaDownloadImageAction` | Async Blueprint node — download a candidate/selected image, decode to a transient `UTexture2D` |
 
-Module `LoomaSceneSync` is `Runtime`, loading phase `Default`.
+Two `Runtime` modules, both loading phase `Default`. `LoomaSceneSync` is the protocol and
+runtime half and has no UI dependency at all; `LoomaSceneSyncUI` is optional and carries the Slate
+one. Dependencies flow one way — the UI module depends on the core, never the reverse — so
+removing the `LoomaSceneSyncUI` entry from `LoomaSceneSync.uplugin` leaves the core building and
+behaving unchanged. That matters for a headless or dedicated-server build, which has no business
+linking Slate.
+
+To drop the UI module, **delete its entry** from the `Modules` array, or give it a
+`TargetDenyList` / `PlatformDenyList`. Adding `"Enabled": false` to the module descriptor does
+**nothing** — that key belongs to entries in the `Plugins` array, and UnrealBuildTool ignores
+unrecognised keys on a module descriptor, so the module still compiles and links. Verified by
+building it both ways.
 
 ## The scene format
 
