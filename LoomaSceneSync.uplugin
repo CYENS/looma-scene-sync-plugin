@@ -13,6 +13,11 @@
       "Name": "LoomaSceneSync",
       "Type": "Runtime",
       "LoadingPhase": "Default"
+    },
+    {
+      "Name": "LoomaSceneSyncUI",
+      "Type": "Runtime",
+      "LoadingPhase": "Default"
     }
   ],
   "Plugins": [
