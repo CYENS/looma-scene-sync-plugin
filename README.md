@@ -28,6 +28,7 @@ The protocol it implements is specified in
 | `ULoomaLoginAction` | Async Blueprint node — log in (`POST /auth/login`) |
 | `ULoomaSubmitGenerationAction` | Async Blueprint node — submit a text→3D job (`POST /generate`) |
 | `ULoomaDownloadImageAction` | Async Blueprint node — download a candidate/selected image, decode to a transient `UTexture2D` |
+| `ULoomaLoginUI` | *(UI module)* Two Blueprint calls that put the bare-bones login form on the viewport, or take it off |
 
 Two `Runtime` modules, both loading phase `Default`. `LoomaSceneSync` is the protocol and
 runtime half and has no UI dependency at all; `LoomaSceneSyncUI` is optional and carries the Slate
@@ -41,6 +42,45 @@ To drop the UI module, **delete its entry** from the `Modules` array, or give it
 **nothing** — that key belongs to entries in the `Plugins` array, and UnrealBuildTool ignores
 unrecognised keys on a module descriptor, so the module still compiles and links. Verified by
 building it both ways.
+
+### The login form
+
+`LoomaSceneSyncUI` ships a **bare-bones login form** — a working starting point, not a designed
+screen. Two Blueprint nodes, both under `Looma|Auth`:
+
+| Node | What it does |
+| --- | --- |
+| **Show Login UI** | Adds the form to the viewport. Idempotent, so calling it from `BeginPlay` on a level that reloads does not stack copies |
+| **Hide Login UI** | Takes it off. Safe when it is not showing |
+| **Is Login UI Showing** | Whether it is up |
+
+**Call `Show Login UI` unconditionally** — at startup, without first working out whether this
+backend wants a login. The form decides for itself and collapses to nothing while the auth state
+is unknown *and* while auth is disabled. That check is the one thing here most worth not
+reimplementing: "we have not managed to ask yet" must not render as "no login needed", and because
+the auth probe retries with backoff, that window can be seconds on a scene busy enough to saturate
+the HTTP connection pool.
+
+What it renders, given `LOOMA_AUTH_ENABLED=1` on the backend: username, a masked password, a
+submit button that disables itself while a login is in flight, and an error line carrying the
+backend's own wording — which is deliberately one generic message for a wrong password and an
+unknown account alike. Once signed in, the name and a log-out button. A session restored from disk
+but not yet re-validated says so, rather than passing itself off as confirmed.
+
+The password is never stored on the widget and never logged. It is read from the box at submit and
+handed straight to `RequestLogin`.
+
+**Layout and styling live in C++**, because the plugin sets `"CanContainContent": false` and this
+module keeps it that way — no `WBP`, nothing to cook, nothing to re-parent. If you want a designed
+login screen, build your own widget against the `Looma|Auth` surface on
+`ULoomaSceneSyncSubsystem` (`IsAuthEnabled`, `GetIdentity`, `Login`, `Logout`,
+`OnAuthStateChanged`, `OnIdentityChanged`) rather than inheriting this one. An asset invites
+editing; an API invites replacing.
+
+One known limitation: the form is tracked in a single process-wide slot, so under *Play As Client*
+with two PIE windows the second `Show Login UI` is a no-op. Both windows share one game-instance
+subsystem and therefore one session, so a second form would be showing the first one's login
+anyway.
 
 ## The scene format
 
