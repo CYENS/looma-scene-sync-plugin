@@ -38,6 +38,40 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FLoomaGenerationJobEvent, const FLoo
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FLoomaSyncConnectionEvent);
 
 /**
+ * Whether the backend wants a login — read from the `auth` block of `GET /health`,
+ * the discovery endpoint HAM-172 added for exactly this question. The web frontend
+ * branches on the same block to decide whether to draw a login screen at all, so
+ * there is no second "what does this backend support" route to keep in sync.
+ *
+ * Three states rather than a bool, because "this backend needs no login" and "we have
+ * not managed to ask yet" call for opposite behaviour: the first says go straight into
+ * the scene, the second says wait. Collapsing them into `false` builds a client that
+ * silently skips the login screen for the first second of every launch — and forever
+ * against a backend that was not up yet — a bug that presents as a race and is really
+ * a missing state.
+ *
+ * Registration is folded into the enabled cases instead of riding alongside as a
+ * second flag, because `auth.registrationEnabled` only means anything when auth is on.
+ * A standalone bool would force every call site to disambiguate "false because
+ * registration is closed" from "false because there is nothing to register with".
+ */
+UENUM(BlueprintType)
+enum class ELoomaAuthState : uint8
+{
+    /** Not asked yet, unreachable, or an answer we could not read. Assume nothing. */
+    Unknown,
+    /** `auth.enabled == false` — every route is open and no token is needed. */
+    Disabled,
+    /** Login required; `auth.registrationEnabled == false`, so accounts are made server-side. */
+    EnabledRegistrationClosed,
+    /** Login required, and this client may also create an account. */
+    EnabledRegistrationOpen
+};
+
+/** Fired when the backend's auth state becomes known, or changes. */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FLoomaAuthStateEvent, ELoomaAuthState, AuthState);
+
+/**
  * Client of the LoomaXR scene-sync hub (backend /ws/scene), speaking **scene format
  * v3** — the normative contract is looma-xr-asset-demo/docs/scene-format.md.
  *
@@ -137,6 +171,39 @@ public:
      */
     UFUNCTION(BlueprintCallable, Category = "Looma")
     void LogConnectionStatus();
+
+    // --- Auth discovery ------------------------------------------------------
+    // Probed on Initialize, on every socket connect, and whenever the backend address
+    // moves — never only on demand, because a UI has to be able to ask this before a
+    // human has typed anything.
+
+    /** What `GET /health` last said about auth. See ELoomaAuthState. */
+    UFUNCTION(BlueprintPure, Category = "Looma|Auth")
+    ELoomaAuthState GetAuthState() const;
+
+    /**
+     * We hold a `/health` answer we can act on. Gate every "show the login screen"
+     * decision on this first: false means undecided, never "no login needed".
+     */
+    UFUNCTION(BlueprintPure, Category = "Looma|Auth")
+    bool IsAuthStateKnown() const;
+
+    /** The backend requires a login. False while the state is still Unknown. */
+    UFUNCTION(BlueprintPure, Category = "Looma|Auth")
+    bool IsAuthEnabled() const;
+
+    /** The backend accepts self-registration. Only ever true when auth is enabled. */
+    UFUNCTION(BlueprintPure, Category = "Looma|Auth")
+    bool IsRegistrationEnabled() const;
+
+    /**
+     * The auth state became known, or moved — a different backend, or one that was
+     * reconfigured. Fires only on an actual change, so binding is enough and nothing
+     * needs to poll; a change *to* Unknown is a change worth hearing about, since it
+     * is what invalidates a login screen drawn from the previous backend's answer.
+     */
+    UPROPERTY(BlueprintAssignable, Category = "Looma|Auth")
+    FLoomaAuthStateEvent OnAuthStateChanged;
 
     // --- Generation jobs (observe) -------------------------------------------
 
@@ -245,6 +312,21 @@ private:
     void CloseSocket();
     /** A settings edit landed: reconnect if the backend address moved. */
     void OnSettingsChanged();
+
+    /**
+     * `GET /health` — the one implementation behind both callers. bLogDiagnostics is
+     * what makes it the `Looma.Status` diagnostic: the reachability triage naming
+     * likely causes. The unprompted probes (startup, socket connect, settings change)
+     * pass false, because that prose on every editor launch — where the backend
+     * routinely is not up yet, and the socket layer already says so once per retry —
+     * is noise nobody asked for. The auth state is refreshed either way; that is the
+     * half that is not a diagnostic.
+     */
+    void ProbeHealth(bool bLogDiagnostics);
+
+    /** Adopt an auth state, broadcasting OnAuthStateChanged only if it actually moved. */
+    void SetAuthState(ELoomaAuthState NewState);
+
     void SendJson(const TSharedRef<FJsonObject>& Msg);
 
     // Inbound — one handler per wire message (see the class comment).
@@ -305,6 +387,8 @@ private:
     FString SocketUrl;
     /** Connect() has been called and the socket has neither opened nor failed yet. */
     bool bConnecting = false;
+    /** What /health last told us about auth. Unknown until a probe lands, and again if one fails. */
+    ELoomaAuthState AuthState = ELoomaAuthState::Unknown;
     /** Our binding on ULoomaSceneSyncSettings::OnSettingsChanged, released on teardown. */
     FDelegateHandle SettingsChangedHandle;
     FString ClientId;

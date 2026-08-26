@@ -65,7 +65,8 @@ FAutoConsoleCommandWithWorld GLoomaReconnectCommand(
 
 FAutoConsoleCommandWithWorld GLoomaStatusCommand(
     TEXT("Looma.Status"),
-    TEXT("Log the Looma scene-sync connection: hub URL, REST base, socket state, and a GET /health probe."),
+    TEXT("Log the Looma scene-sync connection: hub URL, REST base, socket state, backend auth state, ")
+    TEXT("and a GET /health probe."),
     FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* World) {
         if (ULoomaSceneSyncSubsystem* Subsystem = FindLoomaSubsystem(World))
         {

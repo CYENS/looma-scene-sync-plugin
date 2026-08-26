@@ -126,10 +126,38 @@ the new section, which then wins.
 | Command | What it does |
 | --- | --- |
 | `Looma.Reconnect` | Drops the socket and connects again immediately, re-reading the settings. `ULoomaSceneSyncSubsystem::Reconnect`, also Blueprint-callable |
-| `Looma.Status` | Logs state (`CONNECTED` / `CONNECTING` / `DISCONNECTED (retry in Ns)` / `NO SOCKET`), the hub URL actually in use, the REST base, node/job counts and the active scene id — then `GET /health` and logs whether the backend answered, which separates "the socket is down" from "nothing is listening" |
+| `Looma.Status` | Logs state (`CONNECTED` / `CONNECTING` / `DISCONNECTED (retry in Ns)` / `NO SOCKET`), the hub URL actually in use, the REST base, the backend's auth state, node/job counts and the active scene id — then `GET /health` and logs whether the backend answered, which separates "the socket is down" from "nothing is listening". The `/health` answer is also what refreshes the auth state, so this doubles as "ask the backend again" |
 
 Both work in the editor console, in PIE and in a packaged build; they resolve the subsystem from
 the current game instance, and report the configured URL when nothing is running.
+
+### Auth discovery
+
+The backend says whether it wants a login in the `auth` block of `GET /health` —
+`{"enabled": bool, "registrationEnabled": bool}`, the discovery block HAM-172 added, and the same
+one the web frontend reads to decide whether to draw a login screen. The plugin probes `/health`
+on startup, on every successful socket connect, and whenever `BackendUrl` moves, so the answer is
+available before anything asks for it; `Looma.Status` probes too and is the only caller that logs
+the reachability triage.
+
+`ULoomaSceneSyncSubsystem` exposes it as **three states, not a bool** (`ELoomaAuthState`), because
+"this backend needs no login" and "we have not managed to ask yet" have to be told apart — a
+client that skips the login screen because the probe has not landed is a bug, not a fast path.
+All of it is Blueprint-visible, under the `Looma|Auth` category:
+
+| Blueprint node | Meaning |
+| --- | --- |
+| `Get Auth State` | `Unknown` / `Disabled` / `Enabled Registration Closed` / `Enabled Registration Open` |
+| `Is Auth State Known` | False while `Unknown`. Gate any "show the login screen" decision on this first |
+| `Is Auth Enabled` | The backend requires a login. False while `Unknown` |
+| `Is Registration Enabled` | The backend accepts self-registration. Only ever true when auth is enabled |
+| `On Auth State Changed` | Fires when the state becomes known or moves, so a UI can react instead of polling |
+
+Registration is folded into the enabled states rather than carried as a second flag, since
+`registrationEnabled` only means anything when auth is on. An unreachable backend, a non-JSON
+answer, and a `/health` with no `auth` block at all (a backend predating HAM-172) all leave the
+state `Unknown` — never `Disabled`. Reading silence as "no auth" happens to be right against
+today's backend, which is exactly why the code does not write it down.
 
 ## Status
 
