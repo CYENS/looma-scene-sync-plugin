@@ -57,6 +57,16 @@ constexpr float HealthRetryMinDelay = 5.0f;
 constexpr float HealthRetryMaxDelay = 60.0f;
 
 /**
+ * The one spelling of the bearer header. Three places set it — the two ApplyAuthHeader
+ * overloads and Logout, which cannot use them because it has deliberately already
+ * forgotten the token — so the *format* is pulled out here rather than typed three
+ * times. `parse_bearer_token` (backend/app/auth/provider.py) lowercases the scheme but
+ * splits on the space, so "Bearer" without it is a token the backend never sees.
+ */
+constexpr const TCHAR* AuthHeaderName = TEXT("Authorization");
+constexpr const TCHAR* AuthHeaderBearerPrefix = TEXT("Bearer ");
+
+/**
  * The settings' backend address as an absolute http(s) base with no trailing slash.
  * Accepts a bare "host:port" (the plugin's original format), a full URL with a path
  * prefix (a reverse proxy or tunnel), or a ws(s) URL — which is the same base with
@@ -257,7 +267,13 @@ void ULoomaSceneSyncSubsystem::Connect()
 {
     CloseSocket();
     SocketUrl = GetSceneSyncUrl();
-    Socket = FWebSocketsModule::Get().CreateWebSocket(SocketUrl, TEXT(""));
+    // The handshake carries the session, so the hub resolves this socket as the account
+    // rather than as a guest — the roster every other client draws comes from what it
+    // decides here, once, at connect time. Which is why a login has to reconnect: there
+    // is no message that re-identifies a socket already up.
+    TMap<FString, FString> UpgradeHeaders;
+    ApplyAuthHeader(UpgradeHeaders);
+    Socket = FWebSocketsModule::Get().CreateWebSocket(SocketUrl, TEXT(""), UpgradeHeaders);
     bConnecting = true;
 
     Socket->OnConnected().AddWeakLambda(this, [this]() {
@@ -267,6 +283,13 @@ void ULoomaSceneSyncSubsystem::Connect()
         Hello->SetStringField(TEXT("type"), TEXT("hello"));
         Hello->SetStringField(TEXT("clientId"), ClientId);
         Hello->SetStringField(TEXT("role"), TEXT("unreal"));
+        // Belt and braces, both documented: the hub's precedence is bearer header,
+        // then session cookie, then `hello.token` (docs/scene-format.md), and all three
+        // resolve to the same identity. The header wins when it survives the trip; the
+        // hello field is what covers a proxy that strips Authorization on upgrade,
+        // which this deployment — behind a Cloudflare tunnel — is exactly the shape of.
+        // Sending both costs one field and removes a class of "works locally" bug.
+        ApplyAuthToken(Hello);
         SendJson(Hello);
         OnSyncConnected.Broadcast();
         // The WS never replays generation events to late joiners — pull the
@@ -304,6 +327,9 @@ void ULoomaSceneSyncSubsystem::SendJson(const TSharedRef<FJsonObject>& Msg)
         return;
     }
     Msg->SetStringField(TEXT("origin"), ClientId);
+    // Nothing here logs Text, and nothing may start to: since the `hello` carries the
+    // session token, a "here is what we sent" line would put a credential in every
+    // log file this plugin ever produces. Log the message *type* if you need a trace.
     FString Text;
     const TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
         TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Text);
@@ -352,7 +378,11 @@ void ULoomaSceneSyncSubsystem::OnSettingsChanged()
         // another, so keeping it could only ever do one of two things: be rejected, or
         // be sent — a bearer belonging to a different server — to whoever now answers
         // at this address. Neither is worth the convenience of not retyping a password.
-        ClearSession();
+        //
+        // No re-handshake asked of it: Reconnect() below is already doing one for the
+        // address change, and letting ClearSession add a second would tear down the
+        // socket the first had just opened.
+        ClearSession(/*bRehandshake=*/false);
         // Reset the backoff and release the in-flight guard before re-probing: the
         // pending answer describes the old address, and the new one deserves to be
         // asked at once rather than at whatever interval the old one had backed off to.
@@ -672,7 +702,39 @@ void ULoomaSceneSyncSubsystem::ApplyAuthHeader(const TSharedRef<IHttpRequest, ES
         // guest request. Callers must not have to branch on this.
         return;
     }
-    Request->SetHeader(TEXT("Authorization"), TEXT("Bearer ") + AuthToken);
+    // Same-origin, checked here rather than at the call sites, because being the only
+    // function that attaches the token is what makes the check worth anything: a bearer
+    // *cannot* leave for another host, however the URL was assembled. Not theoretical —
+    // the image download's URL comes off a generation job and through
+    // ResolveBackendUrl, which forwards an absolute URL untouched, so a job naming
+    // some other host would otherwise be handed this session.
+    if (!Request->GetURL().StartsWith(GetRestBase()))
+    {
+        UE_LOG(LogLoomaSync, Verbose, TEXT("Withholding the bearer from %s — not the configured backend"),
+            *Request->GetURL());
+        return;
+    }
+    Request->SetHeader(AuthHeaderName, AuthHeaderBearerPrefix + AuthToken);
+}
+
+void ULoomaSceneSyncSubsystem::ApplyAuthHeader(TMap<FString, FString>& UpgradeHeaders) const
+{
+    if (AuthToken.IsEmpty())
+    {
+        return;
+    }
+    // No origin check to make here: the only caller is Connect(), and the URL it is
+    // about to open is GetSceneSyncUrl() — derived from GetRestBase() by construction.
+    UpgradeHeaders.Add(AuthHeaderName, AuthHeaderBearerPrefix + AuthToken);
+}
+
+void ULoomaSceneSyncSubsystem::ApplyAuthToken(const TSharedRef<FJsonObject>& Hello) const
+{
+    if (AuthToken.IsEmpty())
+    {
+        return;
+    }
+    Hello->SetStringField(TEXT("token"), AuthToken);
 }
 
 void ULoomaSceneSyncSubsystem::AdoptSession(const FString& Token, const FLoomaIdentity& NewIdentity)
@@ -682,10 +744,21 @@ void ULoomaSceneSyncSubsystem::AdoptSession(const FString& Token, const FLoomaId
     // OnIdentityChanged captures the serial it will actually be checked against.
     ++SessionSerial;
     SetIdentity(NewIdentity);
+    // The hub resolves an identity once, from the handshake, so a socket that came up
+    // as a guest stays a guest until it is re-opened — this is what makes a login
+    // visible to the other clients in the room rather than only to us.
+    //
+    // Cheap, despite appearances: a reconnect re-sends the whole `scene`, but every
+    // node still in it keeps the actor it already has, so ApplyModel's
+    // `Context.ModelUrl != LoadedModelUrl` guard holds and not one GLB is re-fetched.
+    // Last, after the identity broadcast, so a UI handler reads the new identity before
+    // the connection events for the new socket arrive.
+    Reconnect();
 }
 
-void ULoomaSceneSyncSubsystem::ClearSession()
+void ULoomaSceneSyncSubsystem::ClearSession(bool bRehandshake)
 {
+    const bool bHadSession = HasAuthToken();
     AuthToken.Empty();
     ++SessionSerial;
     // Unknown, not a guest identity we invent. We cannot name our own guest identity:
@@ -695,6 +768,16 @@ void ULoomaSceneSyncSubsystem::ClearSession()
     // backend/app/auth/provider.py), so it would name us something no other client
     // sees in the roster. Unknown is the honest answer until the socket says otherwise.
     SetIdentity(FLoomaIdentity());
+
+    // Only worth a reconnect if we were actually presenting a session: dropping a
+    // token we never had changes nothing about how the hub sees this socket, and
+    // reconnecting on it would churn the room for no reason (a `Looma.Logout` from a
+    // guest, say). RefreshIdentity's dead-token path deliberately does want this — we
+    // are connected as an account the backend has stopped recognising.
+    if (bRehandshake && bHadSession)
+    {
+        Reconnect();
+    }
 }
 
 void ULoomaSceneSyncSubsystem::SetIdentity(const FLoomaIdentity& NewIdentity)
@@ -865,7 +948,7 @@ void ULoomaSceneSyncSubsystem::Logout()
     // The header is set from the local copy rather than through ApplyAuthHeader,
     // because AuthToken is already empty by now — putting it back so a helper could
     // read it out again would reopen the very window this ordering closes.
-    Request->SetHeader(TEXT("Authorization"), TEXT("Bearer ") + RevokedToken);
+    Request->SetHeader(AuthHeaderName, AuthHeaderBearerPrefix + RevokedToken);
     // Background: nothing waits on the revoke, and a short budget would only convert
     // "the pool was busy" into "the token was never revoked".
     Request->SetTimeout(BackgroundRequestTimeout);
@@ -1896,6 +1979,7 @@ void ULoomaSceneSyncSubsystem::HydrateGenerationQueue()
     const TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Request = FHttpModule::Get().CreateRequest();
     Request->SetURL(GetRestBase() + TEXT("/generate"));
     Request->SetVerb(TEXT("GET"));
+    ApplyAuthHeader(Request);
     Request->OnProcessRequestComplete().BindWeakLambda(this,
         [this](FHttpRequestPtr Req, FHttpResponsePtr Resp, bool bOk) {
             if (!bOk || !Resp.IsValid() || Resp->GetResponseCode() >= 300)
@@ -1930,6 +2014,10 @@ void ULoomaSceneSyncSubsystem::SendRest(const FString& Verb, const FString& Path
     const TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Request = FHttpModule::Get().CreateRequest();
     Request->SetURL(GetRestBase() + Path);
     Request->SetVerb(Verb);
+    // After SetURL, as ApplyAuthHeader requires. Every fire-and-forget REST call the
+    // subsystem makes goes through here, so this one line is most of "the whole client
+    // speaks as the logged-in account".
+    ApplyAuthHeader(Request);
     if (Body.IsValid())
     {
         Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));

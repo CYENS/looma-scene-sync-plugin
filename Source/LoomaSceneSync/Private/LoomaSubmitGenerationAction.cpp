@@ -60,6 +60,10 @@ void ULoomaSubmitGenerationAction::Activate()
     const TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Request = FHttpModule::Get().CreateRequest();
     Request->SetURL(SyncSubsystem->GetRestBase() + TEXT("/generate"));
     Request->SetVerb(TEXT("POST"));
+    // After SetURL: ApplyAuthHeader checks the URL is the configured backend before it
+    // attaches anything. A generation job is attributed to whoever submitted it, so a
+    // logged-in client must submit as itself and not as a guest.
+    SyncSubsystem->ApplyAuthHeader(Request);
     Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
     Request->SetContentAsString(BodyText);
     Request->OnProcessRequestComplete().BindUObject(this, &ULoomaSubmitGenerationAction::OnResponse);

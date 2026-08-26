@@ -286,14 +286,29 @@ public:
 
     /**
      * Put `Authorization: Bearer <token>` on a request, if we hold a token. A request
-     * without one is a guest request, not an error, so this is always safe to call.
+     * without one is a guest request, not an error, so this is always safe to call —
+     * every backend route serves guests.
      *
-     * The single place that header is built. It takes the request rather than
-     * returning the string on purpose: no caller ever holds a copy of the token, and
-     * a `GetToken()` getter is one careless log line away from putting it in a shared
-     * file. Every REST call and the WS handshake are meant to route through here.
+     * The single place that header is attached, and public for that reason: the two
+     * async actions are separate UCLASSes and need it. It takes the request rather
+     * than returning the string on purpose, and that is exactly the property that
+     * makes exposing it safe — no caller ever holds a copy of the token, and a
+     * `GetToken()` getter would be one careless log line away from a shared file.
+     *
+     * **Call this after SetURL.** Being the only attacher lets it also enforce that
+     * the token goes nowhere but the configured backend, and it needs the URL to do
+     * that. A caller that gets the order wrong simply gets no header, which is the
+     * safe failure.
      */
     void ApplyAuthHeader(const TSharedRef<IHttpRequest, ESPMode::ThreadSafe>& Request) const;
+
+    /**
+     * The same header as a WebSocket upgrade header, for
+     * FWebSocketsModule::CreateWebSocket's third parameter. An overload rather than a
+     * shared `FString MakeBearer()` so that still nothing anywhere returns the token;
+     * the header's *spelling* is single-sourced in the .cpp instead.
+     */
+    void ApplyAuthHeader(TMap<FString, FString>& UpgradeHeaders) const;
 
     // --- Generation jobs (observe) -------------------------------------------
 
@@ -449,8 +464,25 @@ private:
     /**
      * Drop the token and the identity. Cannot fail and never asks the backend, which
      * is what lets every caller treat forgetting a session as unconditional.
+     *
+     * bRehandshake re-opens the socket so the hub re-resolves us as a guest — which is
+     * what every caller wants except OnSettingsChanged, which is already reconnecting
+     * for the address change and would otherwise connect twice, the second tearing
+     * down the socket the first had just made.
      */
-    void ClearSession();
+    void ClearSession(bool bRehandshake = true);
+
+    /**
+     * Put the session token into an outbound `hello` as its `token` field — the wire's
+     * documented last-resort transport, after the bearer header and the session cookie
+     * (docs/scene-format.md). No-op when we hold none.
+     *
+     * The only place a token is written into a *message body* rather than a header, and
+     * therefore the reason SendJson must never log what it serialises. Named apart from
+     * ApplyAuthHeader so that distinction is visible at the call site: an overload would
+     * have made "header" mean two different things.
+     */
+    void ApplyAuthToken(const TSharedRef<FJsonObject>& Hello) const;
 
     /** Store an identity, broadcasting OnIdentityChanged only if it actually moved. */
     void SetIdentity(const FLoomaIdentity& NewIdentity);
