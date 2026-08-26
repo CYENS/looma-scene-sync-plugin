@@ -60,6 +60,59 @@ FString NormalizeRestBase(const FString& Configured)
     return Base;
 }
 
+/** The auth state as one word for a log line / the status string. */
+const TCHAR* AuthStateText(ELoomaAuthState State)
+{
+    switch (State)
+    {
+    case ELoomaAuthState::Disabled:
+        return TEXT("disabled");
+    case ELoomaAuthState::EnabledRegistrationClosed:
+        return TEXT("required (registration closed)");
+    case ELoomaAuthState::EnabledRegistrationOpen:
+        return TEXT("required (registration open)");
+    default:
+        return TEXT("unknown");
+    }
+}
+
+/**
+ * The `auth` discovery block of a /health body, read as a state.
+ *
+ * Anything missing or of the wrong shape reads as Unknown — including an absent `auth`
+ * altogether, which is what a backend older than HAM-172 answers. Such a backend does
+ * in fact have no auth, so mapping it to Disabled would be right *today*; that is
+ * precisely what makes it the wrong thing to write down. "The server said false" and
+ * "the server said nothing" are different claims, and only the first one is evidence.
+ * A caller that wants to treat silence as permission can still do so, deliberately,
+ * from Unknown.
+ */
+ELoomaAuthState ReadAuthState(const TSharedPtr<FJsonObject>& Health)
+{
+    const TSharedPtr<FJsonObject>* Auth = nullptr;
+    if (!Health.IsValid() || !Health->TryGetObjectField(TEXT("auth"), Auth) || !Auth || !Auth->IsValid())
+    {
+        return ELoomaAuthState::Unknown;
+    }
+    bool bEnabled = false;
+    if (!(*Auth)->TryGetBoolField(TEXT("enabled"), bEnabled))
+    {
+        return ELoomaAuthState::Unknown;
+    }
+    if (!bEnabled)
+    {
+        return ELoomaAuthState::Disabled;
+    }
+    // camelCase on the wire, as everywhere else the backend speaks. Absent reads as
+    // closed, which is the safe half of that guess: it withholds a "create account"
+    // button rather than offering one the server will refuse, and unlike `enabled` it
+    // cannot make a login screen disappear.
+    bool bRegistrationEnabled = false;
+    (*Auth)->TryGetBoolField(TEXT("registrationEnabled"), bRegistrationEnabled);
+    return bRegistrationEnabled ? ELoomaAuthState::EnabledRegistrationOpen
+                                : ELoomaAuthState::EnabledRegistrationClosed;
+}
+
 /**
  * The node an attachment names on the wire — pass GetAttachParentActor() — or null if
  * it names none, which is what a root is.
@@ -103,6 +156,11 @@ void ULoomaSceneSyncSubsystem::Initialize(FSubsystemCollectionBase& Collection)
     SettingsChangedHandle = ULoomaSceneSyncSettings::OnSettingsChanged().AddUObject(
         this, &ULoomaSceneSyncSubsystem::OnSettingsChanged);
     Connect();
+    // Ask what this backend wants before anything asks us. A UI that decides whether
+    // to show a login screen cannot wait for a human to type `Looma.Status`, and the
+    // socket is no substitute for the answer: an auth-enabled hub may well refuse the
+    // WebSocket, which is a symptom of the answer rather than a way to get it.
+    ProbeHealth(/*bLogDiagnostics=*/false);
 }
 
 void ULoomaSceneSyncSubsystem::Deinitialize()
@@ -154,6 +212,13 @@ void ULoomaSceneSyncSubsystem::Connect()
         // The WS never replays generation events to late joiners — pull the
         // current queue over REST so cached jobs reflect all clients.
         HydrateGenerationQueue();
+        // A connect is the first hard evidence the backend is reachable, and the
+        // startup probe usually predates it — an editor that opened before uvicorn did
+        // would otherwise sit on Unknown until someone typed a console command. Costs
+        // one GET per successful connection (failures never reach here, so a retry
+        // loop cannot turn this into a poll), and picks up a backend that came back
+        // with its auth configuration changed.
+        ProbeHealth(/*bLogDiagnostics=*/false);
     });
     Socket->OnConnectionError().AddWeakLambda(this, [this](const FString& Error) {
         bConnecting = false;
@@ -213,7 +278,16 @@ void ULoomaSceneSyncSubsystem::OnSettingsChanged()
     if (GetSceneSyncUrl() != SocketUrl)
     {
         UE_LOG(LogLoomaSync, Display, TEXT("Backend moved to %s"), *GetRestBase());
+        // A different backend can have different auth settings, and the old one's
+        // answer is worse than none: it would leave a login screen drawn (or skipped)
+        // on the authority of a server we no longer talk to. Drop to Unknown now — the
+        // Unknown broadcast is what tells a UI to stop trusting what it is showing —
+        // then ask the new address. Reconnect()'s own on-connect probe is not enough
+        // on its own: if the new address has no hub, the socket never opens, while
+        // /health may still answer (a path-prefix typo does exactly that).
+        SetAuthState(ELoomaAuthState::Unknown);
         Reconnect();
+        ProbeHealth(/*bLogDiagnostics=*/false);
     }
 }
 
@@ -256,10 +330,11 @@ FString ULoomaSceneSyncSubsystem::GetConnectionStatusText() const
     // reconnect lands, and the useful answer is where we are actually pointed.
     const FString HubUrl = SocketUrl.IsEmpty() ? GetSceneSyncUrl() : SocketUrl;
     const FString RestBase = GetRestBase();
-    return FString::Printf(TEXT("%s | hub %s | rest %s | %d node(s), scene %s | %d job(s)"),
+    return FString::Printf(TEXT("%s | hub %s | rest %s | auth %s | %d node(s), scene %s | %d job(s)"),
         *State,
         *HubUrl,
         *RestBase,
+        AuthStateText(AuthState),
         Tracked.Num(),
         ActiveSceneId.IsEmpty() ? TEXT("<unsaved>") : *ActiveSceneId,
         Jobs.Num());
@@ -268,12 +343,67 @@ FString ULoomaSceneSyncSubsystem::GetConnectionStatusText() const
 void ULoomaSceneSyncSubsystem::LogConnectionStatus()
 {
     UE_LOG(LogLoomaSync, Display, TEXT("Looma Scene Sync: %s"), *GetConnectionStatusText());
+    // The line above is free — it reports the socket and the auth state we already
+    // hold. The probe is the half that talks to the backend, and typing `Looma.Status`
+    // is the one case where its running commentary is the point.
+    ProbeHealth(/*bLogDiagnostics=*/true);
+}
 
-    // A socket can be down for three different reasons — nothing listening, the wrong
+// --- Auth discovery ----------------------------------------------------------
+
+ELoomaAuthState ULoomaSceneSyncSubsystem::GetAuthState() const
+{
+    return AuthState;
+}
+
+bool ULoomaSceneSyncSubsystem::IsAuthStateKnown() const
+{
+    return AuthState != ELoomaAuthState::Unknown;
+}
+
+bool ULoomaSceneSyncSubsystem::IsAuthEnabled() const
+{
+    // Unknown answers false here *and* false from IsAuthStateKnown, so the pair
+    // (known = false, enabled = false) is the only way "undecided" can present. A
+    // caller that forgets the known-check gets the timid answer, not the confident
+    // wrong one.
+    return AuthState == ELoomaAuthState::EnabledRegistrationClosed
+        || AuthState == ELoomaAuthState::EnabledRegistrationOpen;
+}
+
+bool ULoomaSceneSyncSubsystem::IsRegistrationEnabled() const
+{
+    return AuthState == ELoomaAuthState::EnabledRegistrationOpen;
+}
+
+void ULoomaSceneSyncSubsystem::SetAuthState(ELoomaAuthState NewState)
+{
+    if (AuthState == NewState)
+    {
+        return;
+    }
+    AuthState = NewState;
+    // One line per actual change, not per probe: the probe now runs unprompted (at
+    // startup and on every connect), and a log entry each time would be pure noise.
+    UE_LOG(LogLoomaSync, Log, TEXT("Backend auth: %s"), AuthStateText(AuthState));
+    OnAuthStateChanged.Broadcast(AuthState);
+}
+
+void ULoomaSceneSyncSubsystem::ProbeHealth(bool bLogDiagnostics)
+{
+    // Two jobs, one request: the auth-discovery probe (the `auth` block of /health,
+    // added by HAM-172) and — when bLogDiagnostics is set — the `Looma.Status` triage.
+    //
+    // A socket can be down for three different reasons: nothing listening, the wrong
     // host, or the right host with the wrong path prefix. One REST call tells them
     // apart, but only if we check *what* answered: a reverse proxy that serves the web
     // app at the root answers /health with 200 and an index.html, which reads as
-    // healthy while the hub URL points at nothing that speaks WebSocket.
+    // healthy while the hub URL points at nothing that speaks WebSocket. That triage
+    // earns a paragraph in the log when a human asked for it, and is noise on every
+    // editor launch — where the backend commonly is not up yet, and the socket layer
+    // already says so once per retry. Hence the flag rather than two request bodies to
+    // keep in step. The quiet path still logs, at Verbose, so
+    // `-LogCmds="LogLoomaSync Verbose"` gets the whole story back.
     const FString RestBase = GetRestBase();
     const FString HealthUrl = RestBase + TEXT("/health");
     const TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Request = FHttpModule::Get().CreateRequest();
@@ -281,11 +411,35 @@ void ULoomaSceneSyncSubsystem::LogConnectionStatus()
     Request->SetVerb(TEXT("GET"));
     Request->SetTimeout(5.0f);
     Request->OnProcessRequestComplete().BindWeakLambda(this,
-        [HealthUrl, RestBase](FHttpRequestPtr Req, FHttpResponsePtr Resp, bool bOk) {
+        [this, HealthUrl, RestBase, bLogDiagnostics](FHttpRequestPtr Req, FHttpResponsePtr Resp, bool bOk) {
+            // The settings may have moved the backend while this was in flight. What
+            // that server said about auth describes a server we no longer talk to, and
+            // recording it would clobber the pending answer from the new one.
+            if (RestBase != GetRestBase())
+            {
+                UE_LOG(LogLoomaSync, Verbose, TEXT("Dropping a /health answer from %s — the backend moved to %s"),
+                    *RestBase, *GetRestBase());
+                return;
+            }
+
+            // Every failure path below lands on Unknown instead of guessing Disabled.
+            // The guess is right against the default configuration, which is exactly
+            // what makes it dangerous: it would walk a client into a scene it never
+            // authenticated for, and turn a missing login into an unexplained 401
+            // later, in another subsystem, far from here.
             if (!bOk || !Resp.IsValid())
             {
-                UE_LOG(LogLoomaSync, Warning, TEXT("Backend %s unreachable — is the backend running, ")
-                                              TEXT("and is the Backend URL right?"), *HealthUrl);
+                SetAuthState(ELoomaAuthState::Unknown);
+                if (bLogDiagnostics)
+                {
+                    UE_LOG(LogLoomaSync, Warning, TEXT("Backend %s unreachable — is the backend running, ")
+                                                  TEXT("and is the Backend URL right?"), *HealthUrl);
+                }
+                else
+                {
+                    UE_LOG(LogLoomaSync, Verbose, TEXT("Health probe of %s failed; auth state stays unknown"),
+                        *HealthUrl);
+                }
                 return;
             }
             const int32 Code = Resp->GetResponseCode();
@@ -293,7 +447,16 @@ void ULoomaSceneSyncSubsystem::LogConnectionStatus()
             const FString Excerpt = Body.Left(120).Replace(TEXT("\r"), TEXT("")).Replace(TEXT("\n"), TEXT(" "));
             if (Code >= 300)
             {
-                UE_LOG(LogLoomaSync, Warning, TEXT("Backend %s answered %d: %s"), *HealthUrl, Code, *Excerpt);
+                SetAuthState(ELoomaAuthState::Unknown);
+                if (bLogDiagnostics)
+                {
+                    UE_LOG(LogLoomaSync, Warning, TEXT("Backend %s answered %d: %s"), *HealthUrl, Code, *Excerpt);
+                }
+                else
+                {
+                    UE_LOG(LogLoomaSync, Verbose, TEXT("Backend %s answered %d; auth state stays unknown"),
+                        *HealthUrl, Code);
+                }
                 return;
             }
 
@@ -305,15 +468,32 @@ void ULoomaSceneSyncSubsystem::LogConnectionStatus()
             {
                 int32 Assets = 0;
                 Json->TryGetNumberField(TEXT("assets"), Assets);
-                UE_LOG(LogLoomaSync, Display, TEXT("Backend %s OK (%d): status %s, %d asset(s)"), *HealthUrl, Code,
-                    *Status, Assets);
+                // Only a body that is recognisably *this* backend's /health gets this
+                // far — the same test the triage below turns on — so the auth state can
+                // never be taken from whatever else happens to serve that address.
+                SetAuthState(ReadAuthState(Json));
+                if (bLogDiagnostics)
+                {
+                    UE_LOG(LogLoomaSync, Display, TEXT("Backend %s OK (%d): status %s, %d asset(s), auth %s"),
+                        *HealthUrl, Code, *Status, Assets, AuthStateText(AuthState));
+                }
                 return;
             }
-            UE_LOG(LogLoomaSync, Warning,
-                TEXT("Backend %s answered %d but not with the backend's /health JSON — something else is ")
-                TEXT("serving that address (a web app, usually). If the API sits behind a path prefix, ")
-                TEXT("the Backend URL must include it, e.g. %s/api. Got: %s"),
-                *HealthUrl, Code, *RestBase, *Excerpt);
+            SetAuthState(ELoomaAuthState::Unknown);
+            if (bLogDiagnostics)
+            {
+                UE_LOG(LogLoomaSync, Warning,
+                    TEXT("Backend %s answered %d but not with the backend's /health JSON — something else is ")
+                    TEXT("serving that address (a web app, usually). If the API sits behind a path prefix, ")
+                    TEXT("the Backend URL must include it, e.g. %s/api. Got: %s"),
+                    *HealthUrl, Code, *RestBase, *Excerpt);
+            }
+            else
+            {
+                UE_LOG(LogLoomaSync, Verbose,
+                    TEXT("Backend %s answered %d with something other than /health JSON; auth stays unknown"),
+                    *HealthUrl, Code);
+            }
         });
     Request->ProcessRequest();
 }
