@@ -708,10 +708,46 @@ void ULoomaSceneSyncSubsystem::ApplyAuthHeader(const TSharedRef<IHttpRequest, ES
     // the image download's URL comes off a generation job and through
     // ResolveBackendUrl, which forwards an absolute URL untouched, so a job naming
     // some other host would otherwise be handed this session.
-    if (!Request->GetURL().StartsWith(GetRestBase()))
+    //
+    // A prefix match ALONE is not enough, and the counter-example is the default
+    // configuration rather than an exotic one. With a base of "http://127.0.0.1:8000",
+    // the URL
+    //
+    //     http://127.0.0.1:8000@evil.com/whatever
+    //
+    // starts with the base and is not our backend at all: everything before the "@" is
+    // userinfo, and the host is evil.com. "http://127.0.0.1:8000.evil.com/" and
+    // "http://127.0.0.1:80001/" slip through the same hole. A base that happens to
+    // carry a path prefix ("https://host/api") is accidentally safe because the "/api"
+    // forces the boundary; nothing should depend on the operator having configured one.
+    //
+    // So: the base, then a path boundary. The next character must be "/" — which "@",
+    // "." and a digit are not — or the URL must be the base exactly. That also rejects
+    // "https://host/apifoo" for a base of "https://host/api". Strict on purpose: it
+    // turns away a bare-base query ("…:8000?x=1") too, which is a legal URL but one no
+    // call site here builds, so the strictness costs nothing and saves a judgement call.
+    //
+    // Deliberately a delimiter check and not a URL parse. Every call site builds its URL
+    // as GetRestBase() + "/...", so this states the invariant we actually want — "this
+    // URL was built from our base" — rather than approximating it by comparing
+    // scheme/host/port, and it inherits no parser's opinions about default ports, IPv6
+    // brackets or empty authorities. It is also strictly stronger than a host
+    // comparison, because it pins the path prefix too.
+    //
+    // GetRestBase() guarantees a non-empty base with no trailing slash
+    // (NormalizeRestBase), which is what makes the boundary character unambiguous and
+    // the index below in range.
+    const FString RestBase = GetRestBase();
+    const FString& Url = Request->GetURL();
+    // Case-insensitive, as StartsWith defaults to: scheme and host are case-insensitive
+    // per RFC 3986, and the only thing it loosens is the *path* prefix's case, which
+    // cannot change which host receives the token.
+    const bool bSameOrigin = Url.StartsWith(RestBase)
+        && (Url.Len() == RestBase.Len() || Url[RestBase.Len()] == TEXT('/'));
+    if (!bSameOrigin)
     {
         UE_LOG(LogLoomaSync, Verbose, TEXT("Withholding the bearer from %s — not the configured backend"),
-            *Request->GetURL());
+            *Url);
         return;
     }
     Request->SetHeader(AuthHeaderName, AuthHeaderBearerPrefix + AuthToken);
