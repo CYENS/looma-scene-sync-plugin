@@ -21,22 +21,25 @@ public class LoomaSceneSyncUI : ModuleRules
         PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;
 
         // Private by default; a dependency is promoted to Public only when a *public*
-        // header of this module includes one of its headers. Nothing here has a public
-        // header yet beyond the module interface, so nothing but Core needs to be
-        // public — the widget and everything driving it are implementation detail.
+        // header of this module includes one of its headers.
+        //
+        // `Public/LoomaLoginUI.h` is now such a header: it is a UCLASS deriving from
+        // UBlueprintFunctionLibrary, so it includes Kismet/BlueprintFunctionLibrary.h
+        // (Engine) and its own .generated.h (CoreUObject). Anyone including it needs
+        // both include paths, so both are public — applying the rule above, not
+        // relaxing it.
         PublicDependencyModuleNames.AddRange(new string[]
         {
             "Core",
+            // UObject/UCLASS machinery, reached through LoomaLoginUI.generated.h.
+            "CoreUObject",
+            // UBlueprintFunctionLibrary in the public header; UGameViewportClient and
+            // UWorld in the implementation.
+            "Engine",
         });
 
         PrivateDependencyModuleNames.AddRange(new string[]
         {
-            // UObject/UCLASS machinery for the Blueprint entry point that shows the
-            // widget, and the reflected types it hands around.
-            "CoreUObject",
-            // UGameViewportClient, to put the widget on the screen, and UWorld for the
-            // world-context lookup that finds the subsystem.
-            "Engine",
             // The widget itself: SCompoundWidget and the editable-text/button set.
             // Deliberately private — a consumer of this module gets no transitive Slate
             // include path, which is the containment the two-module split is for.
