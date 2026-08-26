@@ -64,6 +64,11 @@ void ULoomaSubmitGenerationAction::Activate()
     // attaches anything. A generation job is attributed to whoever submitted it, so a
     // logged-in client must submit as itself and not as a guest.
     SyncSubsystem->ApplyAuthHeader(Request);
+    // POST /generate is an asset-creating request and the backend records who made
+    // each one. Logged in, the bearer above settles that and this is ignored; as a
+    // guest it is the only thing keeping the credit on one stable `Guest-xxxxxx`
+    // rather than a fresh name per submission (HAM-176).
+    SyncSubsystem->ApplyClientIdHeader(Request);
     Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
     Request->SetContentAsString(BodyText);
     Request->OnProcessRequestComplete().BindUObject(this, &ULoomaSubmitGenerationAction::OnResponse);

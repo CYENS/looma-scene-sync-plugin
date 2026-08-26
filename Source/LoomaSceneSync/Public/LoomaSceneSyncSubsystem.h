@@ -326,6 +326,26 @@ public:
      */
     void ApplyAuthHeader(TMap<FString, FString>& UpgradeHeaders) const;
 
+    /**
+     * Put `X-Client-Id: <our clientId>` on an **asset-creating** request, so the work
+     * a guest does over one-shot HTTP is credited to the same `Guest-xxxxxx` the room
+     * roster already shows them under. Without it the backend has nothing to key a
+     * guest name off for a plain POST, and mints a fresh random one per request
+     * (HAM-176).
+     *
+     * A NAME SEED, and nothing else. It proves nothing and authenticates nothing: both
+     * providers resolve a real session first and an authenticated one always wins over
+     * this, so it can never be used to claim `kind: "user"` or anyone else's session
+     * (see CLIENT_ID_HEADER in backend/app/auth/provider.py). Never reach for it where
+     * an identity actually has to be established — that is ApplyAuthHeader's job.
+     *
+     * Scoped to asset-creating requests as the backend documents, rather than attached
+     * blanket-fashion to every REST call: that is the only place the value means
+     * anything, and a header travelling further than its purpose invites being
+     * mistaken for one that matters.
+     */
+    void ApplyClientIdHeader(const TSharedRef<IHttpRequest, ESPMode::ThreadSafe>& Request) const;
+
     // --- Generation jobs (observe) -------------------------------------------
 
     /** Any change to a job (state / progress / queue position / enhanced prompt). */
@@ -597,6 +617,13 @@ private:
     TSharedPtr<IWebSocket> Socket;
     /** The URL the current socket was created with — what a reconnect compares against. */
     FString SocketUrl;
+    /**
+     * The guest name the current socket suggested in its `hello`, cleaned. Exactly
+     * parallel to SocketUrl and there for the same reason: a settings edit has to be
+     * able to tell whether the value actually moved, and the socket — not the settings
+     * object — is what holds what we last told the hub.
+     */
+    FString SentDisplayName;
     /** Connect() has been called and the socket has neither opened nor failed yet. */
     bool bConnecting = false;
     /** What /health last told us about auth. Unknown until a probe lands, and again if one fails. */

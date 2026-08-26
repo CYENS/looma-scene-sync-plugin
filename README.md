@@ -113,6 +113,7 @@ the module name — then regenerate project files and rebuild.
 | `LightIntensityScale` | `1.0` | Trim for the exposure difference between UE and three.js — not a unit conversion, see above |
 | `bBaseAlignModels` | `true` | Stand a `model`'s GLB on the node origin, as the web client does |
 | `WebAssetPrefix` | `/api` | The proxy prefix a *web* peer needs in front of `/static/...`, used to fill in the `url` of a `model` we spawn |
+| `GuestDisplayName` | *(empty)* | The name to suggest for this client in the room roster while connected as a guest. Empty suggests nothing and the hub falls back to `Guest-xxxxxx`. Ignored while logged in — see *Being named in the room* |
 
 Settings are read live from the CDO, so an edit needs no restart; changing `BackendUrl` reconnects
 by itself, including mid-PIE. Locally, prefer an explicit IPv4 address over `localhost` — UE's
@@ -319,6 +320,60 @@ The user id and the admin flag are **not** persisted. `is_admin` especially: a c
 back off disk is one that anybody with write access to `Saved/` could grant themselves in a UI.
 The backend re-checks it on every admin route regardless, so caching it could only ever produce a
 misleading screen.
+
+### Being named in the room
+
+Two small things decide what everyone else sees this client called (both HAM-176 tails).
+
+**A suggested roster name.** The `hello` now carries `displayName` from the `GuestDisplayName`
+setting, when one is set. Without it the hub names this client `Guest-` plus the first six
+characters of its `clientId` — an unreadable string in every other client's roster.
+
+It is a suggestion and never a claim. The hub clamps it to 32 characters, strips control
+characters, rejects it outright if nothing survives that, and — when accounts are enabled —
+rejects it if its normalized form collides with a **registered** username, because a guest may not
+wear the name of an account that exists whether or not it can prove it. So the setting cannot
+impersonate anyone, and the plugin does not second-guess any of those rules: it sends the value
+raw and lets the hub, which is the authority, decide. The one check it does make is not sending an
+empty string, which could only ever be rejected.
+
+**Editing it applies immediately — while connected as a guest.** The name rides in the `hello` and
+nothing renames a socket already up, so the subsystem reconnects to suggest the new one, the same
+way `BackendUrl` reconnects for an address change. That is affordable: a reconnect re-sends the
+whole scene but re-fetches no GLBs (measured — a login reconnect re-applied 33 nodes with zero
+meshes rebuilt).
+
+**While logged in it deliberately does nothing.** The hub takes the name from the session and never
+consults the suggestion, so a reconnect could not change the displayed name by one character, and
+the real cost of a reconnect is not the GLBs — it is that every other client in the room sees a
+leave and a join in their roster. Paying that for no effect is the one case worth skipping. The
+edit is not lost: the next guest connection picks it up, and logging out is one. A log line says
+so at the time, rather than leaving the panel looking broken.
+
+No other setting touches the socket. `LightIntensityScale`, `bBaseAlignModels` and
+`WebAssetPrefix` are read where they are used and apply live without reconnecting anyone.
+
+**It is ignored while logged in.** `identity_from_websocket` resolves a token first and never
+consults the suggestion when one resolves, so this renames a *guest* and never an account. The
+plugin sends it either way rather than branching on the token — the hub already ignores it, and a
+branch would be more code for the same outcome.
+
+This is not merely cosmetic: it is the only way this plugin can know its own guest name at all.
+Inbound `clients` (the roster message) is deliberately not handled here, and `GET /auth/me` mints a
+fresh random `Guest-xxxxxx` on every call, so there is nothing to read the name *back* from.
+Proposing it is how it becomes knowable.
+
+**Attribution for what a guest creates.** `POST /generate` carries `X-Client-Id` with the same
+`clientId` the `hello` sends, so a guest's generations are credited to the one stable
+`Guest-xxxxxx` the roster already shows them under instead of a fresh name per request. Every asset
+and job records who made it, resolved by the backend rather than taken from a name a client hands
+over.
+
+That header is a **name seed only**. It proves nothing and authenticates nothing — both providers
+resolve a real session first and an authenticated one always wins over it, so it can never be used
+to claim `kind: "user"` or reach anyone else's session. It goes on asset-creating requests as the
+backend documents, not on every REST call: that is the only place it means anything, and a header
+that travels further than its purpose invites being mistaken for one that matters.
 
 ## Status
 
