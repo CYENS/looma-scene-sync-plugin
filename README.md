@@ -142,9 +142,21 @@ nothing is running; the auth commands have no session to report without a subsys
 The backend says whether it wants a login in the `auth` block of `GET /health` —
 `{"enabled": bool, "registrationEnabled": bool}`, the discovery block HAM-172 added, and the same
 one the web frontend reads to decide whether to draw a login screen. The plugin probes `/health`
-on startup, on every successful socket connect, and whenever `BackendUrl` moves, so the answer is
-available before anything asks for it; `Looma.Status` probes too and is the only caller that logs
-the reachability triage.
+on startup and whenever `BackendUrl` moves, so the answer is available before anything asks for
+it, and re-probes on a lengthening backoff (5 s doubling to 60 s) for as long as the answer is
+still `Unknown`. `Looma.Status` probes too, and is the only caller that logs the reachability
+triage or gets a short timeout — a background probe is given 30 s, and never loops on a human's
+behalf.
+
+`Unknown` is a **transient** state, not a resting place, and the retry is what makes that true.
+The reason is worth knowing, because the failure looks like a broken backend and is not one: UE
+caps concurrent connections per server at 16 (`HttpMaxConnectionsPerServer`), and the GLB
+downloads and the REST API share a host and therefore share that pool. On a populated scene over
+a real network, `/health` queues behind up to 16 GLB fetches and can time out against a backend
+answering in a tenth of a second — measured over a Cloudflare tunnel: `curl` 0.12-0.27 s, the
+plugin's own request timing out at 5 s, with exactly 16 meshes building in the log. There is
+deliberately no probe at socket-connect time for the same reason: that is the instant every node
+starts pulling its GLB, which is the worst possible moment to want a connection slot.
 
 `ULoomaSceneSyncSubsystem` exposes it as **three states, not a bool** (`ELoomaAuthState`), because
 "this backend needs no login" and "we have not managed to ask yet" have to be told apart — a

@@ -185,9 +185,12 @@ public:
     void LogConnectionStatus();
 
     // --- Auth discovery ------------------------------------------------------
-    // Probed on Initialize, on every socket connect, and whenever the backend address
-    // moves — never only on demand, because a UI has to be able to ask this before a
-    // human has typed anything.
+    // Probed on Initialize and whenever the backend address moves — never only on
+    // demand, because a UI has to be able to ask this before a human has typed
+    // anything — and re-probed on a lengthening backoff for as long as the answer is
+    // still Unknown. `Unknown` is a transient state, not a resting place: see
+    // ScheduleHealthRetry for the connection-pool starvation that makes a single
+    // attempt unreliable over a real network.
 
     /** What `GET /health` last said about auth. See ELoomaAuthState. */
     UFUNCTION(BlueprintPure, Category = "Looma|Auth")
@@ -403,13 +406,39 @@ private:
     /**
      * `GET /health` — the one implementation behind both callers. bLogDiagnostics is
      * what makes it the `Looma.Status` diagnostic: the reachability triage naming
-     * likely causes. The unprompted probes (startup, socket connect, settings change)
-     * pass false, because that prose on every editor launch — where the backend
-     * routinely is not up yet, and the socket layer already says so once per retry —
-     * is noise nobody asked for. The auth state is refreshed either way; that is the
-     * half that is not a diagnostic.
+     * likely causes. The unprompted probes (startup, settings change, retry) pass
+     * false, because that prose on every editor launch — where the backend routinely
+     * is not up yet, and the socket layer already says so once per retry — is noise
+     * nobody asked for. The auth state is refreshed either way; that is the half that
+     * is not a diagnostic.
+     *
+     * The flag separates two more things than the logging. A quiet probe gets a
+     * background timeout and arms a retry; a diagnostic gets a short timeout and never
+     * loops, because someone is watching and wants one answer now.
      */
     void ProbeHealth(bool bLogDiagnostics);
+
+    /**
+     * Arm the next quiet re-probe, lengthening the wait each time (exponential, capped).
+     * No-op once the auth state is known — that is the "only while Unknown" half of the
+     * rule, enforced here so no caller has to remember it.
+     *
+     * Armed when a probe is *sent*, not when one fails, so that "the state is Unknown
+     * and nothing is pending" cannot be represented: a request the HTTP layer drops
+     * without ever completing cannot strand the state machine.
+     */
+    void ScheduleHealthRetry();
+
+    /**
+     * The question is settled, or the address moved: stop asking and forget the
+     * backoff. Also releases the in-flight guard, deliberately abandoning any probe
+     * still outstanding — its answer would be discarded on arrival anyway (it names a
+     * backend we have moved off, or a state we have since learned).
+     */
+    void CancelHealthRetry();
+
+    /** Count down the re-probe. Called from Tick ahead of the reconnect early-out. */
+    void TickHealthRetry(float DeltaTime);
 
     /** Adopt an auth state, broadcasting OnAuthStateChanged only if it actually moved. */
     void SetAuthState(ELoomaAuthState NewState);
@@ -488,6 +517,19 @@ private:
     bool bConnecting = false;
     /** What /health last told us about auth. Unknown until a probe lands, and again if one fails. */
     ELoomaAuthState AuthState = ELoomaAuthState::Unknown;
+    /** Seconds until the next quiet re-probe; <= 0 means none is scheduled. */
+    float HealthProbeCooldown = 0.0f;
+    /**
+     * The wait the *next* arming will use, doubling towards the cap. Zero means "not
+     * backed off yet", so the first retry takes the floor rather than the cap.
+     */
+    float HealthProbeRetryDelay = 0.0f;
+    /**
+     * A quiet probe is outstanding. The retry cadence can be shorter than the request
+     * timeout, so without this the loop would stack probes on a backend that is merely
+     * slow — which is the same connection-pool contention it is trying to survive.
+     */
+    bool bHealthProbeInFlight = false;
     /**
      * The opaque session token from `POST /auth/login`, or empty. Memory only: nothing
      * writes it to disk, to a config, or to the log, and ApplyAuthHeader is the only
