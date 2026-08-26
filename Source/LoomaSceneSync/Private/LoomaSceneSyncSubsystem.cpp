@@ -30,6 +30,33 @@ constexpr float TransientInterval = 0.033f; // ~30 Hz live streaming
 constexpr int32 StillFramesForFinal = 10;   // rest frames before the final commit
 
 /**
+ * Request timeouts, in three tiers, and the tier is chosen by who is waiting.
+ *
+ * The numbers exist because of a real failure over a Cloudflare tunnel: `curl` fetched
+ * /health in 0.12-0.27 s while the plugin's own request timed out at 5 s. Nothing was
+ * wrong with the backend. UE's HTTP layer caps concurrent connections per server at 16
+ * (`HttpMaxConnectionsPerServer`, HttpModule.cpp), the GLB downloads and the REST API
+ * live on the same host and therefore share that pool, and the log showed exactly 16
+ * meshes building. /health had queued behind the GLB fleet. A latency budget on this
+ * host is not a measure of the backend's speed; it is a measure of how busy we are.
+ *
+ * So: background work that nobody is waiting on gets a budget long enough to outlast a
+ * saturated pool, and interactive work keeps a short one because a human would rather
+ * hear "no" quickly.
+ */
+constexpr float HealthDiagnosticTimeout = 5.0f;  // `Looma.Status` — someone is watching
+constexpr float BackgroundRequestTimeout = 30.0f; // the quiet probe, /auth/me, the logout revoke
+constexpr float InteractiveRequestTimeout = 15.0f; // a login: a person typed it and is waiting
+
+/**
+ * Quiet re-probe backoff. Unbounded in count, bounded in rate: a backend that is
+ * genuinely down costs one cheap GET a minute, and the alternative — giving up — is a
+ * client that never learns the answer for the rest of the session.
+ */
+constexpr float HealthRetryMinDelay = 5.0f;
+constexpr float HealthRetryMaxDelay = 60.0f;
+
+/**
  * The settings' backend address as an absolute http(s) base with no trailing slash.
  * Accepts a bare "host:port" (the plugin's original format), a full URL with a path
  * prefix (a reverse proxy or tunnel), or a ws(s) URL — which is the same base with
@@ -194,9 +221,11 @@ void ULoomaSceneSyncSubsystem::Deinitialize()
     ULoomaSceneSyncSettings::OnSettingsChanged().Remove(SettingsChangedHandle);
     SettingsChangedHandle.Reset();
     CloseSocket();
-    // The token is memory-only, so ending the game instance ends the session anyway.
-    // Cleared explicitly rather than left to the object's destruction so it cannot sit
-    // around in a freed-but-not-reused allocation.
+    // Tidiness, not a security control, and worth being exact about: the session ends
+    // with the game instance because that is the only place the token lives. Empty()
+    // releases the buffer, it does not scrub it — and scrubbing this one would buy
+    // nothing anyway, since the HTTP layer and every `Bearer …` header string we built
+    // hold copies of their own that we do not own and cannot reach.
     AuthToken.Empty();
     CurrentIdentity = FLoomaIdentity();
     Tracked.Empty();
@@ -243,13 +272,14 @@ void ULoomaSceneSyncSubsystem::Connect()
         // The WS never replays generation events to late joiners — pull the
         // current queue over REST so cached jobs reflect all clients.
         HydrateGenerationQueue();
-        // A connect is the first hard evidence the backend is reachable, and the
-        // startup probe usually predates it — an editor that opened before uvicorn did
-        // would otherwise sit on Unknown until someone typed a console command. Costs
-        // one GET per successful connection (failures never reach here, so a retry
-        // loop cannot turn this into a poll), and picks up a backend that came back
-        // with its auth configuration changed.
-        ProbeHealth(/*bLogDiagnostics=*/false);
+        // No auth probe here, though this used to be the obvious place for one — it
+        // covered the editor that opened before uvicorn did. Connect time turns out to
+        // be the *worst* moment to ask: this is the instant the scene arrives and every
+        // node starts pulling its GLB, so a request issued here queues behind up to 16
+        // downloads on the shared connection pool and times out against a backend that
+        // is answering in a tenth of a second (see the timeout constants at the top of
+        // this file). The retry backoff covers the launched-too-early case without
+        // competing for a slot at the one moment they are all taken.
     });
     Socket->OnConnectionError().AddWeakLambda(this, [this](const FString& Error) {
         bConnecting = false;
@@ -313,15 +343,20 @@ void ULoomaSceneSyncSubsystem::OnSettingsChanged()
         // answer is worse than none: it would leave a login screen drawn (or skipped)
         // on the authority of a server we no longer talk to. Drop to Unknown now — the
         // Unknown broadcast is what tells a UI to stop trusting what it is showing —
-        // then ask the new address. Reconnect()'s own on-connect probe is not enough
-        // on its own: if the new address has no hub, the socket never opens, while
-        // /health may still answer (a path-prefix typo does exactly that).
+        // then ask the new address. The REST probe is not redundant with the socket
+        // coming up: if the new address has no hub the socket never opens, while
+        // /health may still answer perfectly well (a path-prefix typo does exactly
+        // that).
         SetAuthState(ELoomaAuthState::Unknown);
         // And the session with it. A token minted by one backend means nothing at
         // another, so keeping it could only ever do one of two things: be rejected, or
         // be sent — a bearer belonging to a different server — to whoever now answers
         // at this address. Neither is worth the convenience of not retyping a password.
         ClearSession();
+        // Reset the backoff and release the in-flight guard before re-probing: the
+        // pending answer describes the old address, and the new one deserves to be
+        // asked at once rather than at whatever interval the old one had backed off to.
+        CancelHealthRetry();
         Reconnect();
         ProbeHealth(/*bLogDiagnostics=*/false);
     }
@@ -419,10 +454,52 @@ void ULoomaSceneSyncSubsystem::SetAuthState(ELoomaAuthState NewState)
         return;
     }
     AuthState = NewState;
-    // One line per actual change, not per probe: the probe now runs unprompted (at
-    // startup and on every connect), and a log entry each time would be pure noise.
+    if (AuthState != ELoomaAuthState::Unknown)
+    {
+        // Settled, so stop asking. Done here rather than at each of ProbeHealth's
+        // success paths, which makes "the retry runs only while the state is Unknown"
+        // true by construction instead of by three call sites agreeing.
+        CancelHealthRetry();
+    }
+    // One line per actual change, not per probe: the probe runs unprompted and on a
+    // retry loop, and a log entry each time would be pure noise.
     UE_LOG(LogLoomaSync, Log, TEXT("Backend auth: %s"), AuthStateText(AuthState));
     OnAuthStateChanged.Broadcast(AuthState);
+}
+
+void ULoomaSceneSyncSubsystem::ScheduleHealthRetry()
+{
+    if (IsAuthStateKnown())
+    {
+        return; // nothing left to ask
+    }
+    HealthProbeRetryDelay = (HealthProbeRetryDelay <= 0.0f)
+        ? HealthRetryMinDelay
+        : FMath::Min(HealthProbeRetryDelay * 2.0f, HealthRetryMaxDelay);
+    HealthProbeCooldown = HealthProbeRetryDelay;
+    UE_LOG(LogLoomaSync, Verbose, TEXT("Auth state still unknown; asking again in %.0fs"),
+        HealthProbeCooldown);
+}
+
+void ULoomaSceneSyncSubsystem::CancelHealthRetry()
+{
+    HealthProbeCooldown = 0.0f;
+    HealthProbeRetryDelay = 0.0f;
+    bHealthProbeInFlight = false;
+}
+
+void ULoomaSceneSyncSubsystem::TickHealthRetry(float DeltaTime)
+{
+    if (HealthProbeCooldown <= 0.0f)
+    {
+        return;
+    }
+    HealthProbeCooldown -= DeltaTime;
+    if (HealthProbeCooldown <= 0.0f)
+    {
+        HealthProbeCooldown = 0.0f;
+        ProbeHealth(/*bLogDiagnostics=*/false);
+    }
 }
 
 void ULoomaSceneSyncSubsystem::ProbeHealth(bool bLogDiagnostics)
@@ -440,14 +517,32 @@ void ULoomaSceneSyncSubsystem::ProbeHealth(bool bLogDiagnostics)
     // already says so once per retry. Hence the flag rather than two request bodies to
     // keep in step. The quiet path still logs, at Verbose, so
     // `-LogCmds="LogLoomaSync Verbose"` gets the whole story back.
+    if (!bLogDiagnostics)
+    {
+        // Arm the retry on the way out, before the request even exists. Doing it here
+        // rather than from the failure paths is what makes the schedule unconditional:
+        // a request that is dropped without ever completing still leaves a re-ask
+        // pending. A definitive answer cancels it (see SetAuthState).
+        ScheduleHealthRetry();
+        if (bHealthProbeInFlight)
+        {
+            return; // one at a time; the outstanding one will report or time out
+        }
+        bHealthProbeInFlight = true;
+    }
+
     const FString RestBase = GetRestBase();
     const FString HealthUrl = RestBase + TEXT("/health");
     const TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Request = FHttpModule::Get().CreateRequest();
     Request->SetURL(HealthUrl);
     Request->SetVerb(TEXT("GET"));
-    Request->SetTimeout(5.0f);
+    Request->SetTimeout(bLogDiagnostics ? HealthDiagnosticTimeout : BackgroundRequestTimeout);
     Request->OnProcessRequestComplete().BindWeakLambda(this,
         [this, HealthUrl, RestBase, bLogDiagnostics](FHttpRequestPtr Req, FHttpResponsePtr Resp, bool bOk) {
+            if (!bLogDiagnostics)
+            {
+                bHealthProbeInFlight = false;
+            }
             // The settings may have moved the backend while this was in flight. What
             // that server said about auth describes a server we no longer talk to, and
             // recording it would clobber the pending answer from the new one.
@@ -473,8 +568,8 @@ void ULoomaSceneSyncSubsystem::ProbeHealth(bool bLogDiagnostics)
                 }
                 else
                 {
-                    UE_LOG(LogLoomaSync, Verbose, TEXT("Health probe of %s failed; auth state stays unknown"),
-                        *HealthUrl);
+                    UE_LOG(LogLoomaSync, Verbose,
+                        TEXT("Health probe of %s failed; auth state stays unknown for now"), *HealthUrl);
                 }
                 return;
             }
@@ -618,6 +713,16 @@ void ULoomaSceneSyncSubsystem::RequestLogin(const FString& Username, const FStri
 {
     const FString LoginUrl = GetRestBase() + TEXT("/auth/login");
 
+    // The serial advances when a login is *sent*, not only when one is adopted, so that
+    // of two overlapping logins the later request wins whichever answer arrives first.
+    // Without it, two rapid logins as different accounts could land out of order and
+    // leave us holding the older account's token — and RefreshIdentity already carries
+    // this guard, so login lacking it would read as an oversight rather than a decision.
+    // A superseded login still reports, as a failure: the Blueprint node has a latent
+    // action waiting on exactly one of its two pins.
+    ++SessionSerial;
+    const uint32 Serial = SessionSerial;
+
     const TSharedRef<FJsonObject> Body = MakeShared<FJsonObject>();
     Body->SetStringField(TEXT("username"), Username);
     Body->SetStringField(TEXT("password"), Password);
@@ -634,9 +739,12 @@ void ULoomaSceneSyncSubsystem::RequestLogin(const FString& Username, const FStri
     // and BodyText goes out of scope as soon as the request owns its copy; keeping the
     // credential off the wire entirely is TLS's job, not this function's.
     Request->SetContentAsString(BodyText);
-    Request->SetTimeout(15.0f); // an Argon2id verify is deliberately slow
+    // Interactive: a person typed this and is watching. Long enough for an Argon2id
+    // verify (deliberately slow) plus a contended connection pool, short enough that a
+    // dead backend says so while they still care.
+    Request->SetTimeout(InteractiveRequestTimeout);
     Request->OnProcessRequestComplete().BindWeakLambda(this,
-        [this, LoginUrl, OnComplete](FHttpRequestPtr Req, FHttpResponsePtr Resp, bool bOk) {
+        [this, LoginUrl, OnComplete, Serial](FHttpRequestPtr Req, FHttpResponsePtr Resp, bool bOk) {
             // Every path below reports through here exactly once, and no failure path
             // touches the session: a rejected login leaves the socket up, the scene
             // loaded, and whatever identity we already had still ours.
@@ -647,6 +755,15 @@ void ULoomaSceneSyncSubsystem::RequestLogin(const FString& Username, const FStri
                     OnComplete(false, FLoomaIdentity(), Message);
                 }
             };
+
+            if (Serial != SessionSerial)
+            {
+                // Another login was sent, or the session was dropped, after this one
+                // went out. Adopting now would install a token the user has already
+                // moved on from.
+                Fail(TEXT("Login superseded by a later request."));
+                return;
+            }
 
             if (!bOk || !Resp.IsValid())
             {
@@ -749,7 +866,9 @@ void ULoomaSceneSyncSubsystem::Logout()
     // because AuthToken is already empty by now — putting it back so a helper could
     // read it out again would reopen the very window this ordering closes.
     Request->SetHeader(TEXT("Authorization"), TEXT("Bearer ") + RevokedToken);
-    Request->SetTimeout(5.0f);
+    // Background: nothing waits on the revoke, and a short budget would only convert
+    // "the pool was busy" into "the token was never revoked".
+    Request->SetTimeout(BackgroundRequestTimeout);
     Request->OnProcessRequestComplete().BindWeakLambda(this,
         [](FHttpRequestPtr Req, FHttpResponsePtr Resp, bool bOk) {
             // Best-effort by contract: nothing here may touch local state, and there is
@@ -767,7 +886,11 @@ void ULoomaSceneSyncSubsystem::RefreshIdentity()
     const TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Request = FHttpModule::Get().CreateRequest();
     Request->SetURL(MeUrl);
     Request->SetVerb(TEXT("GET"));
-    Request->SetTimeout(5.0f);
+    // Background, and the tier matters most here: a spurious timeout must never read as
+    // evidence about the token. It does not — the failure path below leaves the
+    // identity untouched — but the shorter the budget, the more often that path is
+    // taken for no reason.
+    Request->SetTimeout(BackgroundRequestTimeout);
     ApplyAuthHeader(Request);
 
     const bool bSentWithToken = HasAuthToken();
@@ -1318,6 +1441,12 @@ void ULoomaSceneSyncSubsystem::Tick(float DeltaTime)
     // Before anything else, and regardless of connection state: a handle created
     // last frame for an already-known job has had a frame to be bound.
     FlushPendingHandleReplays();
+
+    // Ahead of the reconnect early-out below, deliberately. An unreachable backend is
+    // the very case the re-probe exists for, and it is also the case where
+    // ReconnectCooldown is permanently armed — counting the probe down after that
+    // `return` would mean never counting it down at all.
+    TickHealthRetry(DeltaTime);
 
     if (ReconnectCooldown > 0.0f)
     {
