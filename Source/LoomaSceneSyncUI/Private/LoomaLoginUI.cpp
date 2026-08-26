@@ -7,6 +7,7 @@
 #include "LoomaSceneSyncLog.h"
 #include "LoomaSceneSyncSubsystem.h"
 #include "SLoomaLoginWidget.h"
+#include "Widgets/Layout/SBox.h"
 
 namespace
 {
@@ -33,7 +34,7 @@ namespace
  * consumer who needs per-window login is the consumer who should be building their own
  * widget against the Blueprint API.
  */
-TWeakPtr<SLoomaLoginWidget> GLoginWidget;
+TWeakPtr<SWidget> GLoginRoot;
 
 /** The viewport for a Blueprint world-context object, or null in a headless run. */
 UGameViewportClient* ViewportFor(const UObject* WorldContextObject)
@@ -50,7 +51,7 @@ UGameViewportClient* ViewportFor(const UObject* WorldContextObject)
 
 void ULoomaLoginUI::ShowLoginUI(UObject* WorldContextObject, int32 ZOrder)
 {
-    if (GLoginWidget.IsValid())
+    if (GLoginRoot.IsValid())
     {
         return; // already up — see the header on why this is idempotent rather than additive
     }
@@ -84,28 +85,62 @@ void ULoomaLoginUI::ShowLoginUI(UObject* WorldContextObject, int32 ZOrder)
             TEXT("stay hidden. Is the plugin enabled and is this a game world?"));
     }
 
+    // Anchored top-left at a fixed width, not handed to the viewport bare.
+    // AddViewportWidgetContent drops the widget into a full-screen overlay whose slot
+    // fills, and SBorder fills too — so an unwrapped form stretches its background over
+    // the entire viewport with three controls stranded in the middle of it. Looks like a
+    // bug, is one, and costs one SBox to avoid.
     const TSharedRef<SLoomaLoginWidget> Widget = SNew(SLoomaLoginWidget, Subsystem);
-    Viewport->AddViewportWidgetContent(Widget, ZOrder);
-    GLoginWidget = Widget;
+    const TSharedRef<SWidget> Root =
+        SNew(SBox)
+        .HAlign(HAlign_Left)
+        .VAlign(VAlign_Top)
+        .Padding(24.0f)
+        [
+            SNew(SBox).WidthOverride(280.0f)[Widget]
+        ];
+
+    Viewport->AddViewportWidgetContent(Root, ZOrder);
+    GLoginRoot = Root;
+
+    // Say what it decided. "Show Login UI did nothing visible" is otherwise
+    // indistinguishable from three different causes — no subsystem, an auth state still
+    // unknown, or a backend that wants no login — and the form's whole job is to render
+    // nothing in two of them.
+    if (Subsystem)
+    {
+        UE_LOG(LogLoomaSync, Display,
+            TEXT("Show Login UI: %s"),
+            !Subsystem->IsAuthStateKnown()
+                ? TEXT("auth state not known yet — the form stays hidden until /health answers")
+                : (!Subsystem->IsAuthEnabled()
+                    ? TEXT("this backend has auth disabled — the form stays hidden")
+                    : (Subsystem->HasAuthToken()
+                        ? TEXT("already signed in — showing the identity and a log-out button")
+                        : TEXT("auth required and no session — showing the login form"))));
+    }
 }
 
 void ULoomaLoginUI::HideLoginUI(UObject* WorldContextObject)
 {
-    const TSharedPtr<SLoomaLoginWidget> Widget = GLoginWidget.Pin();
-    if (!Widget.IsValid())
+    const TSharedPtr<SWidget> Root = GLoginRoot.Pin();
+    if (!Root.IsValid())
     {
         return;
     }
     if (UGameViewportClient* Viewport = ViewportFor(WorldContextObject))
     {
-        Viewport->RemoveViewportWidgetContent(Widget.ToSharedRef());
+        // The outer wrapper, which is what was added — RemoveViewportWidgetContent
+        // matches on the exact widget it was given, so passing the inner form would
+        // silently remove nothing.
+        Viewport->RemoveViewportWidgetContent(Root.ToSharedRef());
     }
     // Reset even if the viewport had already gone: holding a weak handle to a widget
     // nothing will ever remove would make a later Show a silent no-op.
-    GLoginWidget.Reset();
+    GLoginRoot.Reset();
 }
 
 bool ULoomaLoginUI::IsLoginUIShowing()
 {
-    return GLoginWidget.IsValid();
+    return GLoginRoot.IsValid();
 }
