@@ -24,6 +24,8 @@ The protocol it implements is specified in
 | `LoomaWireConvert` | Wire↔UE transform conversion, shared by the scene-sync layer and the generation-job parser |
 | `ELoomaJobState` / `LoomaGenerationTypes` | Text→3D job lifecycle, mirroring the backend's `JobState` vocabulary |
 | `ULoomaGenerationHandle` | One generation job's events, scoped to that job — raw state events plus per-stage ones (queued / generating images / awaiting selection / generating asset / generated), and the calls to drive the job |
+| `FLoomaIdentity` / `ELoomaIdentityKind` | Who the backend says we are — its `IdentityOut`: user id, display name, kind (`Guest` / `User`), admin flag |
+| `ULoomaLoginAction` | Async Blueprint node — log in (`POST /auth/login`) |
 | `ULoomaSubmitGenerationAction` | Async Blueprint node — submit a text→3D job (`POST /generate`) |
 | `ULoomaDownloadImageAction` | Async Blueprint node — download a candidate/selected image, decode to a transient `UTexture2D` |
 
@@ -127,9 +129,13 @@ the new section, which then wins.
 | --- | --- |
 | `Looma.Reconnect` | Drops the socket and connects again immediately, re-reading the settings. `ULoomaSceneSyncSubsystem::Reconnect`, also Blueprint-callable |
 | `Looma.Status` | Logs state (`CONNECTED` / `CONNECTING` / `DISCONNECTED (retry in Ns)` / `NO SOCKET`), the hub URL actually in use, the REST base, the backend's auth state, node/job counts and the active scene id — then `GET /health` and logs whether the backend answered, which separates "the socket is down" from "nothing is listening". The `/health` answer is also what refreshes the auth state, so this doubles as "ask the backend again" |
+| `Looma.Login <username> <password>` | Logs in over `POST /auth/login`. **Testing only** — the console echoes the password into the log and keeps it in the command history before the plugin sees a character of it. The real login is the `Login` Blueprint node behind a field that does not echo |
+| `Looma.Logout` | Forgets the token, then asks the backend to revoke it |
+| `Looma.Whoami` | Logs the current identity, and re-asks `GET /auth/me` when a token is held |
 
-Both work in the editor console, in PIE and in a packaged build; they resolve the subsystem from
-the current game instance, and report the configured URL when nothing is running.
+They work in the editor console, in PIE and in a packaged build; they resolve the subsystem from
+the current game instance. `Looma.Reconnect` / `Looma.Status` report the configured URL when
+nothing is running; the auth commands have no session to report without a subsystem, and say so.
 
 ### Auth discovery
 
@@ -158,6 +164,52 @@ Registration is folded into the enabled states rather than carried as a second f
 answer, and a `/health` with no `auth` block at all (a backend predating HAM-172) all leave the
 state `Unknown` — never `Disabled`. Reading silence as "no auth" happens to be right against
 today's backend, which is exactly why the code does not write it down.
+
+### Logging in
+
+`ELoomaAuthState` answers *what does this backend require*; the session API answers *who am I*.
+The two move independently — a backend can demand a login while this client is still a guest,
+which is the pair of facts a login screen exists to resolve — so they are separate state with
+separate events (`On Auth State Changed` versus `On Identity Changed`).
+
+| Blueprint node | Meaning |
+| --- | --- |
+| `Login` (async) | `POST /auth/login`. `On Logged In` carries the `FLoomaIdentity`, with the session already adopted; `On Failed` carries a message meant to be shown |
+| `Logout` | Forgets the token and the identity, then asks the backend to revoke — in that order |
+| `Refresh Identity` | `GET /auth/me`, adopting the answer |
+| `Get Identity` | The `FLoomaIdentity` we last learned. `Kind == Unknown` until something establishes it |
+| `Has Auth Token` | We hold a session token. Not the same question as "am I a user" — a token can be revoked server-side while we still hold the bytes |
+| `Get Identity Text` | One line naming the identity and whether a token is held. Never the token |
+| `On Identity Changed` | Who we are moved: a login, a logout, a refresh |
+
+The token lives **in memory only**, for the lifetime of the game instance — no config, no save
+game, no log line — so a fresh editor session is a fresh login. `ApplyAuthHeader` is the only
+thing that reads it; it takes an HTTP request and sets the header, rather than returning the
+string, so no caller ever holds a copy. Changing `BackendUrl` drops the session as well as the
+auth state: a token minted by one backend means nothing at another, and sending it to whoever
+now answers at that address would leak it for no benefit.
+
+Failures are deliberately narrow. A rejected login changes nothing else — the socket stays up,
+the scene stays loaded, and any identity already held is still held. A **401** never says whether
+the username or the password was wrong, because the backend does not either: it verifies against
+a dummy hash when no account exists, so the same message comes back after the same amount of work
+(`backend/app/auth/local.py`), and second-guessing that here would rebuild the account
+enumeration oracle it exists to deny. A **403** is a different thing worth its own message —
+accounts are switched off server-side, so retyping cannot help.
+
+Two subtleties of the backend contract that the code leans on:
+
+- **`GET /auth/me` never answers 401.** An unauthenticated caller gets a *guest* identity with a
+  200, so validity is decided by reading `kind`, never the status code. A token that comes back as
+  a guest has been revoked or has expired, and is dropped.
+- **A guest `/auth/me` answer is not adoptable.** Its HTTP path mints a fresh random
+  `Guest-xxxxxx` per call when there is no session, so the name matches nothing any other client
+  sees in the room roster. `Refresh Identity` therefore adopts an answer only when it is a user,
+  and `Looma.Whoami` only re-asks when a token is held.
+
+**Not yet wired up:** logging in does not change how this client appears in the room roster. The
+`Authorization` header goes on the auth routes only, and the scene-sync socket is still holding
+the guest identity it handshook with — re-handshaking on the token is separate work.
 
 ## Status
 

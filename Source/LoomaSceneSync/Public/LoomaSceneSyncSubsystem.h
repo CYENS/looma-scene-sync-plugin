@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "LoomaAuthTypes.h"
 #include "LoomaGenerationTypes.h"
 #include "LoomaSyncedActor.h"
 #include "Subsystems/GameInstanceSubsystem.h"
@@ -8,6 +9,7 @@
 #include "LoomaSceneSyncSubsystem.generated.h"
 
 class IWebSocket;
+class IHttpRequest;
 class FJsonObject;
 class FJsonValue;
 class ULoomaGenerationHandle;
@@ -70,6 +72,16 @@ enum class ELoomaAuthState : uint8
 
 /** Fired when the backend's auth state becomes known, or changes. */
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FLoomaAuthStateEvent, ELoomaAuthState, AuthState);
+
+/**
+ * Fired when *who we are* changes — a login, a logout, a `/auth/me` refresh.
+ *
+ * Deliberately a separate event from FLoomaAuthStateEvent above, which answers "what
+ * does this backend require". The two move independently and a UI needs both: a
+ * backend can demand a login (ELoomaAuthState::Enabled*) while we are still a guest,
+ * and that pair of facts is exactly the state a login screen exists to resolve.
+ */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FLoomaIdentityEvent, const FLoomaIdentity&, Identity);
 
 /**
  * Client of the LoomaXR scene-sync hub (backend /ws/scene), speaking **scene format
@@ -205,6 +217,81 @@ public:
     UPROPERTY(BlueprintAssignable, Category = "Looma|Auth")
     FLoomaAuthStateEvent OnAuthStateChanged;
 
+    // --- Auth: the session ---------------------------------------------------
+    // "Who am I", as against the block above's "what does this backend require".
+    //
+    // The token lives in memory for the lifetime of the game instance and nowhere
+    // else — no config, no save game, no log line. A fresh editor session is a fresh
+    // login.
+
+    /**
+     * Who the backend last told us we are. `Kind == Unknown` until something
+     * establishes it, and Unknown is not a synonym for guest: this client cannot name
+     * its own guest identity, because the hub derives `Guest-xxxxxx` from our WS
+     * clientId and only it knows the result.
+     */
+    UFUNCTION(BlueprintPure, Category = "Looma|Auth")
+    FLoomaIdentity GetIdentity() const;
+
+    /**
+     * We hold a session token. A different question from "is my identity a user":
+     * a token can be revoked or expire server-side while we still hold the bytes, and
+     * only the backend can say. Kept separate so neither can be mistaken for the
+     * other.
+     */
+    UFUNCTION(BlueprintPure, Category = "Looma|Auth")
+    bool HasAuthToken() const;
+
+    /** One line naming the identity and whether a token is held. Never the token itself. */
+    UFUNCTION(BlueprintPure, Category = "Looma|Auth")
+    FString GetIdentityText() const;
+
+    /** Who we are changed. See FLoomaIdentityEvent for why this is not OnAuthStateChanged. */
+    UPROPERTY(BlueprintAssignable, Category = "Looma|Auth")
+    FLoomaIdentityEvent OnIdentityChanged;
+
+    /**
+     * Forget the session, then ask the backend to revoke it — in that order, and the
+     * local half never depends on the answer. Console: `Looma.Logout`.
+     */
+    UFUNCTION(BlueprintCallable, Category = "Looma|Auth")
+    void Logout();
+
+    /**
+     * `GET /auth/me` — re-ask the backend who we are, and adopt the answer.
+     *
+     * That route never answers 401: an unauthenticated caller gets a *guest* identity
+     * with a 200 (backend/app/auth/routes.py), so a token we hold that comes back as
+     * a guest is a token the backend no longer honours. Console: `Looma.Whoami`.
+     */
+    UFUNCTION(BlueprintCallable, Category = "Looma|Auth")
+    void RefreshIdentity();
+
+    /**
+     * `POST /auth/login`. On success the session is adopted before OnComplete runs,
+     * so a caller can read GetIdentity()/HasAuthToken() straight away. On failure
+     * nothing else moves: the socket stays up, the scene stays loaded, and any
+     * identity we already had is still ours — an auth-enabled backend has to stay
+     * usable by someone who cannot or will not log in.
+     *
+     * Not a UFUNCTION: Blueprint gets `Login` (ULoomaLoginAction), which is this call
+     * with exec pins. The request lives here because the subsystem owns the token and
+     * because `Looma.Login` needs the same call — one implementation, two front doors.
+     */
+    void RequestLogin(const FString& Username, const FString& Password,
+        TFunction<void(bool bSuccess, const FLoomaIdentity& Identity, const FString& Error)> OnComplete);
+
+    /**
+     * Put `Authorization: Bearer <token>` on a request, if we hold a token. A request
+     * without one is a guest request, not an error, so this is always safe to call.
+     *
+     * The single place that header is built. It takes the request rather than
+     * returning the string on purpose: no caller ever holds a copy of the token, and
+     * a `GetToken()` getter is one careless log line away from putting it in a shared
+     * file. Every REST call and the WS handshake are meant to route through here.
+     */
+    void ApplyAuthHeader(const TSharedRef<IHttpRequest, ESPMode::ThreadSafe>& Request) const;
+
     // --- Generation jobs (observe) -------------------------------------------
 
     /** Any change to a job (state / progress / queue position / enhanced prompt). */
@@ -327,6 +414,18 @@ private:
     /** Adopt an auth state, broadcasting OnAuthStateChanged only if it actually moved. */
     void SetAuthState(ELoomaAuthState NewState);
 
+    /** Take on a session: the token and the identity it belongs to, which only mean anything together. */
+    void AdoptSession(const FString& Token, const FLoomaIdentity& NewIdentity);
+
+    /**
+     * Drop the token and the identity. Cannot fail and never asks the backend, which
+     * is what lets every caller treat forgetting a session as unconditional.
+     */
+    void ClearSession();
+
+    /** Store an identity, broadcasting OnIdentityChanged only if it actually moved. */
+    void SetIdentity(const FLoomaIdentity& NewIdentity);
+
     void SendJson(const TSharedRef<FJsonObject>& Msg);
 
     // Inbound — one handler per wire message (see the class comment).
@@ -389,6 +488,22 @@ private:
     bool bConnecting = false;
     /** What /health last told us about auth. Unknown until a probe lands, and again if one fails. */
     ELoomaAuthState AuthState = ELoomaAuthState::Unknown;
+    /**
+     * The opaque session token from `POST /auth/login`, or empty. Memory only: nothing
+     * writes it to disk, to a config, or to the log, and ApplyAuthHeader is the only
+     * reader, so it never leaves this object as a value.
+     */
+    FString AuthToken;
+    /** Who the backend last said we are. Kind == Unknown until something establishes it. */
+    FLoomaIdentity CurrentIdentity;
+    /**
+     * Bumped by every AdoptSession / ClearSession. An in-flight auth request captures
+     * it and drops its answer if it no longer matches — otherwise a `/auth/me` sent as
+     * a guest could land after a login and overwrite the account identity with the
+     * stale guest one. Cheaper and safer than capturing the token to compare: one
+     * fewer copy of it in existence.
+     */
+    uint32 SessionSerial = 0;
     /** Our binding on ULoomaSceneSyncSettings::OnSettingsChanged, released on teardown. */
     FDelegateHandle SettingsChangedHandle;
     FString ClientId;
