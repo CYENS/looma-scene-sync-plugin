@@ -225,11 +225,15 @@ Every REST call the plugin makes goes out with `Authorization: Bearer <token>` w
 held — `SendRest`, the queue hydrate, `POST /generate`, the candidate-image download and the auth
 routes themselves. `ApplyAuthHeader` is the only thing that attaches it, and it takes the request
 rather than returning the string, so no caller ever holds a copy of the token. Because it is the
-only attacher, it can also enforce that the token goes **nowhere but the configured backend**: it
-compares the request URL against `BackendUrl` and withholds the header otherwise. That is not
-theoretical — the image URL comes off a generation job and through `ResolveBackendUrl`, which
-forwards an absolute URL untouched, so it is the one request whose host the plugin did not choose.
-Call `SetURL` before `ApplyAuthHeader`; the wrong order costs you the header, which is the safe
+only attacher, it can also enforce that the token goes **nowhere but the configured backend**: the
+request URL must begin with `BackendUrl` *and* break on a path boundary — the next character has
+to be `/`, or the URL has to be the base exactly. A bare prefix match would not do. Against the
+default `http://127.0.0.1:8000`, `http://127.0.0.1:8000@evil.com/whatever` starts with the base
+and is not the backend at all, because everything before the `@` is userinfo and the host is
+`evil.com`; `…:8000.evil.com` and `…:80001` slip through the same hole. This is not theoretical —
+the image URL comes off a generation job and through `ResolveBackendUrl`, which forwards an
+absolute URL untouched, so it is the one request whose host the plugin did not choose. Call
+`SetURL` before `ApplyAuthHeader`; the wrong order costs you the header, which is the safe
 failure.
 
 **`/static/*.glb` is deliberately anonymous.** It is a plain `StaticFiles` mount and the FastAPI
