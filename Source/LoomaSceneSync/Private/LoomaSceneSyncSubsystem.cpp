@@ -8,6 +8,7 @@
 #include "Interfaces/IHttpRequest.h"
 #include "Interfaces/IHttpResponse.h"
 #include "IWebSocket.h"
+#include "LoomaAuthTypes.h"
 #include "LoomaGenerationHandle.h"
 #include "LoomaGenerationTypes.h"
 #include "LoomaSceneComponents.h"
@@ -74,6 +75,31 @@ const TCHAR* AuthStateText(ELoomaAuthState State)
     default:
         return TEXT("unknown");
     }
+}
+
+/**
+ * The `detail` string FastAPI puts on an HTTPException body, or empty.
+ *
+ * One named field, never an excerpt of the body: echoing a response into the log is
+ * how a token ends up in a shared file, and while no error body from /auth/* carries
+ * one today, "today" is not a property logging code should rest on. The backend's
+ * own message is preferred over anything we could compose because it is the wording
+ * the operator sees in every other client.
+ */
+FString ErrorDetail(const FHttpResponsePtr& Resp)
+{
+    if (!Resp.IsValid())
+    {
+        return FString();
+    }
+    TSharedPtr<FJsonObject> Json;
+    const TSharedRef<TJsonReader<TCHAR>> Reader = TJsonReaderFactory<TCHAR>::Create(Resp->GetContentAsString());
+    FString Detail;
+    if (FJsonSerializer::Deserialize(Reader, Json) && Json.IsValid())
+    {
+        Json->TryGetStringField(TEXT("detail"), Detail);
+    }
+    return Detail;
 }
 
 /**
@@ -168,6 +194,11 @@ void ULoomaSceneSyncSubsystem::Deinitialize()
     ULoomaSceneSyncSettings::OnSettingsChanged().Remove(SettingsChangedHandle);
     SettingsChangedHandle.Reset();
     CloseSocket();
+    // The token is memory-only, so ending the game instance ends the session anyway.
+    // Cleared explicitly rather than left to the object's destruction so it cannot sit
+    // around in a freed-but-not-reused allocation.
+    AuthToken.Empty();
+    CurrentIdentity = FLoomaIdentity();
     Tracked.Empty();
     JobHandles.Empty();
     PendingHandleReplays.Empty();
@@ -286,6 +317,11 @@ void ULoomaSceneSyncSubsystem::OnSettingsChanged()
         // on its own: if the new address has no hub, the socket never opens, while
         // /health may still answer (a path-prefix typo does exactly that).
         SetAuthState(ELoomaAuthState::Unknown);
+        // And the session with it. A token minted by one backend means nothing at
+        // another, so keeping it could only ever do one of two things: be rejected, or
+        // be sent — a bearer belonging to a different server — to whoever now answers
+        // at this address. Neither is worth the convenience of not retyping a password.
+        ClearSession();
         Reconnect();
         ProbeHealth(/*bLogDiagnostics=*/false);
     }
@@ -494,6 +530,305 @@ void ULoomaSceneSyncSubsystem::ProbeHealth(bool bLogDiagnostics)
                     TEXT("Backend %s answered %d with something other than /health JSON; auth stays unknown"),
                     *HealthUrl, Code);
             }
+        });
+    Request->ProcessRequest();
+}
+
+// --- Auth: the session -------------------------------------------------------
+
+FLoomaIdentity ULoomaSceneSyncSubsystem::GetIdentity() const
+{
+    return CurrentIdentity;
+}
+
+bool ULoomaSceneSyncSubsystem::HasAuthToken() const
+{
+    return !AuthToken.IsEmpty();
+}
+
+FString ULoomaSceneSyncSubsystem::GetIdentityText() const
+{
+    const TCHAR* KindText = TEXT("unknown");
+    switch (CurrentIdentity.Kind)
+    {
+    case ELoomaIdentityKind::Guest:
+        KindText = TEXT("guest");
+        break;
+    case ELoomaIdentityKind::User:
+        KindText = TEXT("user");
+        break;
+    default:
+        break;
+    }
+    // Never the token, and not the user id either: an id adds nothing a reader of a log
+    // can use, and is one more field to redact out of a pasted bug report.
+    return FString::Printf(TEXT("%s (%s%s)%s"),
+        CurrentIdentity.DisplayName.IsEmpty() ? TEXT("<no name>") : *CurrentIdentity.DisplayName,
+        KindText,
+        CurrentIdentity.bIsAdmin ? TEXT(", admin") : TEXT(""),
+        HasAuthToken() ? TEXT(" [session token held]") : TEXT(""));
+}
+
+void ULoomaSceneSyncSubsystem::ApplyAuthHeader(const TSharedRef<IHttpRequest, ESPMode::ThreadSafe>& Request) const
+{
+    if (AuthToken.IsEmpty())
+    {
+        // Not an error: every route serves guests, so an unauthenticated request is a
+        // guest request. Callers must not have to branch on this.
+        return;
+    }
+    Request->SetHeader(TEXT("Authorization"), TEXT("Bearer ") + AuthToken);
+}
+
+void ULoomaSceneSyncSubsystem::AdoptSession(const FString& Token, const FLoomaIdentity& NewIdentity)
+{
+    AuthToken = Token;
+    // Bumped before the broadcast, so a handler that fires off a request from inside
+    // OnIdentityChanged captures the serial it will actually be checked against.
+    ++SessionSerial;
+    SetIdentity(NewIdentity);
+}
+
+void ULoomaSceneSyncSubsystem::ClearSession()
+{
+    AuthToken.Empty();
+    ++SessionSerial;
+    // Unknown, not a guest identity we invent. We cannot name our own guest identity:
+    // the hub derives `Guest-xxxxxx` from our WS clientId and only it knows the result,
+    // and GET /auth/me is no help — its HTTP path mints a FRESH random guest seed on
+    // every call with no session (see the CLIENT_ID_HEADER note in
+    // backend/app/auth/provider.py), so it would name us something no other client
+    // sees in the roster. Unknown is the honest answer until the socket says otherwise.
+    SetIdentity(FLoomaIdentity());
+}
+
+void ULoomaSceneSyncSubsystem::SetIdentity(const FLoomaIdentity& NewIdentity)
+{
+    if (CurrentIdentity == NewIdentity)
+    {
+        return;
+    }
+    CurrentIdentity = NewIdentity;
+    UE_LOG(LogLoomaSync, Log, TEXT("Identity: %s"), *GetIdentityText());
+    OnIdentityChanged.Broadcast(CurrentIdentity);
+}
+
+void ULoomaSceneSyncSubsystem::RequestLogin(const FString& Username, const FString& Password,
+    TFunction<void(bool bSuccess, const FLoomaIdentity& Identity, const FString& Error)> OnComplete)
+{
+    const FString LoginUrl = GetRestBase() + TEXT("/auth/login");
+
+    const TSharedRef<FJsonObject> Body = MakeShared<FJsonObject>();
+    Body->SetStringField(TEXT("username"), Username);
+    Body->SetStringField(TEXT("password"), Password);
+    FString BodyText;
+    const TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
+        TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&BodyText);
+    FJsonSerializer::Serialize(Body, Writer);
+
+    const TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Request = FHttpModule::Get().CreateRequest();
+    Request->SetURL(LoginUrl);
+    Request->SetVerb(TEXT("POST"));
+    Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
+    // The one request in the plugin whose body holds a password. It is never logged,
+    // and BodyText goes out of scope as soon as the request owns its copy; keeping the
+    // credential off the wire entirely is TLS's job, not this function's.
+    Request->SetContentAsString(BodyText);
+    Request->SetTimeout(15.0f); // an Argon2id verify is deliberately slow
+    Request->OnProcessRequestComplete().BindWeakLambda(this,
+        [this, LoginUrl, OnComplete](FHttpRequestPtr Req, FHttpResponsePtr Resp, bool bOk) {
+            // Every path below reports through here exactly once, and no failure path
+            // touches the session: a rejected login leaves the socket up, the scene
+            // loaded, and whatever identity we already had still ours.
+            const auto Fail = [&OnComplete](const FString& Message) {
+                UE_LOG(LogLoomaSync, Warning, TEXT("%s"), *Message);
+                if (OnComplete)
+                {
+                    OnComplete(false, FLoomaIdentity(), Message);
+                }
+            };
+
+            if (!bOk || !Resp.IsValid())
+            {
+                Fail(FString::Printf(TEXT("Login failed: %s is unreachable."), *LoginUrl));
+                return;
+            }
+
+            const int32 Code = Resp->GetResponseCode();
+            if (Code >= 300)
+            {
+                // The backend's own `detail` string, read only on the error paths — so
+                // the one response in this API that does carry a token is never picked
+                // over for something to print.
+                const FString Detail = ErrorDetail(Resp);
+                if (Code == 401)
+                {
+                    // One message for a wrong password and an account that does not
+                    // exist alike. The backend raises the same InvalidCredentials, with
+                    // the same wording, after the same amount of work — it verifies
+                    // against a dummy hash when there is no row, so even a timing probe
+                    // learns nothing (backend/app/auth/local.py). Telling the two apart
+                    // here would hand back the account-enumeration oracle it went to
+                    // that trouble to deny.
+                    Fail(Detail.IsEmpty()
+                            ? FString(TEXT("Login failed: those credentials were not accepted."))
+                            : Detail);
+                    return;
+                }
+                if (Code == 403)
+                {
+                    // AuthDisabled, not a bad password: the operator switched accounts
+                    // off, so no credentials would work and retyping is not the remedy.
+                    // Worth its own message for exactly that reason.
+                    Fail(Detail.IsEmpty()
+                            ? FString(TEXT("Login failed: this backend has authentication disabled."))
+                            : Detail);
+                    return;
+                }
+                Fail(FString::Printf(TEXT("Login failed: POST /auth/login answered %d."), Code));
+                return;
+            }
+
+            TSharedPtr<FJsonObject> Json;
+            const TSharedRef<TJsonReader<TCHAR>> Reader =
+                TJsonReaderFactory<TCHAR>::Create(Resp->GetContentAsString());
+            const TSharedPtr<FJsonObject>* IdentityObj = nullptr;
+            FString Token;
+            if (!FJsonSerializer::Deserialize(Reader, Json) || !Json.IsValid() ||
+                !Json->TryGetStringField(TEXT("token"), Token) || Token.IsEmpty() ||
+                !Json->TryGetObjectField(TEXT("identity"), IdentityObj) || !IdentityObj)
+            {
+                // A success we cannot read is a failure, not a session. Note what is
+                // *not* in the message: no excerpt of the body, because this is the one
+                // response in the API that carries a token.
+                Fail(FString::Printf(
+                    TEXT("Login failed: the backend answered %d without a usable identity and token."), Code));
+                return;
+            }
+
+            const FLoomaIdentity Identity = LoomaParseIdentity(*IdentityObj);
+            // Adopt before reporting, so a caller reading GetIdentity() / HasAuthToken()
+            // on the success pin sees the session rather than the state before it.
+            AdoptSession(Token, Identity);
+            UE_LOG(LogLoomaSync, Display, TEXT("Logged in: %s"), *GetIdentityText());
+            if (OnComplete)
+            {
+                OnComplete(true, CurrentIdentity, FString());
+            }
+        });
+    Request->ProcessRequest();
+}
+
+void ULoomaSceneSyncSubsystem::Logout()
+{
+    // Forget first, ask second, and never make the forgetting depend on the answer.
+    // POST /auth/logout is 204 whatever happens — revoking an expired, unknown or
+    // foreign token is a no-op by contract (backend/app/auth/routes.py) — so there is
+    // no failure a user needs told about. And a logout that kept the token because a
+    // packet went missing would leave this client authenticated behind a UI saying it
+    // is not, which is much the worse of the two bugs. The token is copied out first
+    // so the revoke can still name what it is revoking.
+    const FString RevokedToken = AuthToken;
+    ClearSession();
+    // Said out loud either way: a console command that does nothing visible reads as
+    // broken, and "there was nothing to log out of" is itself the answer someone
+    // running this wanted.
+    UE_LOG(LogLoomaSync, Display, TEXT("Logged out%s"),
+        RevokedToken.IsEmpty() ? TEXT(" (there was no session to revoke)") : TEXT(""));
+
+    if (RevokedToken.IsEmpty())
+    {
+        return; // nothing was ever issued, so there is nothing to revoke
+    }
+
+    const FString LogoutUrl = GetRestBase() + TEXT("/auth/logout");
+    const TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Request = FHttpModule::Get().CreateRequest();
+    Request->SetURL(LogoutUrl);
+    Request->SetVerb(TEXT("POST"));
+    // The header is set from the local copy rather than through ApplyAuthHeader,
+    // because AuthToken is already empty by now — putting it back so a helper could
+    // read it out again would reopen the very window this ordering closes.
+    Request->SetHeader(TEXT("Authorization"), TEXT("Bearer ") + RevokedToken);
+    Request->SetTimeout(5.0f);
+    Request->OnProcessRequestComplete().BindWeakLambda(this,
+        [](FHttpRequestPtr Req, FHttpResponsePtr Resp, bool bOk) {
+            // Best-effort by contract: nothing here may touch local state, and there is
+            // nothing for a user to do about it, so this is Verbose and not a Warning.
+            const bool bRevoked = bOk && Resp.IsValid() && Resp->GetResponseCode() < 300;
+            UE_LOG(LogLoomaSync, Verbose, TEXT("Logout revoke %s"),
+                bRevoked ? TEXT("acknowledged") : TEXT("did not land (the token expires on its own)"));
+        });
+    Request->ProcessRequest();
+}
+
+void ULoomaSceneSyncSubsystem::RefreshIdentity()
+{
+    const FString MeUrl = GetRestBase() + TEXT("/auth/me");
+    const TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Request = FHttpModule::Get().CreateRequest();
+    Request->SetURL(MeUrl);
+    Request->SetVerb(TEXT("GET"));
+    Request->SetTimeout(5.0f);
+    ApplyAuthHeader(Request);
+
+    const bool bSentWithToken = HasAuthToken();
+    const uint32 Serial = SessionSerial;
+    Request->OnProcessRequestComplete().BindWeakLambda(this,
+        [this, MeUrl, bSentWithToken, Serial](FHttpRequestPtr Req, FHttpResponsePtr Resp, bool bOk) {
+            if (Serial != SessionSerial)
+            {
+                // The session moved while this was in flight — a login, a logout, or a
+                // backend change. This answer describes a session we are no longer in,
+                // and the classic bug it would cause is a guest `/auth/me` sent before
+                // a login landing after it and demoting the account identity.
+                UE_LOG(LogLoomaSync, Verbose, TEXT("Dropping a stale /auth/me answer"));
+                return;
+            }
+            if (!bOk || !Resp.IsValid() || Resp->GetResponseCode() >= 300)
+            {
+                // Leave the identity exactly as it was. A refresh that did not happen
+                // tells us nothing about who we are, and overwriting a known identity
+                // with Unknown on a dropped packet is a client that logs itself out
+                // every time the network hiccups.
+                UE_LOG(LogLoomaSync, Warning, TEXT("Could not refresh identity from %s (%d)"), *MeUrl,
+                    Resp.IsValid() ? Resp->GetResponseCode() : 0);
+                return;
+            }
+
+            TSharedPtr<FJsonObject> Json;
+            const TSharedRef<TJsonReader<TCHAR>> Reader =
+                TJsonReaderFactory<TCHAR>::Create(Resp->GetContentAsString());
+            if (!FJsonSerializer::Deserialize(Reader, Json) || !Json.IsValid())
+            {
+                UE_LOG(LogLoomaSync, Warning, TEXT("%s answered 200 but not with an identity"), *MeUrl);
+                return;
+            }
+
+            const FLoomaIdentity Fresh = LoomaParseIdentity(Json);
+            // THE thing to get right about this route: it never answers 401. An
+            // unauthenticated caller gets a guest identity with a 200
+            // (backend/app/auth/routes.py), so the status code says nothing whatsoever
+            // about whether our token is alive — only `kind` does. A client that read
+            // the code here would trust a revoked token until something else refused it.
+            if (Fresh.Kind == ELoomaIdentityKind::User)
+            {
+                SetIdentity(Fresh);
+                return;
+            }
+            if (bSentWithToken)
+            {
+                UE_LOG(LogLoomaSync, Warning,
+                    TEXT("Our session token no longer resolves to an account — the backend answered as a ")
+                    TEXT("guest, so the session has been revoked or expired. Dropping it."));
+                ClearSession();
+                return;
+            }
+            // A guest answer to a request that carried no token: expected, and not
+            // adoptable. `/auth/me`'s HTTP path mints a FRESH random `Guest-xxxxxx` per
+            // call when there is no session, so this name matches nothing any other
+            // client sees in the roster — writing it down would invent an identity
+            // rather than learn one. Nothing here to learn; leave what we have alone.
+            UE_LOG(LogLoomaSync, Verbose,
+                TEXT("%s answered as a guest and we sent no token — identity left unchanged"), *MeUrl);
         });
     Request->ProcessRequest();
 }
