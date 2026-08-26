@@ -4,6 +4,7 @@
 #include "Dom/JsonValue.h"
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"
+#include "HAL/FileManager.h"
 #include "HttpModule.h"
 #include "Interfaces/IHttpRequest.h"
 #include "Interfaces/IHttpResponse.h"
@@ -16,7 +17,9 @@
 #include "LoomaSceneSyncSettings.h"
 #include "LoomaSyncedActor.h"
 #include "LoomaWireConvert.h"
+#include "Misc/FileHelper.h"
 #include "Misc/Guid.h"
+#include "Misc/Paths.h"
 #include "Modules/ModuleManager.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
@@ -65,6 +68,22 @@ constexpr float HealthRetryMaxDelay = 60.0f;
  */
 constexpr const TCHAR* AuthHeaderName = TEXT("Authorization");
 constexpr const TCHAR* AuthHeaderBearerPrefix = TEXT("Bearer ");
+
+/**
+ * The persisted session's location and shape. `Saved/` because it is per-machine
+ * scratch that no project commits — see GetSessionFilePath for why Project Settings
+ * would be the wrong home.
+ *
+ * There is no format version. The loader requires every field it reads and discards
+ * the file otherwise, so a future shape change is self-cleaning: an old file simply
+ * fails to satisfy the new loader and is treated as no session at all. A half-written
+ * file (a crash mid-save) lands in the same place, unparseable and therefore ignored.
+ */
+constexpr const TCHAR* SessionFileDir = TEXT("LoomaSceneSync");
+constexpr const TCHAR* SessionFileName = TEXT("Session.json");
+constexpr const TCHAR* SessionFieldBackend = TEXT("backend");
+constexpr const TCHAR* SessionFieldToken = TEXT("token");
+constexpr const TCHAR* SessionFieldDisplayName = TEXT("displayName");
 
 /**
  * The settings' backend address as an absolute http(s) base with no trailing slash.
@@ -218,6 +237,15 @@ void ULoomaSceneSyncSubsystem::Initialize(FSubsystemCollectionBase& Collection)
     FModuleManager::Get().LoadModuleChecked(TEXT("WebSockets"));
     SettingsChangedHandle = ULoomaSceneSyncSettings::OnSettingsChanged().AddUObject(
         this, &ULoomaSceneSyncSubsystem::OnSettingsChanged);
+    // Before Connect, and that order is the whole point of it: the first handshake then
+    // already carries the bearer, so the hub names us the account from the outset. Load
+    // it afterwards instead and every launch would connect as a guest and immediately
+    // reconnect, which every other client in the room sees as a join/leave flicker.
+    //
+    // Validation is not done here. The health probe below is the thing that already
+    // knows when the backend became reachable, and retries until it does, so the
+    // restored token is checked from its success path — see ProbeHealth.
+    LoadSavedSession();
     Connect();
     // Ask what this backend wants before anything asks us. A UI that decides whether
     // to show a login screen cannot wait for a human to type `Looma.Status`, and the
@@ -231,11 +259,14 @@ void ULoomaSceneSyncSubsystem::Deinitialize()
     ULoomaSceneSyncSettings::OnSettingsChanged().Remove(SettingsChangedHandle);
     SettingsChangedHandle.Reset();
     CloseSocket();
-    // Tidiness, not a security control, and worth being exact about: the session ends
-    // with the game instance because that is the only place the token lives. Empty()
-    // releases the buffer, it does not scrub it — and scrubbing this one would buy
-    // nothing anyway, since the HTTP layer and every `Bearer …` header string we built
-    // hold copies of their own that we do not own and cannot reach.
+    // Drop the in-memory copy only. The saved session on disk is deliberately left
+    // alone: outliving the game instance is the entire point of it, and closing the
+    // editor is not a logout — ClearSession is the one thing that deletes the file.
+    //
+    // Tidiness rather than a security control, and worth being exact about, since a
+    // token now does rest on disk: Empty() releases the buffer without scrubbing it,
+    // and scrubbing this one would buy nothing while the HTTP layer and every
+    // `Bearer …` header string hold copies we neither own nor can reach.
     AuthToken.Empty();
     CurrentIdentity = FLoomaIdentity();
     Tracked.Empty();
@@ -633,6 +664,16 @@ void ULoomaSceneSyncSubsystem::ProbeHealth(bool bLogDiagnostics)
                 // far — the same test the triage below turns on — so the auth state can
                 // never be taken from whatever else happens to serve that address.
                 SetAuthState(ReadAuthState(Json));
+                // The backend has just proved it answers, on a connection slot that has
+                // this instant come free — the best moment on offer to check a token
+                // restored from disk. Hung off the probe rather than given a retry loop
+                // of its own, because the probe already keeps asking until the backend
+                // is reachable; and guarded on *provisional*, so a session that has
+                // been confirmed once is not re-checked on every later probe.
+                if (IsIdentityProvisional())
+                {
+                    RefreshIdentity();
+                }
                 if (bLogDiagnostics)
                 {
                     UE_LOG(LogLoomaSync, Display, TEXT("Backend %s OK (%d): status %s, %d asset(s), auth %s"),
@@ -687,11 +728,32 @@ FString ULoomaSceneSyncSubsystem::GetIdentityText() const
     }
     // Never the token, and not the user id either: an id adds nothing a reader of a log
     // can use, and is one more field to redact out of a pasted bug report.
+    //
+    // The token note distinguishes the provisional window explicitly, because
+    // "alice (unknown)" on its own reads like a contradiction to whoever ran
+    // `Looma.Whoami` two seconds after launch — the name is off the disk and the kind
+    // has not been confirmed yet, and the suffix is what says so.
+    const TCHAR* TokenText = TEXT("");
+    if (IsIdentityProvisional())
+    {
+        TokenText = TEXT(" [restored session, not yet validated]");
+    }
+    else if (HasAuthToken())
+    {
+        TokenText = TEXT(" [session token held]");
+    }
     return FString::Printf(TEXT("%s (%s%s)%s"),
         CurrentIdentity.DisplayName.IsEmpty() ? TEXT("<no name>") : *CurrentIdentity.DisplayName,
         KindText,
         CurrentIdentity.bIsAdmin ? TEXT(", admin") : TEXT(""),
-        HasAuthToken() ? TEXT(" [session token held]") : TEXT(""));
+        TokenText);
+}
+
+bool ULoomaSceneSyncSubsystem::IsIdentityProvisional() const
+{
+    // A token but no confirmed identity. Only the restore path can produce this pair:
+    // a login sets both at once, and clearing drops both.
+    return HasAuthToken() && CurrentIdentity.Kind == ELoomaIdentityKind::Unknown;
 }
 
 void ULoomaSceneSyncSubsystem::ApplyAuthHeader(const TSharedRef<IHttpRequest, ESPMode::ThreadSafe>& Request) const
@@ -773,13 +835,22 @@ void ULoomaSceneSyncSubsystem::ApplyAuthToken(const TSharedRef<FJsonObject>& Hel
     Hello->SetStringField(TEXT("token"), AuthToken);
 }
 
-void ULoomaSceneSyncSubsystem::AdoptSession(const FString& Token, const FLoomaIdentity& NewIdentity)
+void ULoomaSceneSyncSubsystem::SetSession(const FString& Token, const FLoomaIdentity& NewIdentity)
 {
     AuthToken = Token;
     // Bumped before the broadcast, so a handler that fires off a request from inside
     // OnIdentityChanged captures the serial it will actually be checked against.
     ++SessionSerial;
     SetIdentity(NewIdentity);
+}
+
+void ULoomaSceneSyncSubsystem::AdoptSession(const FString& Token, const FLoomaIdentity& NewIdentity)
+{
+    SetSession(Token, NewIdentity);
+    // Persisted here and deleted in ClearSession — one write site and one delete site,
+    // which is what makes logout, an expired token and a backend change all covered
+    // without a fourth caller to remember.
+    SaveSession();
     // The hub resolves an identity once, from the handshake, so a socket that came up
     // as a guest stays a guest until it is re-opened — this is what makes a login
     // visible to the other clients in the room rather than only to us.
@@ -795,15 +866,17 @@ void ULoomaSceneSyncSubsystem::AdoptSession(const FString& Token, const FLoomaId
 void ULoomaSceneSyncSubsystem::ClearSession(bool bRehandshake)
 {
     const bool bHadSession = HasAuthToken();
-    AuthToken.Empty();
-    ++SessionSerial;
+    // Unconditionally, whatever bRehandshake says: that flag is about the socket, not
+    // about the disk. A session dropped because the backend moved must not be left on
+    // disk to be restored on the next launch.
+    DeleteSavedSession();
     // Unknown, not a guest identity we invent. We cannot name our own guest identity:
     // the hub derives `Guest-xxxxxx` from our WS clientId and only it knows the result,
     // and GET /auth/me is no help — its HTTP path mints a FRESH random guest seed on
     // every call with no session (see the CLIENT_ID_HEADER note in
     // backend/app/auth/provider.py), so it would name us something no other client
     // sees in the roster. Unknown is the honest answer until the socket says otherwise.
-    SetIdentity(FLoomaIdentity());
+    SetSession(FString(), FLoomaIdentity());
 
     // Only worth a reconnect if we were actually presenting a session: dropping a
     // token we never had changes nothing about how the hub sees this socket, and
@@ -825,6 +898,121 @@ void ULoomaSceneSyncSubsystem::SetIdentity(const FLoomaIdentity& NewIdentity)
     CurrentIdentity = NewIdentity;
     UE_LOG(LogLoomaSync, Log, TEXT("Identity: %s"), *GetIdentityText());
     OnIdentityChanged.Broadcast(CurrentIdentity);
+}
+
+FString ULoomaSceneSyncSubsystem::GetSessionFilePath() const
+{
+    return FPaths::Combine(FPaths::ProjectSavedDir(), SessionFileDir, SessionFileName);
+}
+
+void ULoomaSceneSyncSubsystem::SaveSession() const
+{
+    const FString Path = GetSessionFilePath();
+    if (AuthToken.IsEmpty())
+    {
+        return; // nothing to write; ClearSession is what removes the file
+    }
+
+    const TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+    // The backend that minted it, so the loader can refuse to hand a token to a
+    // different one. Same reasoning OnSettingsChanged applies while running; without it
+    // here, a restart would be a way to smuggle a token from backend A to backend B.
+    Root->SetStringField(SessionFieldBackend, GetRestBase());
+    Root->SetStringField(SessionFieldToken, AuthToken);
+    // The display name and nothing else of the identity. Not the user id, which no
+    // caller needs before validation, and emphatically not `is_admin`: a cached
+    // capability read back off the disk is a capability an attacker with write access
+    // to Saved/ could grant themselves in a UI. The backend re-checks it on every admin
+    // route regardless, so the only thing that would achieve is a misleading screen.
+    Root->SetStringField(SessionFieldDisplayName, CurrentIdentity.DisplayName);
+
+    FString Text;
+    const TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
+        TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Text);
+    FJsonSerializer::Serialize(Root, Writer);
+
+    // SaveStringToFile will not create the directory itself.
+    IFileManager::Get().MakeDirectory(*FPaths::GetPath(Path), /*Tree=*/true);
+    // ForceUTF8WithoutBOM rather than AutoDetect: a display name can be non-ASCII, and
+    // a deterministic encoding is one fewer thing for the loader to be surprised by.
+    // It round-trips — FFileHelper::BufferToString decodes a buffer with no BOM through
+    // FUTF8ToTCHAR_Convert, so a UTF-8 name comes back as it went in.
+    if (!FFileHelper::SaveStringToFile(Text, *Path, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
+    {
+        // Best-effort. The live session is unaffected — this only costs the *next*
+        // launch a login — so it is a warning and not a failure handed back to a caller.
+        UE_LOG(LogLoomaSync, Warning, TEXT("Could not save the session to %s; this login will not persist"),
+            *Path);
+    }
+}
+
+void ULoomaSceneSyncSubsystem::DeleteSavedSession() const
+{
+    const FString Path = GetSessionFilePath();
+    if (!IFileManager::Get().FileExists(*Path))
+    {
+        return;
+    }
+    // Quiet: a delete that fails is worth one line, not the file manager's own error.
+    if (!IFileManager::Get().Delete(*Path, /*RequireExists=*/false, /*EvenReadOnly=*/true, /*Quiet=*/true))
+    {
+        UE_LOG(LogLoomaSync, Warning, TEXT("Could not delete the saved session at %s"), *Path);
+        return;
+    }
+    UE_LOG(LogLoomaSync, Verbose, TEXT("Deleted the saved session at %s"), *Path);
+}
+
+void ULoomaSceneSyncSubsystem::LoadSavedSession()
+{
+    const FString Path = GetSessionFilePath();
+    FString Text;
+    if (!FFileHelper::LoadFileToString(Text, *Path))
+    {
+        return; // no saved session, which is the ordinary case
+    }
+
+    TSharedPtr<FJsonObject> Root;
+    const TSharedRef<TJsonReader<TCHAR>> Reader = TJsonReaderFactory<TCHAR>::Create(Text);
+    FString Backend;
+    FString Token;
+    if (!FJsonSerializer::Deserialize(Reader, Root) || !Root.IsValid() ||
+        !Root->TryGetStringField(SessionFieldBackend, Backend) ||
+        !Root->TryGetStringField(SessionFieldToken, Token) || Token.IsEmpty())
+    {
+        // Unreadable, or missing something we require. Note what is not logged: no
+        // excerpt of the file, because the file is the one place a token is at rest.
+        UE_LOG(LogLoomaSync, Warning, TEXT("Ignoring the saved session at %s — it could not be read"), *Path);
+        DeleteSavedSession();
+        return;
+    }
+
+    // A token is scoped to the backend that issued it. Both sides of this comparison
+    // are NormalizeRestBase output, so an exact match is the right test — and a
+    // mismatch is discarded rather than kept, because a token for a backend we are no
+    // longer pointed at is not going to become useful again by sitting there.
+    if (Backend != GetRestBase())
+    {
+        UE_LOG(LogLoomaSync, Log,
+            TEXT("Discarding the saved session: it belongs to %s and the backend is now %s"),
+            *Backend, *GetRestBase());
+        DeleteSavedSession();
+        return;
+    }
+
+    // Provisional: the token, and the display name as a *label*, with Kind left Unknown
+    // because nothing has yet said this token is still live. The backend's session TTL
+    // is 30 days (backend/app/auth/local.py), so it usually is — but "usually" is not
+    // something to encode in the identity. GET /auth/me promotes it, or clears it; see
+    // IsIdentityProvisional.
+    FLoomaIdentity Provisional;
+    Root->TryGetStringField(SessionFieldDisplayName, Provisional.DisplayName);
+
+    // Straight to SetSession, not AdoptSession: there is no socket to re-handshake yet
+    // (Initialize calls this before Connect, deliberately), and writing the file back
+    // that we have this second read would be pointless.
+    SetSession(Token, Provisional);
+    UE_LOG(LogLoomaSync, Log, TEXT("Restored a saved session for %s (unvalidated so far)"),
+        Provisional.DisplayName.IsEmpty() ? TEXT("<no name>") : *Provisional.DisplayName);
 }
 
 void ULoomaSceneSyncSubsystem::RequestLogin(const FString& Username, const FString& Password,
@@ -1054,6 +1242,11 @@ void ULoomaSceneSyncSubsystem::RefreshIdentity()
             if (Fresh.Kind == ELoomaIdentityKind::User)
             {
                 SetIdentity(Fresh);
+                // Write the confirmed name back over the cached one. Without this a
+                // server-side rename would show stale on every launch for as long as
+                // the token lives — 30 days — because nothing else ever rewrites the
+                // file for an unchanged token.
+                SaveSession();
                 return;
             }
             if (bSentWithToken)
