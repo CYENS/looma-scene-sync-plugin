@@ -80,6 +80,38 @@ public:
     UPROPERTY(EditAnywhere, Config, Category = "Backend", meta = (DisplayName = "Web Asset Prefix"))
     FString WebAssetPrefix = TEXT("/api");
 
+    /**
+     * The name to *suggest* for this client in the room roster, when it is connected
+     * as a guest. Empty — the default — suggests nothing, and the hub falls back to
+     * `Guest-xxxxxx` built from the first six characters of our clientId.
+     *
+     * A suggestion, never a claim. The hub clamps it to 32 characters, strips control
+     * characters, rejects it outright if nothing survives that, and — when accounts
+     * are enabled — rejects it if its normalized form collides with a **registered**
+     * username: a guest may not wear the name of an account that exists, whether or
+     * not it can prove it (docs/scene-format.md, "Identity — the `hello` message and
+     * guest naming"). So this cannot be used to impersonate anyone, and there is no
+     * point validating it here — the hub is the authority and the roster is where it
+     * says what it made of the suggestion.
+     *
+     * Ignored entirely while logged in. A session resolves the identity and the
+     * suggestion is never consulted, so this renames a *guest*, never an account.
+     *
+     * Editing it applies at once **while connected as a guest**: the name rides in the
+     * `hello` and nothing renames a socket already up, so the subsystem reconnects to
+     * suggest the new one. While logged in it deliberately does nothing — the hub takes
+     * the name from the session and would ignore the suggestion, so a reconnect could
+     * not change anything while still costing every other client in the room a leave
+     * and a join. The edit is not lost either way: the next guest connection picks it
+     * up, and logging out is one.
+     *
+     * Unlike the session token, this belongs in Config: it is a preference, not a
+     * secret, and having it in `DefaultGame.ini` is exactly right for a viewer build
+     * that should come up with a sensible name on a headset nobody types on.
+     */
+    UPROPERTY(EditAnywhere, Config, Category = "Identity", meta = (DisplayName = "Guest Display Name"))
+    FString GuestDisplayName;
+
     // --- UObject ---
     virtual void PostInitProperties() override;
 #if WITH_EDITOR

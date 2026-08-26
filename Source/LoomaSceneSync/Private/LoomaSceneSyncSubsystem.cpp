@@ -68,6 +68,8 @@ constexpr float HealthRetryMaxDelay = 60.0f;
  */
 constexpr const TCHAR* AuthHeaderName = TEXT("Authorization");
 constexpr const TCHAR* AuthHeaderBearerPrefix = TEXT("Bearer ");
+/** The guest-name seed header (HAM-176). See ULoomaSceneSyncSubsystem::ApplyClientIdHeader. */
+constexpr const TCHAR* ClientIdHeaderName = TEXT("X-Client-Id");
 
 /**
  * The persisted session's location and shape. `Saved/` because it is per-machine
@@ -298,6 +300,10 @@ void ULoomaSceneSyncSubsystem::Connect()
 {
     CloseSocket();
     SocketUrl = GetSceneSyncUrl();
+    // Read here, where the socket is made, rather than inside OnConnected — so that
+    // what we recorded and what we sent cannot drift if the settings change between
+    // creating the socket and it opening.
+    SentDisplayName = ULoomaSceneSyncSettings::Get().GuestDisplayName.TrimStartAndEnd();
     // The handshake carries the session, so the hub resolves this socket as the account
     // rather than as a guest — the roster every other client draws comes from what it
     // decides here, once, at connect time. Which is why a login has to reconnect: there
@@ -314,6 +320,26 @@ void ULoomaSceneSyncSubsystem::Connect()
         Hello->SetStringField(TEXT("type"), TEXT("hello"));
         Hello->SetStringField(TEXT("clientId"), ClientId);
         Hello->SetStringField(TEXT("role"), TEXT("unreal"));
+        // Suggest a roster name. With none, the hub names us `Guest-` plus the first
+        // six characters of our clientId — an unreadable string in everybody else's
+        // roster, and one this client cannot even discover for itself, since inbound
+        // `clients` is not handled here and GET /auth/me mints a fresh random guest
+        // name on every call. Proposing the name is the only way we come to know it.
+        //
+        // Decides anything only for a GUEST connection: identity_from_websocket
+        // resolves a token first and never consults the suggestion when one resolves
+        // (backend/app/auth/local.py), so this renames a guest and never an account.
+        // Sent unconditionally all the same, because branching on the token to omit a
+        // field the hub already ignores would be more code for the same outcome.
+        //
+        // Sent raw. The hub clamps it, strips it, and may reject it outright; it is the
+        // authority on what a roster name may be, so a second opinion here could only
+        // disagree with it. The empty check is not validation — it is declining to emit
+        // a field whose only possible outcome is rejection.
+        if (!SentDisplayName.IsEmpty())
+        {
+            Hello->SetStringField(TEXT("displayName"), SentDisplayName);
+        }
         // Belt and braces, both documented: the hub's precedence is bearer header,
         // then session cookie, then `hello.token` (docs/scene-format.md), and all three
         // resolve to the same identity. The header wins when it survives the trip; the
@@ -391,8 +417,9 @@ void ULoomaSceneSyncSubsystem::Reconnect()
 
 void ULoomaSceneSyncSubsystem::OnSettingsChanged()
 {
-    // Only the backend address needs a new socket, and only when it actually moved —
-    // every other knob is read where it is used.
+    // Two knobs here need the socket's attention, and only when they actually move.
+    // Every other one — LightIntensityScale, bBaseAlignModels, WebAssetPrefix — is read
+    // where it is used and must never cost anyone a reconnect.
     if (GetSceneSyncUrl() != SocketUrl)
     {
         UE_LOG(LogLoomaSync, Display, TEXT("Backend moved to %s"), *GetRestBase());
@@ -420,7 +447,41 @@ void ULoomaSceneSyncSubsystem::OnSettingsChanged()
         CancelHealthRetry();
         Reconnect();
         ProbeHealth(/*bLogDiagnostics=*/false);
+        // Nothing below applies: Connect() has just re-read the display name too.
+        return;
     }
+
+    // The guest name reaches the hub only in a `hello`, and there is no message that
+    // renames a socket already up — so applying an edit means reconnecting. Every other
+    // knob in that panel takes effect live, so a name that silently did nothing until
+    // some later reconnect would read as broken.
+    const FString SuggestedName = ULoomaSceneSyncSettings::Get().GuestDisplayName.TrimStartAndEnd();
+    if (SuggestedName == SentDisplayName)
+    {
+        return;
+    }
+
+    if (HasAuthToken())
+    {
+        // Deliberately nothing, and this is the interesting half. While we hold a
+        // session the hub resolves identity from it and never consults the suggestion
+        // (identity_from_websocket, backend/app/auth/local.py) — so a reconnect here
+        // could not change the name by even one character. It would still cost every
+        // other client in the room a leave and a join in their roster, which is the
+        // real price of a reconnect; the GLBs are not (a login reconnect was measured
+        // re-applying 33 nodes with zero meshes rebuilt). Pure churn for no effect.
+        //
+        // The edit is not lost. It sits in the settings and the next guest connection
+        // picks it up — logging out reconnects, and Connect() re-reads it there.
+        UE_LOG(LogLoomaSync, Log,
+            TEXT("Guest Display Name changed, but this client is logged in — the hub takes the name from ")
+            TEXT("the session, so it will apply on the next guest connection."));
+        return;
+    }
+
+    UE_LOG(LogLoomaSync, Display, TEXT("Guest display name changed to '%s'; reconnecting to suggest it"),
+        SuggestedName.IsEmpty() ? TEXT("<none>") : *SuggestedName);
+    Reconnect();
 }
 
 FString ULoomaSceneSyncSubsystem::GetSceneSyncUrl() const
@@ -824,6 +885,15 @@ void ULoomaSceneSyncSubsystem::ApplyAuthHeader(TMap<FString, FString>& UpgradeHe
     // No origin check to make here: the only caller is Connect(), and the URL it is
     // about to open is GetSceneSyncUrl() — derived from GetRestBase() by construction.
     UpgradeHeaders.Add(AuthHeaderName, AuthHeaderBearerPrefix + AuthToken);
+}
+
+void ULoomaSceneSyncSubsystem::ApplyClientIdHeader(const TSharedRef<IHttpRequest, ESPMode::ThreadSafe>& Request) const
+{
+    // The same value the `hello` carries, which is the whole point of it: it is what
+    // ties a guest's one-shot POSTs to the socket the room roster already knows them
+    // by. No same-origin guard, unlike ApplyAuthHeader — this is a name seed and not a
+    // credential, so there is nothing here for another host to be handed.
+    Request->SetHeader(ClientIdHeaderName, ClientId);
 }
 
 void ULoomaSceneSyncSubsystem::ApplyAuthToken(const TSharedRef<FJsonObject>& Hello) const
