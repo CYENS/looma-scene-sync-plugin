@@ -401,6 +401,15 @@ void ALoomaSyncedActor::LoadMeshFromUrl(const FString& Url)
     FglTFRuntimeConfig LoaderConfig;
     FglTFRuntimeHttpResponse Completed;
     Completed.BindDynamic(this, &ALoomaSyncedActor::OnGlbLoaded);
+    // The empty header map is deliberate, and this is the obvious place to be tempted
+    // to fill it with the session bearer. Do not: `/static` is a plain StaticFiles
+    // mount (backend/app/main.py) and the FastAPI app carries no app-wide
+    // `dependencies=` and no auth middleware — only individual routes have
+    // `require_admin` — so the GLB fetch is anonymous by design and a bearer here would
+    // be a token sent somewhere it is not read. glTFRuntime does take headers (this
+    // parameter), so if `/static` is ever gated the seam is right here; it would want
+    // ULoomaSceneSyncSubsystem::ApplyAuthHeader's map overload rather than a second
+    // spelling of the header.
     UglTFRuntimeFunctionLibrary::glTFLoadAssetFromUrl(Url, TMap<FString, FString>(), Completed, LoaderConfig);
 }
 

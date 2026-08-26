@@ -219,9 +219,44 @@ Two subtleties of the backend contract that the code leans on:
   sees in the room roster. `Refresh Identity` therefore adopts an answer only when it is a user,
   and `Looma.Whoami` only re-asks when a token is held.
 
-**Not yet wired up:** logging in does not change how this client appears in the room roster. The
-`Authorization` header goes on the auth routes only, and the scene-sync socket is still holding
-the guest identity it handshook with — re-handshaking on the token is separate work.
+### Carrying the session
+
+Every REST call the plugin makes goes out with `Authorization: Bearer <token>` when a session is
+held — `SendRest`, the queue hydrate, `POST /generate`, the candidate-image download and the auth
+routes themselves. `ApplyAuthHeader` is the only thing that attaches it, and it takes the request
+rather than returning the string, so no caller ever holds a copy of the token. Because it is the
+only attacher, it can also enforce that the token goes **nowhere but the configured backend**: it
+compares the request URL against `BackendUrl` and withholds the header otherwise. That is not
+theoretical — the image URL comes off a generation job and through `ResolveBackendUrl`, which
+forwards an absolute URL untouched, so it is the one request whose host the plugin did not choose.
+Call `SetURL` before `ApplyAuthHeader`; the wrong order costs you the header, which is the safe
+failure.
+
+**`/static/*.glb` is deliberately anonymous.** It is a plain `StaticFiles` mount and the FastAPI
+app carries no app-wide `dependencies=` and no auth middleware — only individual routes have
+`require_admin` — so a bearer there would be a token sent somewhere nothing reads it. glTFRuntime
+*does* accept a header map (`glTFLoadAssetFromUrl`'s second parameter), so the seam exists if
+`/static` is ever gated; the empty map in `LoadMeshFromUrl` is a decision, not an omission.
+
+The WebSocket handshake carries the session two ways: as an `Authorization` upgrade header, and as
+the `hello` message's `token` field. The hub's precedence is header, then session cookie, then
+`hello.token` (`docs/scene-format.md`), and all three resolve to the same identity — the header
+wins when it survives the trip, and the hello field covers a proxy that strips `Authorization` on
+upgrade, which a tunnelled deployment makes a real case rather than a hypothetical one. One
+consequence to respect when adding logging: the outbound `hello` now contains a credential, so
+`SendJson` must never log what it serialises.
+
+**A login re-opens the socket.** The hub resolves an identity once, from the handshake, and there
+is no message that re-identifies a socket already up — so adopting or dropping a session
+reconnects, and that is what makes a login visible to the other clients in the room instead of
+only to this one. It is cheap: the reconnect re-sends the whole `scene`, but a node still in it
+keeps the actor it already has, so `ApplyModel`'s `Context.ModelUrl != LoadedModelUrl` guard holds
+and no GLB is re-fetched. Dropping a session only reconnects if one was actually held, so
+`Looma.Logout` as a guest does not churn the room.
+
+The round trip to test: `Looma.Login <user> <pass>` and the **web client's room roster** should
+show the account's display name with `kind: "user"` in place of `Guest-xxxxxx`, and
+`Looma.Logout` should put it back to a guest.
 
 ## Status
 

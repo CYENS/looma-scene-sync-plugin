@@ -42,6 +42,17 @@ void ULoomaDownloadImageAction::Activate()
     const TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Request = FHttpModule::Get().CreateRequest();
     Request->SetURL(ResolvedUrl);
     Request->SetVerb(TEXT("GET"));
+    if (Subsystem)
+    {
+        // After SetURL, which matters more here than anywhere else: this URL came off a
+        // generation job and through ResolveBackendUrl, which forwards an absolute URL
+        // untouched — so it is the one request whose host we did not choose.
+        // ApplyAuthHeader withholds the bearer unless the URL is the configured
+        // backend, which is what stops a job naming another host from collecting this
+        // session. Harmless when the image turns out to be under /static, which is not
+        // gated: an unread header costs nothing.
+        Subsystem->ApplyAuthHeader(Request);
+    }
     Request->OnProcessRequestComplete().BindUObject(this, &ULoomaDownloadImageAction::OnResponse);
     Request->ProcessRequest();
 }
