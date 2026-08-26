@@ -191,6 +191,7 @@ separate events (`On Auth State Changed` versus `On Identity Changed`).
 | `Refresh Identity` | `GET /auth/me`, adopting the answer |
 | `Get Identity` | The `FLoomaIdentity` we last learned. `Kind == Unknown` until something establishes it |
 | `Has Auth Token` | We hold a session token. Not the same question as "am I a user" — a token can be revoked server-side while we still hold the bytes |
+| `Is Identity Provisional` | A session was restored from disk and `/auth/me` has not confirmed it yet. See *Staying logged in* |
 | `Get Identity Text` | One line naming the identity and whether a token is held. Never the token |
 | `On Identity Changed` | Who we are moved: a login, a logout, a refresh |
 
@@ -261,6 +262,63 @@ and no GLB is re-fetched. Dropping a session only reconnects if one was actually
 The round trip to test: `Looma.Login <user> <pass>` and the **web client's room roster** should
 show the account's display name with `kind: "user"` in place of `Guest-xxxxxx`, and
 `Looma.Logout` should put it back to a guest.
+
+### Staying logged in
+
+The session survives an editor restart, because the backend's own session TTL is 30 days and
+retyping a password through a VR keyboard is the thing this exists to avoid. It is kept at:
+
+```
+<Project>/Saved/LoomaSceneSync/Session.json
+{"backend":"http://127.0.0.1:8000","token":"…","displayName":"alice"}
+```
+
+**The token is plaintext on disk. There is no encryption and no DPAPI.** That is the same
+exposure as the browser's session cookie, so it is not a regression against the web client, but
+it is worth knowing rather than discovering: anyone who can read the project's `Saved/` directory
+can use the session until it expires or someone logs out.
+
+`Saved/` and **not** Project Settings, which is the obvious-looking wrong answer — `BackendUrl`
+lives in a `UPROPERTY(Config)` and this looks like the same kind of thing. It is not: config
+writes land in `Config/DefaultGame.ini`, which every consumer project has in git, and a session
+token must never be committable. Nothing in the persistence path goes near `GConfig`.
+
+Three things the file does:
+
+- **It is scoped to the backend that minted it.** The REST base is stored alongside the token and
+  must match on load, or the file is discarded — the persistence-time counterpart to
+  `OnSettingsChanged` dropping the session when the address moves. A restart is not a way to
+  smuggle a token from backend A to backend B.
+- **It is loaded before the first connect.** So the very first handshake carries the bearer and
+  the hub names this client the account from the outset. Loading it after `Connect()` would mean
+  every launch connects as a guest and immediately reconnects, which every other client in the
+  room sees as a join/leave flicker.
+- **It is written in one place and deleted in one place** — `AdoptSession` and `ClearSession` — so
+  logout, an expired token and a backend change are each covered without a fourth caller to
+  remember. Closing the editor is not a logout: `Deinitialize` drops the in-memory copy and leaves
+  the file alone.
+
+Validation is `GET /auth/me`, reusing `Refresh Identity` rather than a second validator, and it is
+triggered from the health probe's success path — the probe already retries until the backend is
+reachable, so hanging the check off it means no second retry loop. A **guest** answer means the
+token was revoked or expired, and it is deleted. An **unreachable** backend means nothing about
+the token, so it is kept and the identity is left untouched; deleting a session because a packet
+dropped would log a user out on every hiccup, and after the connection-pool finding above a
+background request timing out is routine here rather than exceptional.
+
+Between the restore and the answer, `Is Identity Provisional` is true: `Get Identity` reports the
+persisted `DisplayName` with `Kind == Unknown`. Showing that name is the point — a launch does not
+have to look anonymous — but it is a label read off a disk, not evidence, so anything that depends
+on *being* that account must gate on `Kind == User` and never on the name being non-empty. Only
+`/auth/me` promotes `Kind`. Deliberately persisted: the alternative, reporting nothing until
+validation, is honest but blanks the name for seconds on every launch, and the token is the
+authority while the name is only a label — so a brief stale name after a server-side rename is the
+cheaper of the two costs, and `Refresh Identity` writes the corrected one back.
+
+The user id and the admin flag are **not** persisted. `is_admin` especially: a capability read
+back off disk is one that anybody with write access to `Saved/` could grant themselves in a UI.
+The backend re-checks it on every admin route regardless, so caching it could only ever produce a
+misleading screen.
 
 ## Status
 

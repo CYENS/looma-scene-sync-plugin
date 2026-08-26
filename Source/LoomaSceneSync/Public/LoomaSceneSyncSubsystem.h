@@ -249,6 +249,22 @@ public:
     UFUNCTION(BlueprintPure, Category = "Looma|Auth")
     FString GetIdentityText() const;
 
+    /**
+     * We restored a session from disk and `GET /auth/me` has not confirmed it yet.
+     *
+     * True only in that window, which lasts from Initialize until the health probe
+     * lands and the validation it triggers answers — seconds, on a contended
+     * connection. In it, GetIdentity() reports the display name that was persisted
+     * alongside the token and `Kind == Unknown`, because a name off the disk is a
+     * label, not evidence: only the backend can say whether the token is still live,
+     * and only `Kind` records that it has. Show the name if you like — that is why it
+     * is there, and why a launch does not have to look anonymous — but gate anything
+     * that depends on *being* that account on `Kind == User`, never on the name being
+     * non-empty.
+     */
+    UFUNCTION(BlueprintPure, Category = "Looma|Auth")
+    bool IsIdentityProvisional() const;
+
     /** Who we are changed. See FLoomaIdentityEvent for why this is not OnAuthStateChanged. */
     UPROPERTY(BlueprintAssignable, Category = "Looma|Auth")
     FLoomaIdentityEvent OnIdentityChanged;
@@ -458,8 +474,44 @@ private:
     /** Adopt an auth state, broadcasting OnAuthStateChanged only if it actually moved. */
     void SetAuthState(ELoomaAuthState NewState);
 
-    /** Take on a session: the token and the identity it belongs to, which only mean anything together. */
+    /**
+     * Take on a session: the token and the identity it belongs to, which only mean
+     * anything together. Persists it and re-handshakes the socket.
+     */
     void AdoptSession(const FString& Token, const FLoomaIdentity& NewIdentity);
+
+    /**
+     * The in-memory half of a session change, with no persistence and no reconnect.
+     * Exists so AdoptSession, ClearSession and LoadSavedSession share one definition
+     * of "the session is now this" — the restore path in particular must not write
+     * back the file it just read, nor reconnect a socket that does not exist yet.
+     */
+    void SetSession(const FString& Token, const FLoomaIdentity& NewIdentity);
+
+    /**
+     * Where the session is kept: `<Project>/Saved/LoomaSceneSync/Session.json`.
+     *
+     * Under `Saved/` and emphatically **not** in Project Settings. A
+     * `UPROPERTY(Config)` on ULoomaSceneSyncSettings — the obvious-looking answer,
+     * since that is exactly where BackendUrl lives — would write to
+     * `Config/DefaultGame.ini`, which every consumer project has in git. A session
+     * token must not be committable, so nothing here goes near GConfig.
+     */
+    FString GetSessionFilePath() const;
+
+    /** Write the current session out. Best-effort: a failure leaves the live session working. */
+    void SaveSession() const;
+
+    /** Remove the persisted session. Paired with ClearSession, so logout/expiry/backend-change all cover it. */
+    void DeleteSavedSession() const;
+
+    /**
+     * Restore a session from disk, if there is one for *this* backend. Called from
+     * Initialize before Connect, so the first handshake already carries the bearer —
+     * connecting as a guest and then reconnecting would show every other client in the
+     * room a join/leave flicker on every launch, for nothing.
+     */
+    void LoadSavedSession();
 
     /**
      * Drop the token and the identity. Cannot fail and never asks the backend, which
