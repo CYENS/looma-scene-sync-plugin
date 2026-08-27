@@ -441,7 +441,7 @@ its colour. The normative contract is `docs/scene-format.md`, *"What each client
 | `Select Node` / `Deselect Node` | Add or remove one node, read-modify-write over the above |
 | `Clear Selection` | Select nothing, which **sends** `{"ids": []}` — that is what clears the borders |
 | `Get Local Selection` / `Get Local Selection Ids` / `Is Node Selected` | Read it back; destroyed actors are already gone from it |
-| `On Local Selection Changed` | Fires once per change, after it has been reported, carrying the ids |
+| `On Local Selection Changed` | Fires once per local change, carrying the ids. About local truth, not the wire: it fires while disconnected too, and does *not* fire when a reconnect merely re-tells the hub |
 
 Three things about it are worth knowing, because each one is a rule from the contract rather than a
 choice:
