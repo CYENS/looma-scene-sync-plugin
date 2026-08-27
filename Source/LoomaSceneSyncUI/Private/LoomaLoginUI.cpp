@@ -51,18 +51,30 @@ UGameViewportClient* ViewportFor(const UObject* WorldContextObject)
 
 void ULoomaLoginUI::ShowLoginUI(UObject* WorldContextObject, int32 ZOrder)
 {
+    // Every return from here says so. An earlier version returned silently from both
+    // early exits below, which made `Looma.ShowLogin` indistinguishable from a broken
+    // widget in exactly the case the logging was added to diagnose — a form that does not
+    // appear and a command that says nothing leave a reader with no way to tell which
+    // happened. Idempotence and "there is nowhere to draw" are both answers, so both are
+    // reported.
     if (GLoginRoot.IsValid())
     {
-        return; // already up — see the header on why this is idempotent rather than additive
+        UE_LOG(LogLoomaSync, Display,
+            TEXT("Show Login UI: already showing (this call is a no-op). Use Looma.HideLogin first ")
+            TEXT("if you meant to recreate it."));
+        return;
     }
 
     UGameViewportClient* Viewport = ViewportFor(WorldContextObject);
     if (!Viewport)
     {
-        // Not a failure worth shouting about: a commandlet or a dedicated server has no
-        // viewport, and this module being compiled into such a build is a packaging
-        // decision rather than a mistake to assert on.
-        UE_LOG(LogLoomaSync, Verbose, TEXT("Show Login UI: no game viewport; nothing shown"));
+        // Display, not Verbose. A commandlet or dedicated server genuinely has no viewport
+        // and that is not an error — but the overwhelmingly common cause is a human
+        // typing this into the editor console with no PIE session running, and a silent
+        // no-op is the worst possible answer to give them.
+        UE_LOG(LogLoomaSync, Display,
+            TEXT("Show Login UI: no game viewport, so nothing was shown. Start PIE (or a game) — ")
+            TEXT("there is no viewport to draw on in the editor alone."));
         return;
     }
 

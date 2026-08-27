@@ -775,6 +775,17 @@ bool ULoomaSceneSyncSubsystem::HasAuthToken() const
 
 FString ULoomaSceneSyncSubsystem::GetIdentityText() const
 {
+    // Holding no token with nothing resolved is not an identity to describe, it is the
+    // absence of one, and "<no name> (unknown)" described it in a way that reads like a
+    // bug. This is the normal state of a fresh launch and of every moment after a logout,
+    // so it gets a plain sentence. Distinct from the provisional case below, which DOES
+    // hold a token and does have a name to show.
+    if (!HasAuthToken() && CurrentIdentity.Kind == ELoomaIdentityKind::Unknown
+        && CurrentIdentity.DisplayName.IsEmpty())
+    {
+        return TEXT("not signed in");
+    }
+
     const TCHAR* KindText = TEXT("unknown");
     switch (CurrentIdentity.Kind)
     {
