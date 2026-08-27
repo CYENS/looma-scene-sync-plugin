@@ -731,6 +731,25 @@ private:
      */
     TArray<FString> CollectSelectionIds();
 
+#if WITH_EDITOR
+    /**
+     * The editor's actor selection changed: mirror whatever of it is ours into the
+     * local selection, through SetLocalSelection like every other caller.
+     *
+     * Editor-only, and it only ever fires while PIE is running — not because of a
+     * filter, but because ULoomaSceneSyncSubsystem is a UGameInstanceSubsystem and so
+     * does not exist outside a running game. That is the answer to "why does clicking
+     * in the Outliner before Play report nothing", and it is the behaviour we want:
+     * dressing a level at design time is not a claim about what anyone is working on.
+     *
+     * The USelection* payload is ignored — see the implementation.
+     */
+    void OnEditorSelectionChanged(UObject* SelectionObject);
+
+    /** Our binding on USelection::SelectionChangedEvent, released in Deinitialize. */
+    FDelegateHandle EditorSelectionChangedHandle;
+#endif
+
     /** Deliver the cached state to handles created for an already-known job. */
     void FlushPendingHandleReplays();
 

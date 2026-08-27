@@ -24,6 +24,11 @@
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
+
+#if WITH_EDITOR
+#include "Editor.h"    // GEditor
+#include "Selection.h" // USelection
+#endif
 #include "WebSocketsModule.h"
 
 namespace
@@ -254,10 +259,27 @@ void ULoomaSceneSyncSubsystem::Initialize(FSubsystemCollectionBase& Collection)
     // socket is no substitute for the answer: an auth-enabled hub may well refuse the
     // WebSocket, which is a symptom of the answer rather than a way to get it.
     ProbeHealth(/*bLogDiagnostics=*/false);
+
+#if WITH_EDITOR
+    // Mirror the editor's own selection while PIE runs, so clicking a node in the
+    // Outliner puts a border on it in every other client. Static event, so this hears
+    // about every USelection in the editor and not only ours — the recompute is cheap
+    // and the diff throws away the ones that changed nothing.
+    EditorSelectionChangedHandle = USelection::SelectionChangedEvent.AddUObject(
+        this, &ULoomaSceneSyncSubsystem::OnEditorSelectionChanged);
+#endif
 }
 
 void ULoomaSceneSyncSubsystem::Deinitialize()
 {
+#if WITH_EDITOR
+    // Explicitly, even though AddUObject already holds us weakly and would not fire
+    // into a destroyed subsystem: SelectionChangedEvent is a *static* event that
+    // outlives every game instance, so a binding left on it is a leak that accumulates
+    // one entry per PIE session for the life of the editor process.
+    USelection::SelectionChangedEvent.Remove(EditorSelectionChangedHandle);
+    EditorSelectionChangedHandle.Reset();
+#endif
     ULoomaSceneSyncSettings::OnSettingsChanged().Remove(SettingsChangedHandle);
     SettingsChangedHandle.Reset();
     CloseSocket();
@@ -2032,6 +2054,61 @@ void ULoomaSceneSyncSubsystem::TickSelection()
     Msg->SetArrayField(TEXT("ids"), IdValues);
     SendJson(Msg);
 }
+
+#if WITH_EDITOR
+void ULoomaSceneSyncSubsystem::OnEditorSelectionChanged(UObject* SelectionObject)
+{
+    // The payload is deliberately unused, and that is a decision rather than laziness.
+    // It is the USelection *container* upcast to UObject*, not the object that changed,
+    // and USelection::NoteUnknownSelectionChanged broadcasts it as nullptr outright — so
+    // it cannot be trusted either to identify what moved or to say which selection set
+    // moved. Reading the state is the only reliable answer, and it is the state we want
+    // anyway: the wire carries a whole set.
+    (void)SelectionObject;
+
+    if (!GEditor)
+    {
+        return;
+    }
+    // Ours, not "the PIE world" in general: two PIE instances share this one static
+    // event and hold nodes with the same ids, so without this each subsystem would
+    // report the other's selection as its own.
+    const UWorld* OurWorld = GetGameInstance() ? GetGameInstance()->GetWorld() : nullptr;
+    if (!OurWorld)
+    {
+        return;
+    }
+
+    TArray<ALoomaSyncedActor*> Candidates;
+    if (USelection* ActorSelection = GEditor->GetSelectedActors())
+    {
+        // Class-filters and null-checks for us (USelection::GetSelectedObjects<T>).
+        ActorSelection->GetSelectedObjects<ALoomaSyncedActor>(Candidates);
+    }
+
+    TArray<ALoomaSyncedActor*> Selected;
+    Selected.Reserve(Candidates.Num());
+    for (ALoomaSyncedActor* Actor : Candidates)
+    {
+        if (Actor && Actor->GetWorld() == OurWorld)
+        {
+            Selected.Add(Actor);
+        }
+    }
+
+    // Whatever survived the filter, INCLUDING nothing. Selecting a stray level actor
+    // that is not a synced node therefore clears our claim rather than being ignored,
+    // and that is the honest reading of two available ones: the user has stopped
+    // working on the node they had, and a border nobody ever retracts is a false claim
+    // left in everyone else's viewport — precisely what the contract's "`[]` is a real
+    // message" rule exists to prevent. The convenient reading (keep the old selection
+    // because this event "was not about us") would leave that border until the user
+    // happened to click a synced node again. Same call as every other entry point, so
+    // there is one implementation and one diff; the honest reading also turns out to
+    // need no special case at all.
+    SetLocalSelection(Selected);
+}
+#endif // WITH_EDITOR
 
 void ULoomaSceneSyncSubsystem::TickOutbound(float DeltaTime)
 {
