@@ -84,16 +84,25 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FLoomaAuthStateEvent, ELoomaAuthStat
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FLoomaIdentityEvent, const FLoomaIdentity&, Identity);
 
 /**
- * This client's local selection changed. Carries the node ids the room now believes we
- * hold — the same array that just went on the wire.
+ * This client's local selection changed. Carries the node ids now selected.
  *
- * Fires from the send path, once per coalesced change, rather than from each of
- * SetLocalSelection / SelectNode / DeselectNode. Same reasoning as the send itself: a
+ * About **local truth**, and deliberately not about the wire. It fires whether or not
+ * the socket is up, because the selection changed either way — and with a login and a
+ * logout each reconnecting (HAM-181), "briefly disconnected" is ordinary operation, not
+ * an edge case, so a UI that went quiet during it would sit on a stale count. It
+ * equally does *not* fire merely because the hub had to be told again on reconnect:
+ * that is the hub's knowledge changing, not ours.
+ *
+ * Fires once per coalesced change, from the per-tick change detector rather than from
+ * each of SetLocalSelection / SelectNode / DeselectNode. Same reasoning as the send: a
  * gesture that clears and then adds three nodes in one frame is one logical change, and
- * a UI told about it four times has to de-bounce what this can simply not emit. The
- * cost is that a local highlight drawn from this event lags the call by up to a frame;
- * a UI that cannot accept that should read GetLocalSelection() directly, which is
- * always current.
+ * a UI told about it four times has to de-bounce what this can simply not emit. Being
+ * a detector rather than a set of notify calls is also what catches the second way a
+ * selection changes — an actor destroyed while selected, where no setter runs at all.
+ *
+ * The cost is that a highlight drawn from this event lags the call by up to a frame; a
+ * UI that cannot accept that should read GetLocalSelection() directly, which is always
+ * current.
  */
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FLoomaSelectionEvent, const TArray<FString>&, NodeIds);
 
@@ -685,14 +694,23 @@ private:
     void SendReparent(const TArray<FString>& NodeIds);
 
     /**
-     * Diff the local selection against what was last sent and report it if it moved.
-     * Called every tick while connected; sends nothing on an idle scene.
+     * Two questions, in order, once a tick. First: has the local selection changed —
+     * broadcast if so. Second, and only when connected: does the hub need telling.
      *
-     * The same self-maintaining-baseline shape as TickOutbound's pose diff and
-     * ALoomaSyncedActor::ParentId for attachment: one cached copy of what the hub was
-     * last told, compared against the truth, with no separate dirty flag to keep in
-     * step. The one thing a pure diff cannot express is "the hub has forgotten", which
-     * is what bForceSelectionSend is for.
+     * They are separate because they are answered against different baselines and have
+     * different gates. Merging them is a real bug rather than a tidiness question: a
+     * notification gated on connectivity goes silent exactly when a reconnect makes the
+     * socket briefly absent, and one gated on the send diff fires on reconnect when
+     * nothing local has changed at all.
+     *
+     * The send half keeps the same self-maintaining-baseline shape as TickOutbound's
+     * pose diff and ALoomaSyncedActor::ParentId for attachment: one cached copy of what
+     * the hub was last told, compared against the truth, with no separate dirty flag.
+     * The one thing a pure diff cannot express is "the hub has forgotten", which is what
+     * bForceSelectionSend is for.
+     *
+     * Called ahead of Tick's reconnect early-out, so the local half keeps working while
+     * the socket is down.
      */
     void TickSelection();
 
@@ -700,7 +718,14 @@ private:
      * The local selection as node ids, sorted and de-duplicated, compacting away any
      * actor that has since been destroyed.
      *
-     * Sorted so the diff is an array compare rather than a set compare, and so the
+     * **This is the second place the selection changes**, and the easy one to miss: an
+     * actor destroyed while selected leaves the set here, with no setter having been
+     * called and nobody to call one. That is a consequence of holding the selection as
+     * weak pointers — the design that makes destruction need no bookkeeping also makes
+     * it invisible to any notify-at-the-setter scheme, which is why the change detector
+     * in TickSelection compares state rather than trusting call sites.
+     *
+     * Sorted so both diffs are an array compare rather than a set compare, and so the
      * wire is deterministic — the contract treats `ids` as a set, so the order is ours
      * to choose and a stable one keeps a reordering from reading as a change.
      */
@@ -776,10 +801,21 @@ private:
     TArray<TWeakObjectPtr<ALoomaSyncedActor>> LocalSelection;
 
     /**
-     * The ids the last `selection` carried — the diff baseline. Sorted, so comparing is
-     * an array compare.
+     * The ids the last `selection` carried — the *send* baseline. Sorted, so comparing
+     * is an array compare.
      */
     TArray<FString> LastSentSelectionIds;
+
+    /**
+     * The ids OnLocalSelectionChanged last announced — the *notify* baseline.
+     *
+     * A second baseline rather than a reuse of the one above, because the two answer
+     * different questions: "what does the hub believe" and "what have local listeners
+     * been told". They diverge whenever the socket is down (local changes, hub told
+     * nothing) and again on reconnect (hub re-told, nothing local changed), which is
+     * precisely the pair of bugs sharing one baseline produced.
+     */
+    TArray<FString> LastNotifiedSelectionIds;
 
     /**
      * Send the next selection even if the diff says it has not moved.

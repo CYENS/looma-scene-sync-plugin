@@ -1848,6 +1848,15 @@ void ULoomaSceneSyncSubsystem::Tick(float DeltaTime)
     // `return` would mean never counting it down at all.
     TickHealthRetry(DeltaTime);
 
+    // Also ahead of the reconnect early-out, and for the same kind of reason: half of
+    // this is about the local selection rather than the socket, and a reconnect backoff
+    // is exactly when it must keep working. Its own send half is gated on connectivity
+    // internally. Ordering against the pose diff below is a free choice — an id the hub
+    // does not hold yet is passed straight through and becomes drawable when the node
+    // arrives, precisely because "a selection legitimately races the spawn that created
+    // the node".
+    TickSelection();
+
     if (ReconnectCooldown > 0.0f)
     {
         ReconnectCooldown -= DeltaTime;
@@ -1859,11 +1868,6 @@ void ULoomaSceneSyncSubsystem::Tick(float DeltaTime)
     }
     if (IsSyncConnected())
     {
-        // Before the pose diff, though the contract makes the order a free choice: an
-        // id the hub does not hold yet is passed straight through and becomes drawable
-        // when the node arrives, precisely because "a selection legitimately races the
-        // spawn that created the node".
-        TickSelection();
         TickOutbound(DeltaTime);
     }
 }
@@ -1970,18 +1974,37 @@ TArray<FString> ULoomaSceneSyncSubsystem::CollectSelectionIds()
 
 void ULoomaSceneSyncSubsystem::TickSelection()
 {
-    // Guarded here as well as at the call site, because the baseline below must only
-    // ever record a send that actually happened. SendJson drops a message when the
-    // socket is down, so running this while disconnected would move LastSentSelectionIds
-    // to a value the hub was never told — and the diff would then suppress the very
-    // message the reconnect needs. (bForceSelectionSend would rescue it, but only by
-    // accident.) This makes the function safe to call from anywhere.
+    // Derived once and used by both halves. This also compacts away destroyed actors,
+    // which is itself one of the two ways the selection changes — see
+    // CollectSelectionIds.
+    const TArray<FString> Ids = CollectSelectionIds();
+
+    // --- Local truth: has our selection changed? -----------------------------
+    // Compared against state rather than driven from the setters, because a setter is
+    // only one of the two ways this set moves; an actor destroyed while selected leaves
+    // it with nobody calling anything. A detector catches both, and coalesces a gesture
+    // that touches the selection several times in one frame into one event.
+    //
+    // Gated on neither connectivity nor the send diff. Both gates were wrong in
+    // opposite directions: gating on the socket goes quiet during a reconnect, which a
+    // login or a logout now causes; gating on the send diff fires on reconnect when
+    // only the hub's knowledge changed.
+    if (Ids != LastNotifiedSelectionIds)
+    {
+        LastNotifiedSelectionIds = Ids;
+        OnLocalSelectionChanged.Broadcast(Ids);
+    }
+
+    // --- The wire: does the hub need telling? --------------------------------
+    // The send baseline must only ever record a send that actually happened. SendJson
+    // drops a message when the socket is down, so continuing while disconnected would
+    // move LastSentSelectionIds to a value the hub was never told — and the diff would
+    // then suppress the very message the reconnect needs. (bForceSelectionSend would
+    // rescue it, but only by accident.)
     if (!IsSyncConnected())
     {
         return;
     }
-
-    const TArray<FString> Ids = CollectSelectionIds();
     // The diff, so an idle scene sends nothing — the whole reason this is affordable to
     // evaluate every frame. bForceSelectionSend is the one thing a diff cannot know:
     // that the hub has forgotten what it was last told.
@@ -2008,8 +2031,6 @@ void ULoomaSceneSyncSubsystem::TickSelection()
     // `origin`, which the hub's selection handler does not read.)
     Msg->SetArrayField(TEXT("ids"), IdValues);
     SendJson(Msg);
-
-    OnLocalSelectionChanged.Broadcast(Ids);
 }
 
 void ULoomaSceneSyncSubsystem::TickOutbound(float DeltaTime)
