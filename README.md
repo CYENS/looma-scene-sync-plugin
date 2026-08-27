@@ -184,6 +184,9 @@ the new section, which then wins.
 | `Looma.Login <username> <password>` | Logs in over `POST /auth/login`. **Testing only** — the console echoes the password into the log and keeps it in the command history before the plugin sees a character of it. The real login is the `Login` Blueprint node behind a field that does not echo |
 | `Looma.Logout` | Forgets the token, then asks the backend to revoke it |
 | `Looma.Whoami` | Logs the current identity, and re-asks `GET /auth/me` when a token is held |
+| `Looma.Select <nodeId...>` | Replaces the local selection and reports it to the room. Not additive — the wire carries a whole set, so this does too. Unknown ids are named and skipped |
+| `Looma.Deselect [nodeId...]` | Deselects those nodes; with no arguments clears the whole selection, which is what removes this client's borders elsewhere |
+| `Looma.Selection` | Logs the local selection — the ids the next `selection` message would carry |
 
 They work in the editor console, in PIE and in a packaged build; they resolve the subsystem from
 the current game instance. `Looma.Reconnect` / `Looma.Status` report the configured URL when
@@ -425,6 +428,42 @@ resolve a real session first and an authenticated one always wins over it, so it
 to claim `kind: "user"` or reach anyone else's session. It goes on asset-creating requests as the
 backend documents, not on every REST call: that is the only place it means anything, and a header
 that travels further than its purpose invites being mistaken for one that matters.
+
+## Reporting local selection
+
+Every client tells the room what it has selected so the others can draw a border on those nodes in
+its colour. The normative contract is `docs/scene-format.md`, *"What each client has selected — the
+`selection` message"*; this is only how it lands in Unreal.
+
+| Blueprint node (`Looma\|Selection`) | What it does |
+| --- | --- |
+| `Set Local Selection` | Replace the whole selection. The canonical call — the wire carries a whole set, so this mirrors it |
+| `Select Node` / `Deselect Node` | Add or remove one node, read-modify-write over the above |
+| `Clear Selection` | Select nothing, which **sends** `{"ids": []}` — that is what clears the borders |
+| `Get Local Selection` / `Get Local Selection Ids` / `Is Node Selected` | Read it back; destroyed actors are already gone from it |
+| `On Local Selection Changed` | Fires once per change, after it has been reported, carrying the ids |
+
+Three things about it are worth knowing, because each one is a rule from the contract rather than a
+choice:
+
+- **`[]` is a real message, not a no-op.** There is no teardown message and nothing retracts a
+  claim, so clearing the selection has to send. Only the diff decides whether a *particular* call
+  results in traffic.
+- **The send is coalesced into the tick, and diffed.** An idle scene sends nothing; a gesture that
+  clears and then adds three nodes in one frame sends one message rather than four, so no other
+  client ever draws the intermediate states.
+- **`ids` is all this client sends.** The hub stamps `clientId` and `color` from its own presence
+  table and discards anything a client puts in them, so a client cannot wear another's colour or
+  file a selection under someone else's name.
+
+A selection is also re-sent on every connect. A reconnecting client comes back with an empty
+selection as far as the hub is concerned — the socket that made the old claim is gone — so the
+send-on-connect is what restores the borders. That fires more often than it sounds: a login and a
+logout each reconnect.
+
+**Nothing selects anything automatically yet.** The API above and the console commands are the only
+ways in; hooking the editor's own selection so that clicking in the Outliner feeds the same path is
+separate work, and is editor-only besides.
 
 ## Status
 
