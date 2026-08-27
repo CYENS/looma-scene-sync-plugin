@@ -461,9 +461,30 @@ selection as far as the hub is concerned — the socket that made the old claim 
 send-on-connect is what restores the borders. That fires more often than it sounds: a login and a
 logout each reconnect.
 
-**Nothing selects anything automatically yet.** The API above and the console commands are the only
-ways in; hooking the editor's own selection so that clicking in the Outliner feeds the same path is
-separate work, and is editor-only besides.
+### Selecting in the editor
+
+In the editor, the plugin also mirrors **the editor's own actor selection** while PIE is running:
+click a synced node in the World Outliner and a border appears on it in every other client. It runs
+through the same `Set Local Selection` as everything else, so there is one implementation and one
+diff.
+
+**Press F8 to eject first.** Until you do, the PIE Outliner will not let you select runtime actors,
+and the feature looks broken when it is only unreachable. This is the first thing to try if nothing
+seems to happen.
+
+Two behaviours worth knowing, because both are deliberate:
+
+- **It does nothing before you press Play**, and not because of a filter. `ULoomaSceneSyncSubsystem`
+  is a `UGameInstanceSubsystem`, so it does not exist outside a running game — dressing a level at
+  design time is not a claim about what anyone is working on.
+- **Selecting a non-synced actor clears the selection** rather than being ignored. If you click a
+  stray light, you have stopped working on the node you had, and a border nobody ever retracts is a
+  false claim left in everyone else's viewport. Keeping the old selection would leave it there until
+  you happened to click a synced node again.
+
+The hook is editor-only — `UnrealEd` is a `Target.bBuildEditor` dependency and the code is behind
+`WITH_EDITOR`. In a packaged build the API and the console commands are the whole feature, which is
+why they are the half that exists.
 
 ## Status
 
