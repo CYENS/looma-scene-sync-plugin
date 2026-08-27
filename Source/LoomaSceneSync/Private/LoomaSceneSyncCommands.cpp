@@ -5,6 +5,7 @@
 #include "LoomaSceneSyncLog.h"
 #include "LoomaSceneSyncSettings.h"
 #include "LoomaSceneSyncSubsystem.h"
+#include "LoomaSyncedActor.h"
 
 /**
  * `Looma.Reconnect` / `Looma.Status` — the two things you want from a console when the
@@ -155,5 +156,105 @@ FAutoConsoleCommandWithWorldAndArgs GLoomaWhoamiCommand(
         {
             Subsystem->RefreshIdentity();
         }
+    }));
+/**
+ * `Looma.Select <nodeId...>` / `Looma.Deselect [nodeId...]` / `Looma.Selection` — the
+ * only way in as of step 1, since nothing hooks the editor's own selection yet.
+ *
+ * The subsystem's API takes actors, not ids, so these resolve each id through
+ * FindSyncedActor first. That is deliberately the only id-to-actor door: an id this
+ * client does not hold cannot be selected, and saying so is more use than silently
+ * filing a claim on a node we could not draw. Note the asymmetry with the *inbound*
+ * rule, which is the opposite by design — an unknown id arriving from the hub is kept,
+ * not dropped, because a selection legitimately races the spawn that created its node.
+ */
+FAutoConsoleCommandWithWorldAndArgs GLoomaSelectCommand(
+    TEXT("Looma.Select"),
+    TEXT("Replace the local selection and report it to the room: Looma.Select <nodeId> [nodeId...]"),
+    FConsoleCommandWithWorldAndArgsDelegate::CreateStatic([](const TArray<FString>& Args, UWorld* World) {
+        if (Args.Num() == 0)
+        {
+            UE_LOG(LogLoomaSync, Display,
+                TEXT("Usage: Looma.Select <nodeId> [nodeId...]  (Looma.Deselect with no arguments clears)"));
+            return;
+        }
+        ULoomaSceneSyncSubsystem* Subsystem = FindLoomaSubsystem(World);
+        if (!Subsystem)
+        {
+            UE_LOG(LogLoomaSync, Warning,
+                TEXT("Looma.Select: Looma Scene Sync is not running (no game instance)."));
+            return;
+        }
+        TArray<ALoomaSyncedActor*> Actors;
+        for (const FString& NodeId : Args)
+        {
+            if (ALoomaSyncedActor* Actor = Subsystem->FindSyncedActor(NodeId))
+            {
+                Actors.Add(Actor);
+            }
+            else
+            {
+                UE_LOG(LogLoomaSync, Warning, TEXT("Looma.Select: no node '%s' on this client"), *NodeId);
+            }
+        }
+        // Whole-set replace, mirroring the wire — Looma.Select is not additive. The
+        // resolved subset is applied even if some ids were unknown: the alternative,
+        // refusing the whole command, would make one typo undo a selection the caller
+        // had already built up.
+        Subsystem->SetLocalSelection(Actors);
+        UE_LOG(LogLoomaSync, Display, TEXT("Selected %d of %d requested node(s)"), Actors.Num(), Args.Num());
+    }));
+
+FAutoConsoleCommandWithWorldAndArgs GLoomaDeselectCommand(
+    TEXT("Looma.Deselect"),
+    TEXT("Deselect nodes and report it: Looma.Deselect [nodeId...]. With no arguments, clears the whole ")
+    TEXT("selection, which is what removes this client's borders elsewhere."),
+    FConsoleCommandWithWorldAndArgsDelegate::CreateStatic([](const TArray<FString>& Args, UWorld* World) {
+        ULoomaSceneSyncSubsystem* Subsystem = FindLoomaSubsystem(World);
+        if (!Subsystem)
+        {
+            UE_LOG(LogLoomaSync, Warning,
+                TEXT("Looma.Deselect: Looma Scene Sync is not running (no game instance)."));
+            return;
+        }
+        if (Args.Num() == 0)
+        {
+            Subsystem->ClearSelection();
+            UE_LOG(LogLoomaSync, Display, TEXT("Selection cleared"));
+            return;
+        }
+        for (const FString& NodeId : Args)
+        {
+            // Null is fine to pass on — DeselectNode ignores it — but naming the miss is
+            // the useful half, since "nothing happened" and "that node is not here" look
+            // identical from a console otherwise.
+            ALoomaSyncedActor* Actor = Subsystem->FindSyncedActor(NodeId);
+            if (!Actor)
+            {
+                UE_LOG(LogLoomaSync, Warning, TEXT("Looma.Deselect: no node '%s' on this client"), *NodeId);
+                continue;
+            }
+            Subsystem->DeselectNode(Actor);
+        }
+        UE_LOG(LogLoomaSync, Display, TEXT("Selection is now %d node(s)"),
+            Subsystem->GetLocalSelectionIds().Num());
+    }));
+
+FAutoConsoleCommandWithWorldAndArgs GLoomaSelectionCommand(
+    TEXT("Looma.Selection"),
+    TEXT("Log this client's local selection — the ids the next `selection` message would carry."),
+    FConsoleCommandWithWorldAndArgsDelegate::CreateStatic([](const TArray<FString>& Args, UWorld* World) {
+        ULoomaSceneSyncSubsystem* Subsystem = FindLoomaSubsystem(World);
+        if (!Subsystem)
+        {
+            UE_LOG(LogLoomaSync, Warning,
+                TEXT("Looma.Selection: Looma Scene Sync is not running (no game instance)."));
+            return;
+        }
+        const TArray<FString> Ids = Subsystem->GetLocalSelectionIds();
+        // Said explicitly rather than printed as an empty list, because an empty
+        // selection is a real state with a real message behind it, not an absence.
+        UE_LOG(LogLoomaSync, Display, TEXT("Local selection: %s"),
+            Ids.Num() == 0 ? TEXT("<empty>") : *FString::Join(Ids, TEXT(", ")));
     }));
 } // namespace

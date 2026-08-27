@@ -84,6 +84,20 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FLoomaAuthStateEvent, ELoomaAuthStat
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FLoomaIdentityEvent, const FLoomaIdentity&, Identity);
 
 /**
+ * This client's local selection changed. Carries the node ids the room now believes we
+ * hold — the same array that just went on the wire.
+ *
+ * Fires from the send path, once per coalesced change, rather than from each of
+ * SetLocalSelection / SelectNode / DeselectNode. Same reasoning as the send itself: a
+ * gesture that clears and then adds three nodes in one frame is one logical change, and
+ * a UI told about it four times has to de-bounce what this can simply not emit. The
+ * cost is that a local highlight drawn from this event lags the call by up to a frame;
+ * a UI that cannot accept that should read GetLocalSelection() directly, which is
+ * always current.
+ */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FLoomaSelectionEvent, const TArray<FString>&, NodeIds);
+
+/**
  * Client of the LoomaXR scene-sync hub (backend /ws/scene), speaking **scene format
  * v3** — the normative contract is looma-xr-asset-demo/docs/scene-format.md.
  *
@@ -151,6 +165,65 @@ public:
 
     UFUNCTION(BlueprintPure, Category = "Looma")
     bool IsSyncConnected() const;
+
+    // --- Local selection (outbound `selection`) -------------------------------
+    //
+    // What this client has selected, reported to the hub so every other client can
+    // draw a border on those nodes in our colour. The normative contract is
+    // docs/scene-format.md, "What each client has selected — the `selection` message".
+    //
+    // Three properties of that contract shape everything below. The message carries
+    // the **whole** selection and never a delta, so the canonical call is a whole-set
+    // replace and the others are conveniences over it. An **empty set is a real
+    // message** — `[]` is how a border is cleared, and there is no teardown message —
+    // so nothing here may treat "nothing selected" as "nothing to say". And the hub
+    // stamps `clientId` and `color` itself, discarding anything we put there, so we
+    // send `ids` and nothing else.
+    //
+    // This is presence, not scene state: it never enters the document, is never saved,
+    // and dies with the socket.
+
+    /**
+     * Replace the whole local selection. The canonical call — the wire carries a whole
+     * set, so this mirrors it exactly, and SelectNode / DeselectNode / ClearSelection
+     * are conveniences that read-modify-write through here.
+     *
+     * Null entries and duplicates are dropped. Actors are held weakly, so one
+     * destroyed while selected leaves the selection by itself.
+     */
+    UFUNCTION(BlueprintCallable, Category = "Looma|Selection")
+    void SetLocalSelection(const TArray<ALoomaSyncedActor*>& Actors);
+
+    /** Add one node to the local selection. No-op if it is already in it. */
+    UFUNCTION(BlueprintCallable, Category = "Looma|Selection")
+    void SelectNode(ALoomaSyncedActor* Actor);
+
+    /** Remove one node from the local selection. No-op if it was not in it. */
+    UFUNCTION(BlueprintCallable, Category = "Looma|Selection")
+    void DeselectNode(ALoomaSyncedActor* Actor);
+
+    /**
+     * Select nothing. Not a quiet local reset: it sends `{"ids": []}`, which is what
+     * clears our borders in every other client.
+     */
+    UFUNCTION(BlueprintCallable, Category = "Looma|Selection")
+    void ClearSelection();
+
+    /** The actors currently selected locally. Destroyed ones are already gone from it. */
+    UFUNCTION(BlueprintPure, Category = "Looma|Selection")
+    TArray<ALoomaSyncedActor*> GetLocalSelection() const;
+
+    /** Whether this node is in the local selection. */
+    UFUNCTION(BlueprintPure, Category = "Looma|Selection")
+    bool IsNodeSelected(ALoomaSyncedActor* Actor) const;
+
+    /** The local selection as node ids, sorted — what the next `selection` will carry. */
+    UFUNCTION(BlueprintPure, Category = "Looma|Selection")
+    TArray<FString> GetLocalSelectionIds() const;
+
+    /** Our selection changed and has been reported. See FLoomaSelectionEvent. */
+    UPROPERTY(BlueprintAssignable, Category = "Looma|Selection")
+    FLoomaSelectionEvent OnLocalSelectionChanged;
 
     // --- Connection control / diagnostics -------------------------------------
 
@@ -611,6 +684,28 @@ private:
      */
     void SendReparent(const TArray<FString>& NodeIds);
 
+    /**
+     * Diff the local selection against what was last sent and report it if it moved.
+     * Called every tick while connected; sends nothing on an idle scene.
+     *
+     * The same self-maintaining-baseline shape as TickOutbound's pose diff and
+     * ALoomaSyncedActor::ParentId for attachment: one cached copy of what the hub was
+     * last told, compared against the truth, with no separate dirty flag to keep in
+     * step. The one thing a pure diff cannot express is "the hub has forgotten", which
+     * is what bForceSelectionSend is for.
+     */
+    void TickSelection();
+
+    /**
+     * The local selection as node ids, sorted and de-duplicated, compacting away any
+     * actor that has since been destroyed.
+     *
+     * Sorted so the diff is an array compare rather than a set compare, and so the
+     * wire is deterministic — the contract treats `ids` as a set, so the order is ours
+     * to choose and a stable one keeps a reordering from reading as a change.
+     */
+    TArray<FString> CollectSelectionIds();
+
     /** Deliver the cached state to handles created for an already-known job. */
     void FlushPendingHandleReplays();
 
@@ -665,6 +760,39 @@ private:
 
     /** Which saved scene the hub says is live (`sceneId`); empty for an unsaved one. */
     FString ActiveSceneId;
+
+    /**
+     * The local selection, held **weakly and as actors** rather than as node ids.
+     *
+     * The wire wants ids, so storing ids and validating them against `Tracked` at send
+     * time was the other option. Weak actor pointers win because they make the
+     * awkward case disappear instead of handling it: an actor destroyed while selected
+     * leaves the selection with no bookkeeping, no destruction hook, and no window in
+     * which the stored set and the world disagree. Ids would need a validation pass
+     * against `Tracked` — which is itself keyed by id and holds its own weak pointer,
+     * so it is a second indirection to the same truth — and an id that was never a
+     * node at all would sit in the selection forever.
+     */
+    TArray<TWeakObjectPtr<ALoomaSyncedActor>> LocalSelection;
+
+    /**
+     * The ids the last `selection` carried — the diff baseline. Sorted, so comparing is
+     * an array compare.
+     */
+    TArray<FString> LastSentSelectionIds;
+
+    /**
+     * Send the next selection even if the diff says it has not moved.
+     *
+     * Set on connect, because a diff alone cannot know the hub has forgotten us: a
+     * reconnecting client "comes back with an empty selection" and its send-on-connect
+     * is what restores the claim (docs/scene-format.md). Clearing the baseline instead
+     * would not do — if our selection is *also* empty the diff would suppress the
+     * message, and the contract says send it on connect regardless. This matters more
+     * than it used to: HAM-181 made a login and a logout each reconnect, so connect
+     * happens several times in an ordinary session, not once at startup.
+     */
+    bool bForceSelectionSend = false;
 
     /** jobId -> per-job event handle. Only jobs a caller asked about get one. */
     UPROPERTY()

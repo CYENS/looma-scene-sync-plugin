@@ -349,6 +349,13 @@ void ULoomaSceneSyncSubsystem::Connect()
         ApplyAuthToken(Hello);
         SendJson(Hello);
         OnSyncConnected.Broadcast();
+        // A reconnecting client "comes back with an empty selection" — the socket that
+        // made the old claim is gone and nothing would ever retract it — so the
+        // send-on-connect the contract requires is what brings our borders back
+        // (docs/scene-format.md, "What each client has selected"). Flagged rather than
+        // sent from here so it goes out through the one diffing send path, and so it
+        // cannot race the `hello` this socket has only just written.
+        bForceSelectionSend = true;
         // The WS never replays generation events to late joiners — pull the
         // current queue over REST so cached jobs reflect all clients.
         HydrateGenerationQueue();
@@ -1852,8 +1859,157 @@ void ULoomaSceneSyncSubsystem::Tick(float DeltaTime)
     }
     if (IsSyncConnected())
     {
+        // Before the pose diff, though the contract makes the order a free choice: an
+        // id the hub does not hold yet is passed straight through and becomes drawable
+        // when the node arrives, precisely because "a selection legitimately races the
+        // spawn that created the node".
+        TickSelection();
         TickOutbound(DeltaTime);
     }
+}
+
+// --- Local selection (outbound `selection`) -----------------------------------
+
+void ULoomaSceneSyncSubsystem::SetLocalSelection(const TArray<ALoomaSyncedActor*>& Actors)
+{
+    // Rebuilt wholesale rather than diffed in: the wire carries a whole set, so the
+    // canonical local operation is the same shape, and every other entry point below
+    // reads-modifies-writes through here. Nothing is sent from this call — see
+    // TickSelection for why the send is coalesced into the tick.
+    LocalSelection.Reset(Actors.Num());
+    for (ALoomaSyncedActor* Actor : Actors)
+    {
+        // A node with no id never went through the hub — an ALoomaSyncedActor someone
+        // dropped into the map by hand — so there is nothing the wire could name it by.
+        // Dropped here rather than at send time so the stored set is only ever things
+        // that are actually reportable, and AddUnique keeps a caller passing the same
+        // actor twice from putting it on the wire twice.
+        if (Actor && !Actor->Id.IsEmpty())
+        {
+            LocalSelection.AddUnique(TWeakObjectPtr<ALoomaSyncedActor>(Actor));
+        }
+    }
+}
+
+void ULoomaSceneSyncSubsystem::SelectNode(ALoomaSyncedActor* Actor)
+{
+    if (!Actor || Actor->Id.IsEmpty())
+    {
+        return;
+    }
+    LocalSelection.AddUnique(TWeakObjectPtr<ALoomaSyncedActor>(Actor));
+}
+
+void ULoomaSceneSyncSubsystem::DeselectNode(ALoomaSyncedActor* Actor)
+{
+    if (!Actor)
+    {
+        return;
+    }
+    LocalSelection.Remove(TWeakObjectPtr<ALoomaSyncedActor>(Actor));
+}
+
+void ULoomaSceneSyncSubsystem::ClearSelection()
+{
+    // Deliberately not an early-out when already empty. The send is the point of this
+    // call: `{"ids": []}` is what clears our borders in every other client, and there
+    // is no teardown message that would do it for us. The diff decides whether it
+    // actually goes out, which is the one place that judgement belongs.
+    LocalSelection.Reset();
+}
+
+TArray<ALoomaSyncedActor*> ULoomaSceneSyncSubsystem::GetLocalSelection() const
+{
+    TArray<ALoomaSyncedActor*> Result;
+    Result.Reserve(LocalSelection.Num());
+    for (const TWeakObjectPtr<ALoomaSyncedActor>& Weak : LocalSelection)
+    {
+        if (ALoomaSyncedActor* Actor = Weak.Get())
+        {
+            Result.Add(Actor);
+        }
+    }
+    return Result;
+}
+
+bool ULoomaSceneSyncSubsystem::IsNodeSelected(ALoomaSyncedActor* Actor) const
+{
+    return Actor != nullptr && LocalSelection.Contains(TWeakObjectPtr<ALoomaSyncedActor>(Actor));
+}
+
+TArray<FString> ULoomaSceneSyncSubsystem::GetLocalSelectionIds() const
+{
+    // The const twin of CollectSelectionIds: same answer, without the compaction, so a
+    // Blueprint or a console command can ask without mutating anything.
+    TArray<FString> Ids;
+    Ids.Reserve(LocalSelection.Num());
+    for (const TWeakObjectPtr<ALoomaSyncedActor>& Weak : LocalSelection)
+    {
+        const ALoomaSyncedActor* Actor = Weak.Get();
+        if (Actor && !Actor->Id.IsEmpty())
+        {
+            Ids.AddUnique(Actor->Id);
+        }
+    }
+    Ids.Sort();
+    return Ids;
+}
+
+TArray<FString> ULoomaSceneSyncSubsystem::CollectSelectionIds()
+{
+    // Compact first: an actor destroyed while selected is no longer selected, and
+    // deriving the ids here rather than storing them is what makes that true with no
+    // destruction hook and no separate pruning pass. The resulting change is picked up
+    // by the ordinary diff, so a destroyed node also *reports* its own deselection.
+    LocalSelection.RemoveAll([](const TWeakObjectPtr<ALoomaSyncedActor>& Weak) {
+        const ALoomaSyncedActor* Actor = Weak.Get();
+        return Actor == nullptr || Actor->Id.IsEmpty();
+    });
+    return GetLocalSelectionIds();
+}
+
+void ULoomaSceneSyncSubsystem::TickSelection()
+{
+    // Guarded here as well as at the call site, because the baseline below must only
+    // ever record a send that actually happened. SendJson drops a message when the
+    // socket is down, so running this while disconnected would move LastSentSelectionIds
+    // to a value the hub was never told — and the diff would then suppress the very
+    // message the reconnect needs. (bForceSelectionSend would rescue it, but only by
+    // accident.) This makes the function safe to call from anywhere.
+    if (!IsSyncConnected())
+    {
+        return;
+    }
+
+    const TArray<FString> Ids = CollectSelectionIds();
+    // The diff, so an idle scene sends nothing — the whole reason this is affordable to
+    // evaluate every frame. bForceSelectionSend is the one thing a diff cannot know:
+    // that the hub has forgotten what it was last told.
+    if (!bForceSelectionSend && Ids == LastSentSelectionIds)
+    {
+        return;
+    }
+    bForceSelectionSend = false;
+    LastSentSelectionIds = Ids;
+
+    TArray<TSharedPtr<FJsonValue>> IdValues;
+    IdValues.Reserve(Ids.Num());
+    for (const FString& Id : Ids)
+    {
+        IdValues.Add(MakeShared<FJsonValueString>(Id));
+    }
+
+    TSharedRef<FJsonObject> Msg = MakeShared<FJsonObject>();
+    Msg->SetStringField(TEXT("type"), TEXT("selection"));
+    // `ids` and nothing else. The hub stamps `clientId` and `color` from its own
+    // presence table and discards anything a client puts in them — a border is a claim
+    // about who is working on what, so we could not wear another client's colour or
+    // file a selection under their name even by trying. (SendJson adds its usual
+    // `origin`, which the hub's selection handler does not read.)
+    Msg->SetArrayField(TEXT("ids"), IdValues);
+    SendJson(Msg);
+
+    OnLocalSelectionChanged.Broadcast(Ids);
 }
 
 void ULoomaSceneSyncSubsystem::TickOutbound(float DeltaTime)
