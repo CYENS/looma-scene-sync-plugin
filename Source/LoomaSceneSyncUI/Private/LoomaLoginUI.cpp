@@ -51,30 +51,20 @@ UGameViewportClient* ViewportFor(const UObject* WorldContextObject)
 
 void ULoomaLoginUI::ShowLoginUI(UObject* WorldContextObject, int32 ZOrder)
 {
-    // Every return from here says so. An earlier version returned silently from both
-    // early exits below, which made `Looma.ShowLogin` indistinguishable from a broken
-    // widget in exactly the case the logging was added to diagnose — a form that does not
-    // appear and a command that says nothing leave a reader with no way to tell which
-    // happened. Idempotence and "there is nowhere to draw" are both answers, so both are
-    // reported.
+    // Every path out of here logs. Both early exits used to return silently, which made
+    // the command indistinguishable from a broken widget.
     if (GLoginRoot.IsValid())
     {
-        UE_LOG(LogLoomaSync, Display,
-            TEXT("Show Login UI: already showing (this call is a no-op). Use Looma.HideLogin first ")
-            TEXT("if you meant to recreate it."));
+        UE_LOG(LogLoomaSync, Display, TEXT("Login UI: already showing"));
         return;
     }
 
     UGameViewportClient* Viewport = ViewportFor(WorldContextObject);
     if (!Viewport)
     {
-        // Display, not Verbose. A commandlet or dedicated server genuinely has no viewport
-        // and that is not an error — but the overwhelmingly common cause is a human
-        // typing this into the editor console with no PIE session running, and a silent
-        // no-op is the worst possible answer to give them.
-        UE_LOG(LogLoomaSync, Display,
-            TEXT("Show Login UI: no game viewport, so nothing was shown. Start PIE (or a game) — ")
-            TEXT("there is no viewport to draw on in the editor alone."));
+        // Display rather than Verbose: a commandlet legitimately has no viewport, but the
+        // common cause is the editor console with no PIE running.
+        UE_LOG(LogLoomaSync, Display, TEXT("Login UI: no game viewport (start PIE)"));
         return;
     }
 
@@ -93,8 +83,7 @@ void ULoomaLoginUI::ShowLoginUI(UObject* WorldContextObject, int32 ZOrder)
     if (!Subsystem)
     {
         UE_LOG(LogLoomaSync, Warning,
-            TEXT("Show Login UI: no LoomaSceneSync subsystem on this game instance — the form will ")
-            TEXT("stay hidden. Is the plugin enabled and is this a game world?"));
+            TEXT("Login UI: no LoomaSceneSync subsystem on this game instance; the form stays hidden"));
     }
 
     // Anchored top-left at a fixed width, not handed to the viewport bare.
@@ -115,21 +104,19 @@ void ULoomaLoginUI::ShowLoginUI(UObject* WorldContextObject, int32 ZOrder)
     Viewport->AddViewportWidgetContent(Root, ZOrder);
     GLoginRoot = Root;
 
-    // Say what it decided. "Show Login UI did nothing visible" is otherwise
-    // indistinguishable from three different causes — no subsystem, an auth state still
-    // unknown, or a backend that wants no login — and the form's whole job is to render
-    // nothing in two of them.
+    // Which state it found. Two of the four are "render nothing", which is correct and
+    // otherwise indistinguishable from a broken widget.
     if (Subsystem)
     {
         UE_LOG(LogLoomaSync, Display,
-            TEXT("Show Login UI: %s"),
+            TEXT("Login UI: %s"),
             !Subsystem->IsAuthStateKnown()
-                ? TEXT("auth state not known yet — the form stays hidden until /health answers")
+                ? TEXT("hidden — auth state unknown")
                 : (!Subsystem->IsAuthEnabled()
-                    ? TEXT("this backend has auth disabled — the form stays hidden")
+                    ? TEXT("hidden — auth disabled")
                     : (Subsystem->HasAuthToken()
-                        ? TEXT("already signed in — showing the identity and a log-out button")
-                        : TEXT("auth required and no session — showing the login form"))));
+                        ? TEXT("shown — signed in")
+                        : TEXT("shown — login form"))));
     }
 }
 

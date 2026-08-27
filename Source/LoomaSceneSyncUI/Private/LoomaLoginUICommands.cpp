@@ -28,8 +28,7 @@ UWorld* CommandWorld(UWorld* World)
 {
     if (!World)
     {
-        UE_LOG(LogLoomaSync, Warning,
-            TEXT("No world — run this in PIE or a game, where there is a viewport to draw on."));
+        UE_LOG(LogLoomaSync, Warning, TEXT("Login UI: no world (run this in PIE)"));
         return nullptr;
     }
     return World;
@@ -38,8 +37,7 @@ UWorld* CommandWorld(UWorld* World)
 
 FAutoConsoleCommandWithWorld GLoomaShowLoginCommand(
     TEXT("Looma.ShowLogin"),
-    TEXT("Put the Looma login form on the viewport. Logs what it decided to show, and why, so a ")
-    TEXT("form that stays hidden is diagnosable rather than merely absent."),
+    TEXT("Show the Looma login form. Logs which state it found."),
     FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* World) {
         if (UWorld* W = CommandWorld(World))
         {
@@ -56,6 +54,6 @@ FAutoConsoleCommandWithWorld GLoomaHideLoginCommand(
         if (UWorld* W = CommandWorld(World))
         {
             ULoomaLoginUI::HideLoginUI(W);
-            UE_LOG(LogLoomaSync, Display, TEXT("Hide Login UI: done"));
+            UE_LOG(LogLoomaSync, Display, TEXT("Login UI: hidden"));
         }
     }));
