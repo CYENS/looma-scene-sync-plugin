@@ -2601,6 +2601,10 @@ void ULoomaSceneSyncSubsystem::OnRawMessage(const FString& Text)
     {
         HandleClients(Msg);
     }
+    else if (Type == TEXT("selection"))
+    {
+        HandleSelection(Msg);
+    }
     else
     {
         // Not an error — the hub may speak messages a newer backend added — but
@@ -3716,11 +3720,80 @@ void ULoomaSceneSyncSubsystem::HandleClients(const TSharedPtr<FJsonObject>& Msg)
         NextClients.Add(MoveTemp(Client));
     }
 
+    // --- The roster meets the ledger ----------------------------------------
+    //
+    // "Hydrate from the roster, then apply increments" (docs/scene-format.md). The
+    // roster's job is to hydrate a client we are meeting for the first time — nothing
+    // replays the `selection` messages we were not connected for — and NOT to restate
+    // one we have been tracking incrementally since.
+    //
+    // So a client already in the room keeps the selection we hold for it, and only its
+    // colour, role, name and kind are taken from the new roster. Two things go wrong
+    // if the roster's copy is applied to a known client instead. It reorders: rebuilding
+    // the ledger from roster order would re-seat every claim in JOIN order, so a node B
+    // claimed before A would silently flip to A the next time an unrelated third party
+    // joined — a border changing colour because somebody else walked in. And it can
+    // lose: the hub awaits between roster recipients, so a roster generated before our
+    // `selection` was recorded can be delivered after it, and treating that stale copy
+    // as authoritative would retract a claim nothing will ever re-send.
+    //
+    // Membership and order are still wholesale, which is the step-1 rule intact: this
+    // carries forward one field of an entry the roster still has to list at all.
+    TSet<FString> PreviousIds;
+    PreviousIds.Reserve(RemoteClients.Num());
+    for (const FLoomaClient& Client : RemoteClients)
+    {
+        PreviousIds.Add(Client.Id);
+    }
+    for (FLoomaClient& Client : NextClients)
+    {
+        if (const FLoomaClient* Known = RemoteClients.FindByPredicate(
+                [&Client](const FLoomaClient& Candidate) { return Candidate.Id == Client.Id; }))
+        {
+            Client.Selection = Known->Selection;
+        }
+    }
+
     const bool bSelfMoved = NextSelf != SelfClient || NextOwnId != OwnClientId;
     const bool bRoomMoved = NextClients != RemoteClients;
     SelfClient = MoveTemp(NextSelf);
     OwnClientId = MoveTemp(NextOwnId);
+
+    // Rule 3, and it must run before the hydration below rather than after: a client
+    // that left has no borders, which is the only way a disconnect clears them — there
+    // is no teardown message — and freeing its slots first is what lets a newcomer
+    // inherit a contested node in the same roster that reports both events.
+    TSet<FString> NextIds;
+    NextIds.Reserve(NextClients.Num());
+    for (const FLoomaClient& Client : NextClients)
+    {
+        NextIds.Add(Client.Id);
+    }
+    for (const FString& OldId : PreviousIds)
+    {
+        if (!NextIds.Contains(OldId))
+        {
+            ReleaseAllClaims(OldId);
+        }
+    }
+
     RemoteClients = MoveTemp(NextClients);
+
+    // Hydration proper, in roster order, which is join order — the tiebreak the
+    // contract specifies for nodes that arrive already selected in a roster. Only
+    // clients we had not met: everyone else's claims are already in the ledger, at the
+    // positions their `selection` messages earned them.
+    for (const FLoomaClient& Client : RemoteClients)
+    {
+        if (PreviousIds.Contains(Client.Id))
+        {
+            continue;
+        }
+        for (const FString& NodeId : Client.Selection)
+        {
+            ClaimNode(NodeId, Client.Id);
+        }
+    }
 
     // Only on an actual change — see FLoomaClientsEvent. The self half is folded into
     // the same event rather than given one of its own: a consumer showing "the colour
@@ -3732,12 +3805,225 @@ void ULoomaSceneSyncSubsystem::HandleClients(const TSharedPtr<FJsonObject>& Msg)
     }
 }
 
+void ULoomaSceneSyncSubsystem::HandleSelection(const TSharedPtr<FJsonObject>& Msg)
+{
+    FString SenderId;
+    if (!Msg->TryGetStringField(TEXT("clientId"), SenderId) || SenderId.IsEmpty())
+    {
+        // Server-stamped and never optional on the inbound copy. Without it the claim
+        // is unattributable — there is no colour to draw it in and no way to retract
+        // it later — so there is nothing useful to do but drop the message.
+        return;
+    }
+    // The hub echo-suppresses, so this should never be us. Checked anyway, for the
+    // same reason step 1 keeps the self entry out of the remote list: our own colour
+    // drawn on our own selection is the exact confusion per-client colours exist to
+    // remove, and a one-line guard is cheaper than trusting a remote invariant.
+    if (SenderId == ClientId || (!OwnClientId.IsEmpty() && SenderId == OwnClientId))
+    {
+        return;
+    }
+
+    const TArray<TSharedPtr<FJsonValue>>* IdValues = nullptr;
+    if (!Msg->TryGetArrayField(TEXT("ids"), IdValues) || !IdValues)
+    {
+        // A *missing* `ids` is malformed; an EMPTY `ids` is a real message that clears
+        // this client's borders everywhere. Reading the first as the second would let a
+        // truncated message silently retract a live claim, so absence is refused here
+        // rather than folded into the empty case.
+        return;
+    }
+    TArray<FString> Ids;
+    Ids.Reserve(IdValues->Num());
+    for (const TSharedPtr<FJsonValue>& Value : *IdValues)
+    {
+        FString NodeId;
+        if (Value.IsValid() && Value->TryGetString(NodeId) && !NodeId.IsEmpty())
+        {
+            // Kept whether or not we hold a node by this name. A selection legitimately
+            // races the `spawn` that created its node, and filtering here would drop a
+            // claim nothing ever re-sends; it simply becomes drawable if the node
+            // arrives. Note this is the exact opposite of the OUTBOUND rule, where
+            // Looma.Select refuses an id this client does not hold.
+            Ids.Add(NodeId);
+        }
+    }
+
+    FString ColorWire;
+    Msg->TryGetStringField(TEXT("color"), ColorWire);
+    const FString MessageHex = LoomaNormalizeClientColorHex(ColorWire);
+
+    int32 Index = RemoteClients.IndexOfByPredicate(
+        [&SenderId](const FLoomaClient& Candidate) { return Candidate.Id == SenderId; });
+    if (Index == INDEX_NONE)
+    {
+        // A sender the roster has not introduced yet. Appended rather than ignored:
+        // the roster and a `selection` are fanned out independently — the hub awaits
+        // between roster recipients — so a selection really can land just before the
+        // roster that names its sender, and dropping it would lose the claim for good.
+        // The hub stamps `color` on this message precisely so the border can be drawn
+        // anyway. Appended at the end, which is not its join position; the next roster
+        // rebuilds membership and order and seats it correctly.
+        FLoomaClient Provisional;
+        Provisional.Id = SenderId;
+        Provisional.Role = TEXT("unknown");
+        // DisplayName left empty and Kind left Guest: neither field is on this message
+        // — both are roster-only — and inventing either would put a name or an account
+        // in the room that no other client is showing.
+        Index = RemoteClients.Add(MoveTemp(Provisional));
+    }
+
+    FLoomaClient& Sender = RemoteClients[Index];
+    // Colour precedence: this message, then whatever the last roster gave this client,
+    // then the neutral fallback. The message's copy is the same value as the roster's,
+    // so the first two can only differ when the hub has recoloured someone — and a
+    // client we learned about from a `selection` alone has nothing but the message.
+    if (!MessageHex.IsEmpty())
+    {
+        LoomaParseClientColor(MessageHex, Sender.ColorHex, Sender.Color);
+    }
+    else if (Sender.ColorHex.IsEmpty())
+    {
+        LoomaParseClientColor(FString(), Sender.ColorHex, Sender.Color);
+    }
+
+    if (Sender.Selection == Ids)
+    {
+        // Nothing moved. The ledger would be unchanged too — MoveClaims would compute
+        // an empty diff — so returning here only skips an event, which is the rule
+        // OnClientsChanged states.
+        return;
+    }
+    // The whole set, replacing what it held; the wire never sends a delta. The ledger
+    // gets the difference, which is why the old set has to be read before the new one
+    // is stored.
+    MoveClaims(SenderId, Sender.Selection, Ids);
+    Sender.Selection = MoveTemp(Ids);
+
+    OnClientsChanged.Broadcast(RemoteClients);
+}
+
+// --- The claim ledger ---------------------------------------------------------
+
+void ULoomaSceneSyncSubsystem::ClaimNode(const FString& NodeId, const FString& ClaimantId)
+{
+    TArray<FString>& Claimants = Claims.FindOrAdd(NodeId);
+    // AddUnique, spelled out: a claimant already on the list keeps the position it
+    // has. Appending again would move it to the back of a queue it may be at the front
+    // of, which is the one thing the tiebreak may never do.
+    Claimants.AddUnique(ClaimantId);
+}
+
+void ULoomaSceneSyncSubsystem::ReleaseNode(const FString& NodeId, const FString& ClaimantId)
+{
+    TArray<FString>* Claimants = Claims.Find(NodeId);
+    if (!Claimants)
+    {
+        return;
+    }
+    Claimants->Remove(ClaimantId);
+    if (Claimants->Num() == 0)
+    {
+        // Dropped rather than left empty, so that "no entry" is the only way a node is
+        // unclaimed. Two representations of the same state is how a lookup that checks
+        // one of them starts drawing borders nobody holds.
+        Claims.Remove(NodeId);
+    }
+}
+
+void ULoomaSceneSyncSubsystem::ReleaseAllClaims(const FString& ClaimantId)
+{
+    // The one operation that scans, and the reason the ledger can afford to be keyed
+    // by node alone — it runs once per roster, over the nodes a room has selected.
+    for (auto It = Claims.CreateIterator(); It; ++It)
+    {
+        It.Value().Remove(ClaimantId);
+        if (It.Value().Num() == 0)
+        {
+            It.RemoveCurrent();
+        }
+    }
+}
+
+void ULoomaSceneSyncSubsystem::MoveClaims(
+    const FString& ClaimantId, const TArray<FString>& Held, const TArray<FString>& Next)
+{
+    const TSet<FString> StillHeld(Next);
+    for (const FString& NodeId : Held)
+    {
+        if (!StillHeld.Contains(NodeId))
+        {
+            ReleaseNode(NodeId, ClaimantId);
+        }
+    }
+    // ClaimNode is already idempotent, so the ids in both sets could simply be
+    // re-claimed — but going through them anyway would make the no-op path depend on
+    // AddUnique's silence for correctness rather than by construction. Diff both ways.
+    const TSet<FString> WasHeld(Held);
+    for (const FString& NodeId : Next)
+    {
+        if (!WasHeld.Contains(NodeId))
+        {
+            ClaimNode(NodeId, ClaimantId);
+        }
+    }
+}
+
+bool ULoomaSceneSyncSubsystem::GetNodeBorderOwner(const FString& NodeId, FLoomaClient& OutClient) const
+{
+    const TArray<FString>* Claimants = Claims.Find(NodeId);
+    if (!Claimants || Claimants->Num() == 0)
+    {
+        return false;
+    }
+    // The head, and that is the whole rule. Derived here rather than read from a
+    // maintained owner table: it is an array index, and a cached copy of a
+    // one-element derivation is a thing that can disagree with its source.
+    return GetClient((*Claimants)[0], OutClient);
+}
+
+TArray<FString> ULoomaSceneSyncSubsystem::GetNodeClaimants(const FString& NodeId) const
+{
+    if (const TArray<FString>* Claimants = Claims.Find(NodeId))
+    {
+        return *Claimants;
+    }
+    return TArray<FString>();
+}
+
+TArray<FString> ULoomaSceneSyncSubsystem::GetClientBorderNodes(const FString& InClientId) const
+{
+    FLoomaClient Client;
+    if (!GetClient(InClientId, Client))
+    {
+        return TArray<FString>();
+    }
+    // The reverse index the ledger deliberately does not keep: that client's own
+    // selection, filtered through one O(1) lookup per id. Order is the selection's,
+    // so a renderer that groups by client gets a stable list across redraws.
+    TArray<FString> Won;
+    Won.Reserve(Client.Selection.Num());
+    for (const FString& NodeId : Client.Selection)
+    {
+        const TArray<FString>* Claimants = Claims.Find(NodeId);
+        if (Claimants && Claimants->Num() > 0 && (*Claimants)[0] == InClientId)
+        {
+            Won.Add(NodeId);
+        }
+    }
+    return Won;
+}
+
 void ULoomaSceneSyncSubsystem::ClearPresence()
 {
     const bool bHadRoom = RemoteClients.Num() > 0 || !OwnClientId.IsEmpty() || !SelfClient.Id.IsEmpty();
     RemoteClients.Reset();
     SelfClient = FLoomaClient();
     OwnClientId.Reset();
+    // The ledger goes with the room it describes. It is derived entirely from the
+    // roster and the `selection` messages of the socket that just died, and nothing
+    // will retract a claim made over a connection that no longer exists.
+    Claims.Reset();
     if (bHadRoom)
     {
         OnClientsChanged.Broadcast(RemoteClients);
@@ -3820,6 +4106,42 @@ void ULoomaSceneSyncSubsystem::LogRoom() const
     for (const FLoomaClient& Client : RemoteClients)
     {
         LogClient(Client, /*bIsSelf=*/false);
+    }
+}
+
+void ULoomaSceneSyncSubsystem::LogClaims() const
+{
+    if (Claims.Num() == 0)
+    {
+        UE_LOG(LogLoomaSync, Display, TEXT("Looma claims: nobody in the room has anything selected"));
+        return;
+    }
+
+    UE_LOG(LogLoomaSync, Display, TEXT("Looma claims: %d node(s) claimed (winner first, '<-' marks the border)"),
+        Claims.Num());
+    // Iteration order of a TMap is its internal one, so this listing is not stable
+    // between calls. Deliberately not sorted: the order WITHIN each list is the
+    // load-bearing thing and it is preserved, while sorting the nodes would suggest an
+    // ordering between them that the ledger does not have.
+    for (const TPair<FString, TArray<FString>>& Entry : Claims)
+    {
+        UE_LOG(LogLoomaSync, Display, TEXT("  %s <- %s"),
+            *Entry.Key, *FString::Join(Entry.Value, TEXT(", then ")));
+    }
+
+    // The other direction, and the reason both are printed: what a client selected and
+    // what it actually draws are different numbers the moment anyone is contested, and
+    // a border that is simply missing looks identical to a client that is not there.
+    UE_LOG(LogLoomaSync, Display, TEXT("Looma claims by client:"));
+    for (const FLoomaClient& Client : RemoteClients)
+    {
+        const TArray<FString> Won = GetClientBorderNodes(Client.Id);
+        UE_LOG(LogLoomaSync, Display, TEXT("    %s (%s) wins %d of %d selected%s%s"),
+            *Client.Id,
+            Client.DisplayName.IsEmpty() ? *Client.ColorHex : *Client.DisplayName,
+            Won.Num(), Client.Selection.Num(),
+            Won.Num() > 0 ? TEXT(": ") : TEXT(""),
+            Won.Num() > 0 ? *FString::Join(Won, TEXT(", ")) : TEXT(""));
     }
 }
 

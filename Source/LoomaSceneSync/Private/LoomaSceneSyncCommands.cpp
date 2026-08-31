@@ -20,8 +20,8 @@
  *   Looma.Cue [index]                         where on the running order
  *   Looma.Scenes / Looma.Performances         what there is to name in the three above
  *   Looma.Select / Deselect / Selection       what this client has selected
- *   Looma.Room                                who else is in the room, and what
- *                                             each of them holds
+ *   Looma.Room / Looma.Claims                 who else is in the room, and which
+ *                                             actors each of them holds
  *
  * The one distinction worth carrying into all of them: changing SCENE is a message and
  * changing PERFORMANCE is a reconnect, because a socket's performance is fixed at
@@ -639,5 +639,29 @@ FAutoConsoleCommandWithWorldAndArgs GLoomaRoomCommand(
             return;
         }
         Subsystem->LogRoom();
+    }));
+
+/**
+ * `Looma.Claims` — the tiebreak, made visible.
+ *
+ * Separate from `Looma.Room` because it answers a question the roster cannot: two
+ * clients may both have a node selected, and only one of them draws a border on it.
+ * When somebody reports "my selection is not showing on their screen", this is the
+ * command that distinguishes a broken border from a lost tiebreak, and those have
+ * opposite fixes.
+ */
+FAutoConsoleCommandWithWorldAndArgs GLoomaClaimsCommand(
+    TEXT("Looma.Claims"),
+    TEXT("Log the claim ledger: each claimed node with its claimants oldest-first (the head draws ")
+    TEXT("the border), then each client with how much of its selection it actually wins."),
+    FConsoleCommandWithWorldAndArgsDelegate::CreateStatic([](const TArray<FString>& Args, UWorld* World) {
+        ULoomaSceneSyncSubsystem* Subsystem = FindLoomaSubsystem(World);
+        if (!Subsystem)
+        {
+            UE_LOG(LogLoomaSync, Warning,
+                TEXT("Looma.Claims: Looma Scene Sync is not running (no game instance)."));
+            return;
+        }
+        Subsystem->LogClaims();
     }));
 } // namespace

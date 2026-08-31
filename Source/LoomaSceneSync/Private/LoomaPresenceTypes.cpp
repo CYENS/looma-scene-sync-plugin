@@ -5,8 +5,6 @@
 
 const TCHAR* const LoomaFallbackClientColorHex = TEXT("#bbbbbb");
 
-namespace
-{
 /**
  * `#rgb` or `#rrggbb`, case-insensitive, expanded to six lowercase digits. Empty if
  * the string is anything else.
@@ -16,7 +14,7 @@ namespace
  * what is a valid colour. Written out rather than run through FRegexPattern: this is
  * on the path of every roster entry, and the check is four characters of arithmetic.
  */
-FString NormalizeColorHex(const FString& Wire)
+FString LoomaNormalizeClientColorHex(const FString& Wire)
 {
     if (Wire.Len() != 4 && Wire.Len() != 7)
     {
@@ -44,11 +42,10 @@ FString NormalizeColorHex(const FString& Wire)
     }
     return FString(TEXT("#")) + Digits;
 }
-} // namespace
 
 void LoomaParseClientColor(const FString& Wire, FString& OutHex, FLinearColor& OutColor)
 {
-    OutHex = NormalizeColorHex(Wire);
+    OutHex = LoomaNormalizeClientColorHex(Wire);
     if (OutHex.IsEmpty())
     {
         OutHex = LoomaFallbackClientColorHex;
