@@ -4135,6 +4135,13 @@ void ULoomaSceneSyncSubsystem::RefreshRemoteBorders()
         // from its own nodes, skipping ours, skipping anything already claimed
         // outright, and skipping what an earlier group already took — one node, one
         // border, and earlier means earlier in the roster.
+        // `Taken` doubles as the visited set, which is what makes this safe on a
+        // malformed hierarchy: a node is pushed only in the same statement that adds it
+        // to `Taken`, and nothing is ever removed from `Taken` during a recompute, so
+        // each id is enqueued at most once and the loop is bounded by the node count.
+        // A `ParentId` cycle therefore terminates rather than spinning — including a
+        // cycle that closes back onto a seed, since every node in `Group.OwnNodeIds` is
+        // a claimed node and `Taken` was seeded with every one of those above.
         TArray<FString> Frontier = Group.OwnNodeIds;
         while (Frontier.Num() > 0)
         {
