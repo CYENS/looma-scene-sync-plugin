@@ -25,6 +25,8 @@ The protocol it implements is specified in
 | `ELoomaJobState` / `LoomaGenerationTypes` | Text→3D job lifecycle, mirroring the backend's `JobState` vocabulary |
 | `ULoomaGenerationHandle` | One generation job's events, scoped to that job — raw state events plus per-stage ones (queued / generating images / awaiting selection / generating asset / generated), and the calls to drive the job |
 | `FLoomaIdentity` / `ELoomaIdentityKind` | Who the backend says we are — its `IdentityOut`: user id, display name, kind (`Guest` / `User`), admin flag |
+| `FLoomaClient` / `ELoomaClientKind` | One client in the room, from the hub's `clients` roster: id, colour, role, display name, kind (`Guest` / `User`), selection |
+| `FLoomaBorderGroup` | What to draw for one remote client — its colour, its stencil slot, the nodes it won outright and their descendants |
 | `ULoomaLoginAction` | Async Blueprint node — log in (`POST /auth/login`) |
 | `ULoomaSubmitGenerationAction` | Async Blueprint node — submit a text→3D job (`POST /generate`) |
 | `ULoomaDownloadImageAction` | Async Blueprint node — download a candidate/selected image, decode to a transient `UTexture2D` |
@@ -165,6 +167,7 @@ the module name — then regenerate project files and rebuild.
 | `bBaseAlignModels` | `true` | Stand a `model`'s GLB on the node origin, as the web client does |
 | `WebAssetPrefix` | `/api` | The proxy prefix a *web* peer needs in front of `/static/...`, used to fill in the `url` of a `model` we spawn |
 | `GuestDisplayName` | *(empty)* | The name to suggest for this client in the room roster while connected as a guest. Empty suggests nothing and the hub falls back to `Guest-xxxxxx`. Ignored while logged in — see *Being named in the room* |
+| `RemoteSelectionCollection` | *(empty)* | The Material Parameter Collection remote clients' border colours are written into. **It has to live in your project** — the plugin ships no assets — so this is a soft path. Empty publishes no colours; the stencil is still written. See *Wiring the outline* |
 
 Settings are read live from the CDO, so an edit needs no restart; changing `BackendUrl` reconnects
 by itself, including mid-PIE. Locally, prefer an explicit IPv4 address over `localhost` — UE's
@@ -192,6 +195,8 @@ the new section, which then wins.
 | `Looma.Select <nodeId...>` | Replaces the local selection and reports it to the room. Not additive — the wire carries a whole set, so this does too. Unknown ids are named and skipped |
 | `Looma.Deselect [nodeId...]` | Deselects those nodes; with no arguments clears the whole selection, which is what removes this client's borders elsewhere |
 | `Looma.Selection` | Logs the local selection — the ids the next `selection` message would carry |
+| `Looma.Room` | Logs who else is in the room from the hub's roster — id, name, kind, role, colour and selection — with this client's own entry marked `*`. The only way to read our own room name, since `GET /auth/me` mints a fresh guest name per call |
+| `Looma.Claims` | Logs the claim ledger both ways round: each claimed node with its claimants oldest-first (the head draws the border), then each client with how much of its selection it actually wins, then which stencil slots are in use and who the budget left out |
 
 Between them these are self-sufficient: every id and name `Looma.Scene`, `Looma.Performance` and `Looma.Cue` accept can be discovered with `Looma.Scenes`, `Looma.Performances` and `Looma.Cue`, so nothing here needs a browser tab open beside it. The distinction that shapes all of them is that changing **scene** is a message while changing **performance** is a reconnect — a socket's performance is fixed at `hello` for its life.
 
@@ -492,6 +497,137 @@ Two behaviours worth knowing, because both are deliberate:
 The hook is editor-only — `UnrealEd` is a `Target.bBuildEditor` dependency and the code is behind
 `WITH_EDITOR`. In a packaged build the API and the console commands are the whole feature, which is
 why they are the half that exists.
+
+## Remote selections
+
+The inbound twin of the section above: everyone else's selections, drawn in their own colours so a
+shared scene reads as shared. The normative contract is `docs/scene-format.md`, *"Who else is in the
+room — the `clients` message"* and *"What each client has selected"*; this is how it lands in
+Unreal.
+
+Two messages feed it. `clients` is the whole room, re-sent on every join and every leave, carrying
+each client's colour, name, kind and current selection. `selection` is one client's whole set,
+changing hands between rosters. Neither is scene state: **none of it is merged into the document,
+sent in a `scene`, or saved, and all of it dies with the socket** — there is no teardown message, so
+dropping a client that has left the roster is the only thing that clears its borders.
+
+| Blueprint node (`Looma\|Presence`) | What it does |
+| --- | --- |
+| `Get Clients` | The **other** clients, in roster order (= join order). Empty while disconnected |
+| `Get Own Client Id` | Our own id in the room — the roster's `you` |
+| `Get Client` | One client by id, **ours included**; the self entry is held apart from the list but is still findable |
+| `Get Node Border Owner` / `Get Node Claimants` | Who wins a node's border, and everyone claiming it oldest-first |
+| `Get Client Border Nodes` | The nodes one client both selected *and* won — one outline group's worth |
+| `Get Remote Border Groups` | The whole draw list: per client, its colour, stencil slot, own nodes and descendants |
+| `Get Undrawn Clients` | Clients holding a border that no stencil slot was left for |
+| `On Clients Changed` | The room moved — a join, a leave, or somebody's selection. Fires only on a real change, and fires with an empty array when the socket drops |
+
+`Get Own Client Id` closes a gap worth naming: **this is the only way the plugin can learn its own
+room name.** `GET /auth/me` mints a fresh random `Guest-xxxxxx` on every call when no session is
+held, so that name matches nothing anyone else sees; the roster's self entry is the real one. Set
+`GuestDisplayName` to have something readable there — see *Being named in the room*.
+
+Five rules govern what is drawn, and each is a rule from the contract rather than a choice:
+
+- **First claim wins, and nothing is locked.** Two people can select one node and both can still
+  edit it; this is a drawing rule only, so that one node has one border. The claim ledger is
+  `nodeId → claimants, oldest first`, and the head draws. Every client receives hub messages in the
+  same order, so each maintains that order locally and they all agree with no arbitration. A real
+  per-selection lock is planned and will replace it.
+- **Your own selection always wins on your own screen.** Our ids are subtracted from every remote
+  border first, thick and thin alike, so a remote claim can never make us lose track of what we
+  hold. Our own colour is what *other* people see for us; it is never drawn here.
+- **A node someone claimed outright is never another client's descendant hint** — the same
+  precedence a selection has over a child hint. One node, one border, however many claimed subtrees
+  it sits under.
+- **An unknown node id is kept, not filtered.** A `selection` legitimately races the `spawn` that
+  created its node, and nothing re-sends a dropped claim, so the claim is held and the border simply
+  appears if the node arrives.
+- **An unknown `clientId` is drawn in a neutral grey (`#bbbbbb`), never guessed and never dropped.**
+  The roster and a `selection` are fanned out independently, so a selection can land just before the
+  roster that introduces its sender. The next roster corrects it.
+
+Two limits are deliberate and visible rather than silent:
+
+**The budget is eight clients** (`LoomaRemoteBorderSlots`). Not an engine limit — the stencil
+encoding holds 127 — but the hub's colour palette is eight and **repeats** past that
+(`docs/scene-format.md`), so a ninth border would be drawn in a colour somebody else is already
+wearing. An ambiguous border is a wrong answer where a missing one is a visibly missing one. Clients
+past the budget are named by `Get Undrawn Clients`, logged once each time the list changes, and
+printed by `Looma.Claims` — show them in your UI, because a client that is present, working and
+invisible is otherwise indistinguishable from an empty room. Slots are spent in roster order, one
+per client that actually won a claim, so a client holding nothing costs nothing.
+
+**A node with no primitive draws nothing.** A `light` node and an empty group node have no mesh to
+outline, so a claim on one is held in the ledger, counts toward its owner's group, and produces no
+border. The web client solved this with a pick proxy (HAM-148); this plugin has no equivalent,
+because it can ship no assets. If you need it, spawn your own proxy primitive as a child of the
+node — it will be picked up automatically, since every `UPrimitiveComponent` on a synced actor is
+marked.
+
+`Looma.Room` prints the roster with our own entry marked; `Looma.Claims` prints the ledger both ways
+round — each claimed node with its claimants, then each client with how much of its selection it
+actually wins — plus which stencil slots are in use. Those numbers differ the moment anyone is
+contested, and telling a lost tiebreak from a broken border is the whole reason both are printed.
+
+### Wiring the outline
+
+**The plugin marks; it does not draw.** It sets `CustomDepthStencilValue` on the primitives whose
+borders you should see and publishes the colours; a post-process material in your project turns the
+two into an outline. That split is forced — `LoomaSceneSync.uplugin` sets `"CanContainContent":
+false`, so the plugin can ship code and nothing else, no material and no parameter collection — and
+it is also the right shape, since a project that already has an outline material wires this in
+without adopting a second one.
+
+Four things to build, in order:
+
+**1. Turn on the custom depth stencil.** *Project Settings > Rendering > Postprocessing > Custom
+Depth-Stencil Pass* = **Enabled with Stencil** (`r.CustomDepth=3`). Without it the stencil buffer is
+never written and **nothing appears at all**, however correct everything else is. The plugin cannot
+set this for its host — writing to a project's render config from a plugin would be a worse surprise
+than a warning — so it checks the CVar the first time a border exists and logs a warning naming the
+value it found.
+
+**2. Create a Material Parameter Collection** anywhere in your content, with:
+
+| Parameter | Type | Meaning |
+| --- | --- | --- |
+| `LoomaClient1` … `LoomaClient8` | Vector | Slot *n*'s colour, linear. **Alpha is the occupancy flag** — 1 when the slot is in use, 0 when it is free |
+| `LoomaClientCount` | Scalar | How many slots are in use |
+
+Point *Project Settings > Plugins > Looma Scene Sync > Remote Selection Parameter Collection* at it.
+Every slot is rewritten on every change, empty ones included: writing only the occupied slots would
+leave a departed client's colour sitting in the collection for a material to draw with, which is the
+"border in the wrong colour" failure — strictly worse than none. Leave the setting empty and the
+plugin logs once that stencil values are being written with no colours published, because "not
+configured" and "broken" otherwise produce the identical symptom.
+
+**3. Decode the stencil in a post-process material** (blendable location *Before Tonemapping*), from
+`SceneTexture:CustomStencil`:
+
+| Value | Meaning |
+| --- | --- |
+| `0` | No border. Reserved, and never allocated — a stray non-zero value can never be mistaken for a claim |
+| `1` … `8` | Slot *n*, **thick** — a node that client selected and won |
+| `129` … `136` | Slot *n*, **thin** — a descendant of one of those nodes, the "this moves with it" hint |
+
+So: `IsChild = Stencil > 128`, `Slot = Stencil - (IsChild ? 128 : 0)`, then look up `LoomaClient<Slot>`
+and pick an edge weight. A high bit rather than `slot * 2 + weight` because the decode is then a
+compare and a subtract rather than a floor and a modulo — and the thick values stay equal to the
+slot number, which makes a stencil buffer readable in RenderDoc without decoding anything.
+
+Match the web client's weighting so the two viewers agree: thick edges at strength 5, thin at 2
+(`frontend/src/scene/Scene.jsx`), and dim the occluded half of an edge rather than colouring it
+differently, so a claim on something behind another object still reads as that client's.
+
+**4. Or skip 2 and 3 entirely.** `Get Remote Border Groups` hands you the same decision — client,
+colour, slot, own nodes, descendants — as plain Blueprint data, recomputed whenever the room, the
+local selection or the scene moves. Drive your own materials from it if the collection route does
+not suit; the stencil is written either way.
+
+The plugin deliberately does **not** drive a stencil for your own local selection. That is your
+project's business and it must not change when the room does — which is the point of the
+your-selection-always-wins rule above.
 
 ## Status
 

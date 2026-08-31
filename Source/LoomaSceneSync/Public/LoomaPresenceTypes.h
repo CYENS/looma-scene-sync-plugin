@@ -136,6 +136,82 @@ struct FLoomaClient
 };
 
 /**
+ * How many remote clients can have a border drawn at once.
+ *
+ * NOT the encoding's ceiling, which is 127 (see LoomaBorderStencilValue). This is a
+ * budget, and it is derived rather than tuned: the hub allocates colours from a fixed
+ * palette of **eight** and wraps past the end of it (backend/app/sync.py `PALETTE`,
+ * and docs/scene-format.md — "in a room larger than the palette colours **repeat**").
+ * A ninth border would therefore be drawn in a colour some other client is already
+ * wearing, which is worse than not drawing it: an ambiguous border is a wrong answer
+ * where a missing one is a visibly missing one, and GetUndrawnClients names who is
+ * missing. It also happens to be the point past which a post-process material's
+ * per-pixel slot comparison chain and a hand-authored parameter collection stop being
+ * reasonable to maintain.
+ *
+ * Raising it is a two-sided change — this constant and the consumer's material and
+ * collection — which is exactly the coupling the README's "Wiring the outline"
+ * section documents.
+ */
+inline constexpr int32 LoomaRemoteBorderSlots = 8;
+
+/**
+ * Added to a slot for the thinner "this moves with it" descendant border, so one
+ * 8-bit stencil value carries both which client and which weight.
+ *
+ * A high bit rather than `slot * 2 + weight`: the decode a post-process material has
+ * to run is then a compare and a subtract, not a floor and a modulo, and the thick
+ * values stay equal to the slot number — which makes a stencil buffer readable in
+ * RenderDoc without decoding anything. 127 slots fit; the budget above spends eight.
+ */
+inline constexpr int32 LoomaChildStencilOffset = 128;
+
+/**
+ * The `CustomDepthStencilValue` for one client's border. **Slot 0 is reserved for "no
+ * border"** — an actor nobody claims is cleared to it, so a stray non-zero value can
+ * never be mistaken for a claim.
+ */
+inline constexpr int32 LoomaBorderStencilValue(int32 Slot, bool bChild)
+{
+    return Slot + (bChild ? LoomaChildStencilOffset : 0);
+}
+
+/**
+ * One client's worth of border, ready to draw: which nodes, in which colour, at which
+ * stencil slot.
+ *
+ * Published so a consumer that would rather not use the parameter collection can
+ * drive its own material from Blueprint with no reaching into the subsystem's
+ * internals — the two halves of the "how does a colour reach the material" question
+ * the README's *Wiring the outline* section sets out.
+ */
+USTRUCT(BlueprintType)
+struct FLoomaBorderGroup
+{
+    GENERATED_BODY()
+
+    /** Whose border this is. Never ours — see ULoomaSceneSyncSubsystem::GetClients. */
+    UPROPERTY(BlueprintReadOnly, Category = "Looma|Presence")
+    FString ClientId;
+
+    /** That client's hub-assigned colour, linear. */
+    UPROPERTY(BlueprintReadOnly, Category = "Looma|Presence")
+    FLinearColor Color = FLinearColor::Gray;
+
+    /** 1-based stencil slot; the value written is LoomaBorderStencilValue(Slot, bChild). */
+    UPROPERTY(BlueprintReadOnly, Category = "Looma|Presence")
+    int32 Slot = 0;
+
+    /** Nodes this client selected and won the claim on — the thick border. */
+    UPROPERTY(BlueprintReadOnly, Category = "Looma|Presence")
+    TArray<FString> OwnNodeIds;
+
+    /** Everything under those nodes — the thinner "this moves with it" hint. */
+    UPROPERTY(BlueprintReadOnly, Category = "Looma|Presence")
+    TArray<FString> ChildNodeIds;
+};
+
+/**
  * The colour for a client we hold no valid colour for: a neutral grey, chosen so it
  * reads as "no colour was given" rather than as somebody's assigned one.
  *
