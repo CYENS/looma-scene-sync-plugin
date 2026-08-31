@@ -540,6 +540,18 @@ Five rules govern what is drawn, and each is a rule from the contract rather tha
 - **A node someone claimed outright is never another client's descendant hint** — the same
   precedence a selection has over a child hint. One node, one border, however many claimed subtrees
   it sits under.
+- **A hint follows the nearest owning ancestor, and stops at a claimed node rather than passing
+  through it.** Take `P → C → G`, where X claims `P` and Y claims `C`. `C` is Y's outright claim, so
+  the rule above already keeps X's hint off it — but `G` is not claimed by anyone, and the two
+  possible answers differ. Here the walk from `P` stops at `C` and never reaches `G`, so `G` becomes
+  **Y's** hint: a hint means "this moves with the thing above it", and the nearest thing above `G`
+  that anybody holds is Y's. Letting X's colour reappear two levels below Y's claim would read as X
+  holding a subtree that is not theirs.
+
+  A known difference from the web client, which builds each subtree in full and filters afterwards
+  (`descendants()` in `tree.js`), so `G` there becomes **X's** hint — the hint leapfrogs Y's claim.
+  Not a contract violation on either side: descendant hints are a local rendering convention and
+  appear nowhere on the wire, so no client is wrong by it. Filed for a doc pass alongside HAM-196.
 - **An unknown node id is kept, not filtered.** A `selection` legitimately races the `spawn` that
   created its node, and nothing re-sends a dropped claim, so the claim is held and the border simply
   appears if the node arrives.
