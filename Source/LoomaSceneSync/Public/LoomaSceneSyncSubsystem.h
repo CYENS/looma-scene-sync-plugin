@@ -3,6 +3,7 @@
 #include "CoreMinimal.h"
 #include "LoomaAuthTypes.h"
 #include "LoomaGenerationTypes.h"
+#include "LoomaPresenceTypes.h"
 #include "LoomaSyncedActor.h"
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "Tickable.h"
@@ -230,6 +231,25 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FLoomaIdentityEvent, const FLoomaIde
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FLoomaSelectionEvent, const TArray<FString>&, NodeIds);
 
 /**
+ * The room moved: a client joined, left, or arrived holding a different selection.
+ * Carries the **remote** clients in roster order — never our own entry, for the
+ * reason GetClients() gives.
+ *
+ * Fires only when the roster actually differs from the one we held, the same rule
+ * OnAuthStateChanged and OnIdentityChanged follow: binding is then enough and nothing
+ * has to poll or diff defensively. The hub re-sends the whole roster on every join
+ * and every leave, so the traffic is low enough that firing unconditionally would
+ * have been affordable — the objection is not cost. It is that a delegate which fires
+ * when nothing moved teaches every consumer to diff before acting, and step 3's
+ * consumer rebuilds border geometry, which is exactly the work not worth doing twice.
+ *
+ * It DOES fire with an empty array when the socket drops, and that is not a
+ * formality: presence dies with the socket, and this event is the only thing that
+ * will ever tell a consumer to take those borders down. There is no teardown message.
+ */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FLoomaClientsEvent, const TArray<FLoomaClient>&, Clients);
+
+/**
  * Client of the LoomaXR scene-sync hub (backend /ws/scene), speaking **scene format
  * v3** — the normative contract is looma-xr-asset-demo/docs/scene-format.md.
  *
@@ -241,7 +261,8 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FLoomaSelectionEvent, const TArray<F
  * Inbound: hello -> `scene` (the whole document, on connect and on activation), then
  * `spawn` / `despawn` / `transform` / `reparent` / `patch`. Structural ops are
  * re-broadcast by the hub from its own normalised state to *every* client including
- * the sender, so all of them are applied idempotently.
+ * the sender, so all of them are applied idempotently. `clients` rides alongside as
+ * presence rather than scene state — the room roster, never merged into the document.
  *
  * Outbound: every tick, each tracked actor's parent-local transform is diffed against
  * a last-sent cache — any motion (editor/PIE gizmo, physics, sequencer, code) streams
@@ -666,6 +687,70 @@ public:
     /** Our selection changed and has been reported. See FLoomaSelectionEvent. */
     UPROPERTY(BlueprintAssignable, Category = "Looma|Selection")
     FLoomaSelectionEvent OnLocalSelectionChanged;
+
+    // --- Presence: who else is in the room (inbound `clients`) ----------------
+    //
+    // The normative contract is docs/scene-format.md, "Who else is in the room — the
+    // `clients` message". The hub gives every connected client a colour and tells
+    // everyone who is present, so a shared scene reads as shared.
+    //
+    // Three properties of that contract shape everything below. The roster is the
+    // **whole room every time**, so it is replaced wholesale and never merged: a
+    // client that has left is simply absent, and dropping it is the only thing that
+    // clears its borders, because there is no teardown message. Its **order is join
+    // order**, which step 2 uses as the tiebreak when two clients claim one node, so
+    // nothing here sorts it. And **nothing in it is ours to invent** — the colour is
+    // server-assigned, the display name server-resolved, `kind` whatever the hub said.
+    //
+    // This is presence, not scene state: never merged into the document, never saved,
+    // never sent in a `scene`, and cleared the moment the socket dies.
+
+    /**
+     * The **other** clients in the room, in roster order. Empty while disconnected.
+     *
+     * Our own entry is deliberately not in this list — GetOwnClientId() and
+     * GetClient() reach it instead. That is not tidiness: everything downstream of
+     * this list draws a border in that client's colour, and our own colour drawn on
+     * our own selection is exactly the confusion per-client colours exist to remove.
+     * Our selection already has its local highlight.
+     */
+    UFUNCTION(BlueprintPure, Category = "Looma|Presence")
+    TArray<FLoomaClient> GetClients() const;
+
+    /**
+     * Our own id in the room — the roster's `you` — or empty until a roster lands.
+     *
+     * Worth more than it looks: it is the only way this client can learn its own
+     * room name. `GET /auth/me` mints a fresh random `Guest-xxxxxx` on every call
+     * when no session is held, so that name matches nothing anybody else sees; the
+     * roster's self entry is the one place our real name appears. Feed this to
+     * GetClient() to read it.
+     */
+    UFUNCTION(BlueprintPure, Category = "Looma|Presence")
+    FString GetOwnClientId() const;
+
+    /**
+     * One client by id, ours included — the self entry is held separately from the
+     * remote list but is still findable here, so `GetClient(GetOwnClientId())` is how
+     * you read the colour and name everyone else sees for us.
+     *
+     * Note the self entry's `Selection` is the hub's copy, refreshed only on a join
+     * or a leave, so it is stale for us the moment we click something. A reader that
+     * wants our live selection wants GetLocalSelectionIds().
+     */
+    UFUNCTION(BlueprintPure, Category = "Looma|Presence")
+    bool GetClient(const FString& ClientId, FLoomaClient& OutClient) const;
+
+    /** The room moved. See FLoomaClientsEvent. */
+    UPROPERTY(BlueprintAssignable, Category = "Looma|Presence")
+    FLoomaClientsEvent OnClientsChanged;
+
+    /**
+     * Log the room one line per client — id, name, kind, role, colour and selection —
+     * with our own entry marked. Console: `Looma.Room`.
+     */
+    UFUNCTION(BlueprintCallable, Category = "Looma|Presence")
+    void LogRoom() const;
 
     // --- Connection control / diagnostics -------------------------------------
 
@@ -1092,6 +1177,22 @@ private:
      */
     void HandleSceneError(const TSharedPtr<FJsonObject>& Msg);
 
+    /** The room roster: rebuild RemoteClients / SelfClient wholesale. See the Presence block. */
+    void HandleClients(const TSharedPtr<FJsonObject>& Msg);
+
+    /**
+     * Forget the room, because presence dies with the socket.
+     *
+     * Called from every one of the three ways a socket ends — CloseSocket for a
+     * deliberate teardown, and the OnClosed / OnConnectionError handlers for a drop,
+     * which do NOT route through CloseSocket. Missing the last two is the bug worth
+     * naming: the roster would then survive the disconnection that invalidated it, and
+     * step 3 would leave a departed client's borders on screen until a reconnect that
+     * may never come. Broadcasts OnClientsChanged if the room was not already empty,
+     * which is what takes them down.
+     */
+    void ClearPresence();
+
     /**
      * `GET /scenes` once, handing the rows to OnDone — with bOk false and an empty array
      * if the list could not be read, having already said why.
@@ -1436,6 +1537,43 @@ private:
      * happens several times in an ordinary session, not once at startup.
      */
     bool bForceSelectionSend = false;
+
+    /**
+     * The room, from the last `clients` roster: everyone but us, in join order.
+     *
+     * A flat array rather than a map keyed by id, though GetClient() then has to scan
+     * it. Order is load-bearing — it is the claim tiebreak step 2 resolves conflicts
+     * with, and every client receives hub messages in the same order, so preserving it
+     * is what makes all of them agree without a byte of extra protocol. A TMap would
+     * have thrown it away for a lookup on a set whose size is a handful of people in a
+     * room.
+     *
+     * Kept next to the selection state above rather than beside the scene state,
+     * because its lifetime is the selection's, not the scene's: the scene document
+     * survives a reconnect and is re-reconciled from the hub's `scene`, while this
+     * dies with the socket outright — see ClearPresence.
+     */
+    TArray<FLoomaClient> RemoteClients;
+
+    /**
+     * Our own roster entry, held apart from RemoteClients so nothing that iterates
+     * that list can draw our colour on our own selection. Id is empty when we have no
+     * self entry — before the first roster, or if the hub sent one that does not name
+     * us at all.
+     */
+    FLoomaClient SelfClient;
+
+    /**
+     * The roster's `you`: the id the hub says is ours. Empty until a roster lands.
+     *
+     * Stored rather than assumed equal to ClientId, even though the hub echoes back
+     * the id we sent in `hello`. The message is built per recipient and `you` is how
+     * the contract says a client finds itself; deriving it from ClientId instead would
+     * mean we could never notice the two disagreeing, and a disagreement is precisely
+     * the case where we would start painting our own colour on our own selection.
+     * HandleClients cross-checks them and warns.
+     */
+    FString OwnClientId;
 
     /** jobId -> per-job event handle. Only jobs a caller asked about get one. */
     UPROPERTY()

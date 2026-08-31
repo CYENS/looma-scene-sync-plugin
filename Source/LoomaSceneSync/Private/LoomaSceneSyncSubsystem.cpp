@@ -380,6 +380,12 @@ void ULoomaSceneSyncSubsystem::CloseSocket()
     Socket->Close();
     Socket.Reset();
     bConnecting = false;
+    // The room was derived from this socket's registration in the hub's presence
+    // table, so it means nothing the moment the socket goes. Note the scene state is
+    // deliberately NOT cleared alongside it — the hub answers a fresh connection with
+    // the whole `scene`, which reconciles it, whereas nothing ever replays a roster we
+    // kept a stale copy of.
+    ClearPresence();
 }
 
 void ULoomaSceneSyncSubsystem::Connect()
@@ -421,9 +427,10 @@ void ULoomaSceneSyncSubsystem::Connect()
         Hello->SetStringField(TEXT("role"), TEXT("unreal"));
         // Suggest a roster name. With none, the hub names us `Guest-` plus the first
         // six characters of our clientId — an unreadable string in everybody else's
-        // roster, and one this client cannot even discover for itself, since inbound
-        // `clients` is not handled here and GET /auth/me mints a fresh random guest
-        // name on every call. Proposing the name is the only way we come to know it.
+        // roster. `GET /auth/me` mints a fresh random guest name on every call and so
+        // cannot report it; since HAM-159 the inbound `clients` roster can (see
+        // GetOwnClientId / GetClient), but proposing a name here is still the only way
+        // to have a readable one to read back.
         //
         // Decides anything only for a GUEST connection: identity_from_websocket
         // resolves a token first and never consults the suggestion when one resolves
@@ -485,6 +492,9 @@ void ULoomaSceneSyncSubsystem::Connect()
         bConnecting = false;
         UE_LOG(LogLoomaSync, Warning, TEXT("Connection error on %s: %s (retrying)"), *SocketUrl, *Error);
         ReconnectCooldown = ReconnectDelay;
+        // Before the disconnect event, not after: a listener that reads GetClients()
+        // from OnSyncDisconnected must see the empty room, not the one that just died.
+        ClearPresence();
         OnSyncDisconnected.Broadcast();
     });
     Socket->OnClosed().AddWeakLambda(this, [this](int32 Code, const FString& Reason, bool bWasClean) {
@@ -503,6 +513,12 @@ void ULoomaSceneSyncSubsystem::Connect()
             UE_LOG(LogLoomaSync, Warning, TEXT("Socket closed (%d %s), retrying"), Code, *Reason);
             ReconnectCooldown = ReconnectDelay;
         }
+        // Dropped here as well as in CloseSocket, and on both branches above: neither
+        // this handler nor OnConnectionError routes through CloseSocket, so without
+        // this a departed room would outlive the socket that described it for as long
+        // as the reconnect took. Before the disconnect event, not after, so a listener
+        // reading GetClients() from OnSyncDisconnected sees the empty room.
+        ClearPresence();
         OnSyncDisconnected.Broadcast();
     });
     Socket->OnMessage().AddUObject(this, &ULoomaSceneSyncSubsystem::OnRawMessage);
@@ -2581,6 +2597,10 @@ void ULoomaSceneSyncSubsystem::OnRawMessage(const FString& Text)
     {
         HandleSceneError(Msg);
     }
+    else if (Type == TEXT("clients"))
+    {
+        HandleClients(Msg);
+    }
     else
     {
         // Not an error — the hub may speak messages a newer backend added — but
@@ -3626,6 +3646,180 @@ void ULoomaSceneSyncSubsystem::DespawnSyncedActor(ALoomaSyncedActor* Actor)
     if (Actor)
     {
         Actor->Destroy(); // OnSyncedActorDestroyed broadcasts the despawn
+    }
+}
+
+// --- Presence: who else is in the room ----------------------------------------
+
+void ULoomaSceneSyncSubsystem::HandleClients(const TSharedPtr<FJsonObject>& Msg)
+{
+    const TArray<TSharedPtr<FJsonValue>>* Entries = nullptr;
+    if (!Msg->TryGetArrayField(TEXT("clients"), Entries) || !Entries)
+    {
+        return;
+    }
+
+    FString You;
+    Msg->TryGetStringField(TEXT("you"), You);
+    // Belt and braces, exactly as the web passes both `you` and its socket's own id.
+    // `you` is the contract's answer and wins where the two differ, but a hub that
+    // named someone else as us would otherwise be invisible — and its consequence is
+    // the worst one this feature has: we would treat our own entry as a remote client
+    // and paint our colour over our own selection. Cheap to notice, so notice it.
+    if (!You.IsEmpty() && You != ClientId)
+    {
+        UE_LOG(LogLoomaSync, Warning,
+            TEXT("Roster names us '%s' but our hello sent clientId '%s' — treating both as ours. ")
+            TEXT("A hub that renamed our socket would make us draw our own colour on our own selection."),
+            *You, *ClientId);
+    }
+
+    // Rebuilt wholesale, never merged. The roster is the whole room every time: a
+    // client that has left is simply absent, and dropping it here is the only thing
+    // that will ever clear its borders, because there is no teardown message.
+    // Roster order is join order and is the claim tiebreak, so nothing below sorts.
+    TArray<FLoomaClient> NextClients;
+    NextClients.Reserve(Entries->Num());
+    FLoomaClient NextSelf;
+    FString NextOwnId = You;
+
+    for (const TSharedPtr<FJsonValue>& Value : *Entries)
+    {
+        const TSharedPtr<FJsonObject>* Entry = nullptr;
+        if (!Value.IsValid() || !Value->TryGetObject(Entry) || !Entry)
+        {
+            continue;
+        }
+        FLoomaClient Client = LoomaParseClient(*Entry);
+        if (Client.Id.IsEmpty())
+        {
+            // Nobody: an entry with no id cannot be attributed, so it cannot own a
+            // border either. Verbose rather than a warning — this is a malformed hub,
+            // not a state a running room reaches.
+            UE_LOG(LogLoomaSync, Verbose, TEXT("Roster entry with no id, ignored"));
+            continue;
+        }
+        // Ours goes aside rather than into the list. See GetClients() for why this one
+        // line is the rule the whole feature rests on.
+        if (Client.Id == You || Client.Id == ClientId)
+        {
+            NextSelf = MoveTemp(Client);
+            // Where `you` was absent — an older hub, or a truncated message — our own
+            // clientId is still a usable self name, so adopt it rather than leaving
+            // GetOwnClientId() empty with a self entry sitting right there.
+            if (NextOwnId.IsEmpty())
+            {
+                NextOwnId = NextSelf.Id;
+            }
+            continue;
+        }
+        NextClients.Add(MoveTemp(Client));
+    }
+
+    const bool bSelfMoved = NextSelf != SelfClient || NextOwnId != OwnClientId;
+    const bool bRoomMoved = NextClients != RemoteClients;
+    SelfClient = MoveTemp(NextSelf);
+    OwnClientId = MoveTemp(NextOwnId);
+    RemoteClients = MoveTemp(NextClients);
+
+    // Only on an actual change — see FLoomaClientsEvent. The self half is folded into
+    // the same event rather than given one of its own: a consumer showing "the colour
+    // everyone else sees me in" has exactly one roster to read, and two events for one
+    // message would only ever fire together.
+    if (bRoomMoved || bSelfMoved)
+    {
+        OnClientsChanged.Broadcast(RemoteClients);
+    }
+}
+
+void ULoomaSceneSyncSubsystem::ClearPresence()
+{
+    const bool bHadRoom = RemoteClients.Num() > 0 || !OwnClientId.IsEmpty() || !SelfClient.Id.IsEmpty();
+    RemoteClients.Reset();
+    SelfClient = FLoomaClient();
+    OwnClientId.Reset();
+    if (bHadRoom)
+    {
+        OnClientsChanged.Broadcast(RemoteClients);
+    }
+}
+
+TArray<FLoomaClient> ULoomaSceneSyncSubsystem::GetClients() const
+{
+    return RemoteClients;
+}
+
+FString ULoomaSceneSyncSubsystem::GetOwnClientId() const
+{
+    return OwnClientId;
+}
+
+// `InClientId` rather than the header's `ClientId`, which is the Blueprint pin name:
+// the member of the same name is this socket's own id, and shadowing it here would be
+// one typo away from answering "is this us" with the wrong variable.
+bool ULoomaSceneSyncSubsystem::GetClient(const FString& InClientId, FLoomaClient& OutClient) const
+{
+    if (InClientId.IsEmpty())
+    {
+        return false;
+    }
+    // Ours first, and it is not in the array — the split is a storage decision, not an
+    // "our entry is unreachable" one.
+    if (!SelfClient.Id.IsEmpty() && SelfClient.Id == InClientId)
+    {
+        OutClient = SelfClient;
+        return true;
+    }
+    if (const FLoomaClient* Found = RemoteClients.FindByPredicate(
+            [&InClientId](const FLoomaClient& Client) { return Client.Id == InClientId; }))
+    {
+        OutClient = *Found;
+        return true;
+    }
+    return false;
+}
+
+void ULoomaSceneSyncSubsystem::LogRoom() const
+{
+    // One log call per client rather than one joined block, so the engine's line
+    // wrapping does not fold a roster of five into an unreadable paragraph.
+    auto LogClient = [](const FLoomaClient& Client, bool bIsSelf) {
+        UE_LOG(LogLoomaSync, Display, TEXT("  %s %s | %s | %s | %s | %s | selection: %s"),
+            bIsSelf ? TEXT("*") : TEXT(" "),
+            *Client.Id,
+            Client.DisplayName.IsEmpty() ? TEXT("<no name>") : *Client.DisplayName,
+            Client.Kind == ELoomaClientKind::User ? TEXT("user") : TEXT("guest"),
+            *Client.Role,
+            *Client.ColorHex,
+            Client.Selection.Num() == 0 ? TEXT("<empty>") : *FString::Join(Client.Selection, TEXT(", ")));
+    };
+
+    if (OwnClientId.IsEmpty() && RemoteClients.Num() == 0)
+    {
+        // Distinguished, because "no roster yet" and "a room with nobody else in it"
+        // look identical from an empty list and mean opposite things — the first is a
+        // socket problem, the second is simply being alone.
+        UE_LOG(LogLoomaSync, Display, TEXT("Looma room: no roster held (%s)"),
+            IsSyncConnected() ? TEXT("connected, none received yet") : TEXT("not connected"));
+        return;
+    }
+
+    UE_LOG(LogLoomaSync, Display, TEXT("Looma room: %d other client(s); our id is %s (* marks us)"),
+        RemoteClients.Num(), OwnClientId.IsEmpty() ? TEXT("<unknown>") : *OwnClientId);
+    // Ours first rather than in its roster position: the position is not kept, since
+    // nothing but the remote list needs join order.
+    if (!SelfClient.Id.IsEmpty())
+    {
+        LogClient(SelfClient, /*bIsSelf=*/true);
+    }
+    else if (!OwnClientId.IsEmpty())
+    {
+        UE_LOG(LogLoomaSync, Display,
+            TEXT("  * %s | <not in the roster the hub sent us>"), *OwnClientId);
+    }
+    for (const FLoomaClient& Client : RemoteClients)
+    {
+        LogClient(Client, /*bIsSelf=*/false);
     }
 }
 
