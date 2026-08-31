@@ -741,9 +741,62 @@ public:
     UFUNCTION(BlueprintPure, Category = "Looma|Presence")
     bool GetClient(const FString& ClientId, FLoomaClient& OutClient) const;
 
-    /** The room moved. See FLoomaClientsEvent. */
+    /**
+     * The room moved. See FLoomaClientsEvent.
+     *
+     * Also fires for an inbound `selection`, which changes no membership at all: a
+     * client's selection is part of FLoomaClient and part of its equality, so "who is
+     * here" and "what are they working on" are one question with one event. A second
+     * delegate for selections would fire in lockstep with this one on every roster —
+     * every roster carries selections — and give a consumer two ways to be told the
+     * same thing.
+     */
     UPROPERTY(BlueprintAssignable, Category = "Looma|Presence")
     FLoomaClientsEvent OnClientsChanged;
+
+    // --- The claim ledger: who gets to draw a border on a node ----------------
+    //
+    // Nothing stops two people selecting one node and **nothing is locked** — both can
+    // still edit it. This is a drawing rule only, so that one node has one border, and
+    // it is the contract's "Two clients on one node — first claim wins".
+    //
+    // The ledger is nodeId -> claimants, oldest claim first, maintained by the four
+    // rules the spec gives: append a sender for each id it did not previously hold,
+    // remove it from each id it no longer sends, remove a departed client from every
+    // list, and draw the head. Every client receives hub messages in the same order,
+    // so maintaining arrival order locally is what makes every client agree on the
+    // winner with no arbitration and no extra protocol. A real per-selection lock is
+    // planned and will replace this rule, which is why the tiebreak lives here rather
+    // than being re-decided by whatever draws.
+
+    /**
+     * Who currently wins the border on this node — the oldest live claim — or false if
+     * nobody claims it. Ours is never in the ledger, so this only ever names someone
+     * else.
+     */
+    UFUNCTION(BlueprintPure, Category = "Looma|Presence")
+    bool GetNodeBorderOwner(const FString& NodeId, FLoomaClient& OutClient) const;
+
+    /**
+     * Everyone claiming this node, oldest claim first — the head is the winner. For
+     * a UI that wants to say "and two others", which the border alone cannot.
+     */
+    UFUNCTION(BlueprintPure, Category = "Looma|Presence")
+    TArray<FString> GetNodeClaimants(const FString& NodeId) const;
+
+    /**
+     * The nodes this client both selected **and won**, in that client's selection
+     * order — one outline group's worth, which is what makes it the call a renderer
+     * wants rather than GetClient().Selection.
+     *
+     * Ids for nodes this client does not hold are included, deliberately: a selection
+     * legitimately races the spawn that created its node, filtering here would drop a
+     * claim nothing ever re-sends, and resolving an id to an actor is the caller's job
+     * anyway (FindSyncedActor). Draw nothing for an id you cannot resolve; do not
+     * treat it as an error.
+     */
+    UFUNCTION(BlueprintPure, Category = "Looma|Presence")
+    TArray<FString> GetClientBorderNodes(const FString& ClientId) const;
 
     /**
      * Log the room one line per client — id, name, kind, role, colour and selection —
@@ -751,6 +804,15 @@ public:
      */
     UFUNCTION(BlueprintCallable, Category = "Looma|Presence")
     void LogRoom() const;
+
+    /**
+     * Log the claim ledger both ways round: each claimed node with its claimants
+     * oldest-first, and each client with how much of its selection it actually wins.
+     * The two differ whenever anyone is contested, and that difference is the whole
+     * point of the tiebreak. Console: `Looma.Claims`.
+     */
+    UFUNCTION(BlueprintCallable, Category = "Looma|Presence")
+    void LogClaims() const;
 
     // --- Connection control / diagnostics -------------------------------------
 
@@ -1179,6 +1241,26 @@ private:
 
     /** The room roster: rebuild RemoteClients / SelfClient wholesale. See the Presence block. */
     void HandleClients(const TSharedPtr<FJsonObject>& Msg);
+    /** One client's whole selection, replacing what it held. See the claim-ledger block. */
+    void HandleSelection(const TSharedPtr<FJsonObject>& Msg);
+
+    // --- Claim ledger maintenance --------------------------------------------
+    // The spec's four rules, one function each, so that nothing else in the plugin
+    // decides who draws what. See the public claim-ledger block.
+
+    /** Rule 1: append a claimant to a node's list, if it is not already on it. */
+    void ClaimNode(const FString& NodeId, const FString& ClaimantId);
+    /** Rule 2: drop a claimant from a node's list, and the list itself once empty. */
+    void ReleaseNode(const FString& NodeId, const FString& ClaimantId);
+    /** Rule 3: a departed client holds nothing. The one operation that scans the ledger. */
+    void ReleaseAllClaims(const FString& ClaimantId);
+    /**
+     * Move one client from the set it held to the set it now sends: append for what is
+     * new, release what it let go, and leave everything it still holds exactly where
+     * it is. That last clause is the tiebreak — re-appending an unchanged claim would
+     * silently promote a client to the back of a queue it was already at the front of.
+     */
+    void MoveClaims(const FString& ClaimantId, const TArray<FString>& Held, const TArray<FString>& Next);
 
     /**
      * Forget the room, because presence dies with the socket.
@@ -1574,6 +1656,27 @@ private:
      * HandleClients cross-checks them and warns.
      */
     FString OwnClientId;
+
+    /**
+     * The claim ledger: nodeId -> claimants, oldest claim first. A node with no
+     * claimants has no entry at all, so a lookup miss and an empty list never both
+     * mean "unclaimed".
+     *
+     * Keyed by NODE and only by node, though step 3 needs both directions — "who owns
+     * this node" and "every node this client draws". The second direction is already
+     * held, once, as FLoomaClient::Selection: it is what the wire sends and what the
+     * roster carries, so a per-client index here would be a second copy of a fact the
+     * room already stores, kept in step by hand. The reverse mapping is therefore free
+     * (GetClientBorderNodes filters that client's own selection through this map, one
+     * O(1) lookup per id) and the price is paid in exactly one place: removing a
+     * departed client scans every list, once per roster, over the handful of nodes a
+     * room has selected. Cheap where it is rare, free where it is hot.
+     *
+     * There is deliberately no cached "owner per node" alongside it. The owner IS the
+     * head of a list — deriving it is an array index, and a maintained second copy of
+     * a one-element derivation is a thing that can disagree with its source.
+     */
+    TMap<FString, TArray<FString>> Claims;
 
     /** jobId -> per-job event handle. Only jobs a caller asked about get one. */
     UPROPERTY()

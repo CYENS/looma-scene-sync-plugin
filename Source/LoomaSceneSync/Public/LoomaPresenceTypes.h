@@ -149,6 +149,18 @@ struct FLoomaClient
 LOOMASCENESYNC_API extern const TCHAR* const LoomaFallbackClientColorHex;
 
 /**
+ * A hub-assigned colour as lowercase `#rrggbb`, or **empty** if the string is not a
+ * colour at all.
+ *
+ * Separate from LoomaParseClientColor because one caller has to tell "the hub sent no
+ * usable colour" from "the hub sent grey": a `selection` message's colour precedence
+ * is the message's, then the one the last roster gave that client, then the fallback
+ * — and collapsing invalid to grey up front would overwrite a perfectly good roster
+ * colour with it.
+ */
+LOOMASCENESYNC_API FString LoomaNormalizeClientColorHex(const FString& Wire);
+
+/**
  * Read a hub-assigned colour off the wire into both forms.
  *
  * `OutHex` is lowercase `#rrggbb`, `OutColor` its linear value. Anything that is not
