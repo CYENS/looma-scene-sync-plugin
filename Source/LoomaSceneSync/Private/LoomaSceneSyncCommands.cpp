@@ -10,7 +10,7 @@
 /**
  * The console surface, which as of HAM-239 is self-sufficient: every id and name these
  * commands accept can be discovered from the same console, with no browser tab beside
- * it. Six groups, and the shape of each is a fact about the wire rather than a choice
+ * it. Eight groups, and the shape of each is a fact about the wire rather than a choice
  * of style.
  *
  *   Looma.Status / Looma.Reconnect            what the socket is doing, and do it again
@@ -20,6 +20,8 @@
  *   Looma.Cue [index]                         where on the running order
  *   Looma.Scenes / Looma.Performances         what there is to name in the three above
  *   Looma.Select / Deselect / Selection       what this client has selected
+ *   Looma.Room                                who else is in the room, and what
+ *                                             each of them holds
  *
  * The one distinction worth carrying into all of them: changing SCENE is a message and
  * changing PERFORMANCE is a reconnect, because a socket's performance is fixed at
@@ -613,5 +615,29 @@ FAutoConsoleCommandWithWorldAndArgs GLoomaSelectionCommand(
         // selection is a real state with a real message behind it, not an absence.
         UE_LOG(LogLoomaSync, Display, TEXT("Local selection: %s"),
             Ids.Num() == 0 ? TEXT("<empty>") : *FString::Join(Ids, TEXT(", ")));
+    }));
+
+/**
+ * `Looma.Room` — the other half of `Looma.Selection`: what everyone *else* has, from
+ * the hub's `clients` roster.
+ *
+ * Also the only way this client can read its own room name. `Looma.Whoami` cannot
+ * answer that for a guest — `GET /auth/me` mints a fresh random `Guest-xxxxxx` per
+ * call — so the self entry here, marked with a `*`, is the one place the name other
+ * people see for us appears.
+ */
+FAutoConsoleCommandWithWorldAndArgs GLoomaRoomCommand(
+    TEXT("Looma.Room"),
+    TEXT("Log who else is in the room from the hub's roster: id, name, kind, role, colour and ")
+    TEXT("selection, with this client's own entry marked."),
+    FConsoleCommandWithWorldAndArgsDelegate::CreateStatic([](const TArray<FString>& Args, UWorld* World) {
+        ULoomaSceneSyncSubsystem* Subsystem = FindLoomaSubsystem(World);
+        if (!Subsystem)
+        {
+            UE_LOG(LogLoomaSync, Warning,
+                TEXT("Looma.Room: Looma Scene Sync is not running (no game instance)."));
+            return;
+        }
+        Subsystem->LogRoom();
     }));
 } // namespace
