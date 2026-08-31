@@ -112,6 +112,29 @@ public:
     UPROPERTY(EditAnywhere, Config, Category = "Identity", meta = (DisplayName = "Guest Display Name"))
     FString GuestDisplayName;
 
+    /**
+     * The Material Parameter Collection this plugin writes remote clients' border
+     * colours into — `LoomaClient1` … `LoomaClient8` (vectors) and `LoomaClientCount`
+     * (scalar). Empty by default, and the feature draws nothing until it is set.
+     *
+     * **The collection has to live in your project, not in this plugin, and that is a
+     * hard constraint rather than a preference.** An MPC is a `.uasset`, and
+     * `LoomaSceneSync.uplugin` declares `"CanContainContent": false` — the plugin can
+     * ship code and nothing else — so there is no collection here to point at. A soft
+     * path is what lets the plugin write into an object it cannot own; the alternative
+     * considered was to publish the colours to Blueprint only and let each project
+     * wire an event graph, which is still available (`Get Remote Border Groups`) but
+     * makes the common case a thing every project has to reimplement, and reimplement
+     * correctly, before any border appears at all.
+     *
+     * Soft rather than hard so an unset or deleted collection costs a log line rather
+     * than a failed package load, and so nothing is loaded in a build that never
+     * draws borders. See the README's *Wiring the outline*.
+     */
+    UPROPERTY(EditAnywhere, Config, Category = "Rendering",
+        meta = (DisplayName = "Remote Selection Parameter Collection", AllowedClasses = "/Script/Engine.MaterialParameterCollection"))
+    FSoftObjectPath RemoteSelectionCollection;
+
     // --- UObject ---
     virtual void PostInitProperties() override;
 #if WITH_EDITOR

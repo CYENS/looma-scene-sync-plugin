@@ -14,6 +14,8 @@ class IHttpRequest;
 class FJsonObject;
 class FJsonValue;
 class ULoomaGenerationHandle;
+class UMaterialParameterCollection;
+class UPrimitiveComponent;
 
 /**
  * The performance — the workspace — this socket is in, as the `scene` frame reports it
@@ -798,6 +800,51 @@ public:
     UFUNCTION(BlueprintPure, Category = "Looma|Presence")
     TArray<FString> GetClientBorderNodes(const FString& ClientId) const;
 
+    // --- Drawing the borders (custom depth stencil) ---------------------------
+    //
+    // The plugin does not draw. It marks: it sets `CustomDepthStencilValue` on the
+    // primitives whose borders this client should show, and publishes the per-client
+    // colours, leaving a consumer project's post-process material to turn the two into
+    // an outline. That split is forced — `"CanContainContent": false` means the plugin
+    // can ship no material and no parameter collection — and it is also the right
+    // shape: a project that already has an outline material wires this in without
+    // adopting a second one. The README's *Wiring the outline* is the whole recipe.
+    //
+    // The weighting mirrors the web client (frontend/src/scene/Scene.jsx): thick on
+    // the claimed node, thinner on everything under it, in the owner's colour. Two
+    // subtractions come before it, both from `remoteBorders` in presence.js. Our own
+    // selection is removed from remote borders first, own and child alike — on our
+    // screen ours always wins, so a remote claim can never make us lose track of what
+    // we hold. And a node someone claimed outright never doubles as another client's
+    // descendant hint, the same precedence a selection has over a child hint locally,
+    // so one node keeps one border however many claimed subtrees it sits under.
+    //
+    // This plugin does NOT drive a stencil for the local selection. That is HAM-188's
+    // half and a consumer's own business — its visuals never change when the room
+    // does, which is the point.
+
+    /**
+     * What to draw, one entry per remote client that holds a border, in roster order.
+     *
+     * For a consumer driving its own material instead of the parameter collection.
+     * Recomputed when the room, the local selection or the scene moves — bind
+     * `On Clients Changed` and re-read, or just read it each frame; it is a cached
+     * array, not a computation.
+     */
+    UFUNCTION(BlueprintPure, Category = "Looma|Presence")
+    TArray<FLoomaBorderGroup> GetRemoteBorderGroups() const;
+
+    /**
+     * Clients holding a border that there was no stencil slot left to draw.
+     *
+     * Never empty silently: a room bigger than LoomaRemoteBorderSlots is a real state,
+     * and a client that is present, working and invisible is indistinguishable from an
+     * empty room unless something says so. Show these in a HUD, the way the web names
+     * them in its room panel; the plugin also logs the list once each time it changes.
+     */
+    UFUNCTION(BlueprintPure, Category = "Looma|Presence")
+    TArray<FString> GetUndrawnClients() const;
+
     /**
      * Log the room one line per client — id, name, kind, role, colour and selection —
      * with our own entry marked. Console: `Looma.Room`.
@@ -1262,6 +1309,29 @@ private:
      */
     void MoveClaims(const FString& ClaimantId, const TArray<FString>& Held, const TArray<FString>& Next);
 
+    // --- Border rendering ------------------------------------------------------
+
+    /**
+     * The room, the local selection or the scene moved, so the borders need working
+     * out again. A flag rather than an immediate recompute: a roster arriving while
+     * four nodes spawn is one redraw, not five, and the two events that dirty this
+     * most often — a `selection` and a local selection change — can both land in the
+     * same frame.
+     */
+    void MarkBordersDirty() { bBordersDirty = true; }
+
+    /** Recompute BorderGroups and push them to the stencil and the collection, if dirty. */
+    void TickBorders();
+
+    /** Work out who draws what, apply it, and name anyone the budget left out. */
+    void RefreshRemoteBorders();
+
+    /** Write one group's stencil value onto a node's primitives; slot 0 clears. */
+    void ApplyStencilToNode(const FString& NodeId, int32 StencilValue, TSet<TWeakObjectPtr<UPrimitiveComponent>>& OutTouched);
+
+    /** Publish the slot colours to the configured Material Parameter Collection. */
+    void PublishBorderColors();
+
     /**
      * Forget the room, because presence dies with the socket.
      *
@@ -1677,6 +1747,40 @@ private:
      * a one-element derivation is a thing that can disagree with its source.
      */
     TMap<FString, TArray<FString>> Claims;
+
+    /** What the last recompute decided to draw, in roster order. See GetRemoteBorderGroups. */
+    TArray<FLoomaBorderGroup> BorderGroups;
+
+    /** Clients that hold a border and did not get a slot. See GetUndrawnClients. */
+    TArray<FString> UndrawnClientIds;
+
+    /**
+     * Every primitive we currently have a non-zero stencil value on.
+     *
+     * Held weakly and kept explicitly, because clearing is the half that goes wrong:
+     * a node that loses its border has to be restored to
+     * `SetRenderCustomDepth(false)`, and without this the only way to find it would be
+     * to sweep every actor in the world — which would also stamp on a stencil value
+     * the consumer project set for its own reasons. Weak, so an actor destroyed while
+     * claimed simply drops out; nothing here ever dereferences a stale pointer, and
+     * the ledger itself holds node ids rather than pointers.
+     */
+    TSet<TWeakObjectPtr<UPrimitiveComponent>> StencilComponents;
+
+    /** The collection resolved from the setting, held so it is not collected under us. */
+    UPROPERTY()
+    TObjectPtr<UMaterialParameterCollection> ResolvedBorderCollection;
+
+    /** Set by MarkBordersDirty, spent by TickBorders. */
+    bool bBordersDirty = false;
+
+    /**
+     * One-shot latches for the two diagnostics that would otherwise print every frame.
+     * Both reset when the condition clears, so a fixed setting says so once and a
+     * regression is reported again rather than swallowed.
+     */
+    bool bWarnedNoBorderCollection = false;
+    bool bWarnedCustomDepthOff = false;
 
     /** jobId -> per-job event handle. Only jobs a caller asked about get one. */
     UPROPERTY()
