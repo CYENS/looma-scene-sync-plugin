@@ -161,7 +161,13 @@ FAutoConsoleCommandWithWorldAndArgs GLoomaWhoamiCommand(
         }
     }));
 /**
- * `Looma.Scene [sceneId]` — which saved scene this client is on, and how to move it.
+ * `Looma.Scene [sceneId | "name"]` — which saved scene this client is on, and how to
+ * move it.
+ *
+ * An argument may be either the scene's id or its name; the name is resolved against
+ * `GET /scenes` before anything is sent, so an unquoted multi-word name is rejoined
+ * here and a miss is answered with the catalogue rather than a bare refusal from the
+ * hub. See OpenSceneByNameOrId for why every open now costs that lookup.
  *
  * With an id it sends `openScene`, which subscribes THIS client and moves nobody else
  * in the room (docs/scene-format.md, "Choosing a scene (HAM-185)"). Note the asymmetry
@@ -179,20 +185,9 @@ FAutoConsoleCommandWithWorldAndArgs GLoomaWhoamiCommand(
  */
 FAutoConsoleCommandWithWorldAndArgs GLoomaSceneCommand(
     TEXT("Looma.Scene"),
-    TEXT("Open a saved scene for this client: Looma.Scene <sceneId>. With no arguments, log the ")
-    TEXT("active scene's id and name."),
+    TEXT("Open a saved scene for this client by id or by name: Looma.Scene <sceneId> | ")
+    TEXT("Looma.Scene \"<name>\". With no arguments, log the active scene's id and name."),
     FConsoleCommandWithWorldAndArgsDelegate::CreateStatic([](const TArray<FString>& Args, UWorld* World) {
-        // One id, or none. A scene id is a slug and cannot contain a space
-        // (`_slugify_scene`, backend/app/scenes.py), so a second argument is a typo
-        // rather than a value that needed quoting — the same reasoning as
-        // `Looma.Login`'s argument count, and the opposite of `Looma.Select`, where a
-        // list of ids is the whole point.
-        if (Args.Num() > 1)
-        {
-            UE_LOG(LogLoomaSync, Display,
-                TEXT("Usage: Looma.Scene <sceneId>  (with no arguments, reports the active scene)"));
-            return;
-        }
         ULoomaSceneSyncSubsystem* Subsystem = FindLoomaSubsystem(World);
         if (!Subsystem)
         {
@@ -214,11 +209,27 @@ FAutoConsoleCommandWithWorldAndArgs GLoomaSceneCommand(
                 TEXT("`Looma.Reconnect` to retry now, then type this again."));
             return;
         }
-        Subsystem->OpenScene(Args[0]);
-        // Nothing is printed here about the outcome, because none is known yet: what
-        // happened arrives as a `scene` frame ("Scene 'x': N node(s) applied") or as a
-        // refusal from HandleSceneError. A cheerful line at this point would be the one
-        // entry in the log that cannot be trusted.
+        // JOINED, not refused. `Looma.Scene "Costume Test"` already arrives as one
+        // argument — the console's tokenizer consumes a quoted run and strips the quotes
+        // — so the multi-argument case is somebody who did not quote, which on this
+        // backend is every scene there is: `_slugify_scene` puts the hyphens in the id
+        // and leaves the spaces in the name, so refusing would be refusing the ordinary
+        // case in order to teach a convention. Rejoining with single spaces reconstructs
+        // anything the console's whitespace collapsing did not destroy, and a stray
+        // extra token merely makes the lookup miss — which answers with the catalogue
+        // and the quoting hint anyway, so the lesson still gets taught, by the path that
+        // also works. The quoted form remains the exact one, for a name with runs of
+        // spaces that this cannot rebuild.
+        //
+        // Which is why there is no arity check any more: with a join, every argument
+        // count from one upwards is a legal lookup, and a usage line would be refusing
+        // input this understands.
+        Subsystem->OpenSceneByNameOrId(FString::Join(Args, TEXT(" ")));
+        // Nothing is printed here about the outcome, because none is known yet: the
+        // resolver says what it matched, and what actually happened then arrives as a
+        // `scene` frame ("Scene 'x': N node(s) applied") or as a refusal from
+        // HandleSceneError. A cheerful line at this point would be the one entry in the
+        // log that cannot be trusted.
     }));
 
 /**
