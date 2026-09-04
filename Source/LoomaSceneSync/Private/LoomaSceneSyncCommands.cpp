@@ -8,15 +8,24 @@
 #include "LoomaSyncedActor.h"
 
 /**
- * `Looma.Reconnect` / `Looma.Status` — the two things you want from a console when the
- * viewer shows an empty scene, in the editor console, in PIE, or in a packaged build —
- * plus `Looma.Login` / `Looma.Logout` / `Looma.Whoami` for the auth surface and
- * `Looma.Scene` / `Looma.Performance` for which scene this client is looking at, and
- * which workspace it is looking at it in — the second of which is also the one command
- * that can move it, since a performance switch is a reconnect rather than a message —
- * with `Looma.Scenes` / `Looma.Performances` printing every id and name those two will
- * accept, so the console needs no browser tab beside it — and `Looma.Cue` stepping along
- * the running order, which is the one of these that moves a show rather than a client.
+ * The console surface, which as of HAM-239 is self-sufficient: every id and name these
+ * commands accept can be discovered from the same console, with no browser tab beside
+ * it. Six groups, and the shape of each is a fact about the wire rather than a choice
+ * of style.
+ *
+ *   Looma.Status / Looma.Reconnect            what the socket is doing, and do it again
+ *   Looma.Login / Logout / Whoami             the auth surface
+ *   Looma.Scene [id | "name"]                 where this client is looking; a MESSAGE
+ *   Looma.Performance [id [cue]]              which workspace; a RECONNECT
+ *   Looma.Cue [index]                         where on the running order
+ *   Looma.Scenes / Looma.Performances         what there is to name in the three above
+ *   Looma.Select / Deselect / Selection       what this client has selected
+ *
+ * The one distinction worth carrying into all of them: changing SCENE is a message and
+ * changing PERFORMANCE is a reconnect, because a socket's performance is fixed at
+ * `hello` and never changes for its life. Everything else — why `Looma.Scene` refuses
+ * while disconnected and `Looma.Performance` does not, why a cue is an `openScene` and
+ * not a rejoin, why a two-argument switch has to park its cue — follows from that.
  *
  * The subsystem is per-GameInstance while a console command is global, so each command
  * resolves the subsystem when it runs: from the world the console handed us, else from
@@ -295,8 +304,8 @@ FAutoConsoleCommandWithWorldAndArgs GLoomaScenesCommand(
     }));
 
 /**
- * `Looma.Performance [performance-id]` — which workspace this socket is in, and how to
- * move it.
+ * `Looma.Performance [performance-id [cue-index]]` — which workspace this socket is in,
+ * how to move it, and how to land somewhere particular on arrival.
  *
  * With an id it RECONNECTS, and there is no gentler option: a socket's performance is
  * chosen once, from the `hello`, and never changes for the life of that connection
@@ -305,6 +314,12 @@ FAutoConsoleCommandWithWorldAndArgs GLoomaScenesCommand(
  * does NOT test IsSyncConnected() first the way that one does. A switch typed while the
  * socket is down is not lost, it is the whole repair: it records the intent and starts
  * the connection that carries it.
+ *
+ * With an id AND an index it does both, in the only order that works: the cue is parked
+ * and fired when the new socket is confirmed in a performance, because the socket that
+ * must carry the `openScene` does not exist yet and a send before it opens is dropped
+ * without trace. See SwitchPerformanceToCue for what drops a parked cue and why landing
+ * somewhere unasked-for is one of those things.
  *
  * With no arguments it reports, and reports the pending switch first when there is one.
  * That order is not cosmetic — during a switch the "current" performance is the room
@@ -321,13 +336,14 @@ FAutoConsoleCommandWithWorldAndArgs GLoomaPerformanceCommand(
     TEXT("Switch this client to a performance: Looma.Performance <performance-id> (a reconnect). ")
     TEXT("With no arguments, log the performance this client is in."),
     FConsoleCommandWithWorldAndArgsDelegate::CreateStatic([](const TArray<FString>& Args, UWorld* World) {
-        // One id or none, like `Looma.Scene` and for the same reason: an id is a slug on
-        // the wire and a second argument is a typo, not a value that needed quoting.
-        if (Args.Num() > 1)
+        // An id, an id and a cue index, or neither. Never a name to rejoin: unlike
+        // `Looma.Scene`, both arguments here are slugs and numbers, so a third token is
+        // a typo rather than a value that needed quoting.
+        if (Args.Num() > 2)
         {
             UE_LOG(LogLoomaSync, Display,
-                TEXT("Usage: Looma.Performance <performance-id>  (with no arguments, reports the ")
-                TEXT("current performance)"));
+                TEXT("Usage: Looma.Performance [<performance-id> [<cue-index>]]  (with no ")
+                TEXT("arguments, reports the current performance)"));
             return;
         }
         ULoomaSceneSyncSubsystem* Subsystem = FindLoomaSubsystem(World);
@@ -336,13 +352,31 @@ FAutoConsoleCommandWithWorldAndArgs GLoomaPerformanceCommand(
             LogNoSubsystem(TEXT("Looma.Performance"));
             return;
         }
-        if (Args.Num() == 1)
+        if (Args.Num() >= 1)
         {
             // No local check on the id, and no connectivity check either. The hub owns
             // both questions: it re-resolves identity and re-runs the visibility gate,
             // and it answers a refusal with a bare 4403/4404 close that stops the retry
             // loop and explains itself. Nothing said from here could improve on that.
-            Subsystem->SwitchPerformance(Args[0]);
+            if (Args.Num() == 1)
+            {
+                Subsystem->SwitchPerformance(Args[0]);
+                return;
+            }
+            int32 CueIndex = 0;
+            if (!ParseIndexArgument(Args[1], CueIndex))
+            {
+                // Checked before the switch, so a mistyped cue number costs nobody a
+                // reconnect. The same strict parse `Looma.Cue` uses, and for the same
+                // reason: Atoi reads anything it cannot parse as 0, which here would
+                // switch performance AND open the opening cue of it.
+                UE_LOG(LogLoomaSync, Warning,
+                    TEXT("Looma.Performance: '%s' is not a cue number, so nothing was switched. ")
+                    TEXT("Usage: Looma.Performance <performance-id> <cue-index>, 0-based."),
+                    *Args[1]);
+                return;
+            }
+            Subsystem->SwitchPerformanceToCue(Args[0], CueIndex);
             return;
         }
         const FString Pending = Subsystem->GetPendingPerformanceId();
