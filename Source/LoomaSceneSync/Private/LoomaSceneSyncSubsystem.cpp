@@ -570,6 +570,18 @@ void ULoomaSceneSyncSubsystem::LogActiveScene()
     Request->ProcessRequest();
 }
 
+// --- Which performance this client is in -------------------------------------
+
+FLoomaPerformance ULoomaSceneSyncSubsystem::GetActivePerformance() const
+{
+    return ActivePerformance;
+}
+
+FString ULoomaSceneSyncSubsystem::GetActivePerformanceId() const
+{
+    return ActivePerformance.Id;
+}
+
 // --- Connection control / diagnostics ----------------------------------------
 
 void ULoomaSceneSyncSubsystem::Reconnect()
@@ -694,12 +706,21 @@ FString ULoomaSceneSyncSubsystem::GetConnectionStatusText() const
     // reconnect lands, and the useful answer is where we are actually pointed.
     const FString HubUrl = SocketUrl.IsEmpty() ? GetSceneSyncUrl() : SocketUrl;
     const FString RestBase = GetRestBase();
-    return FString::Printf(TEXT("%s | hub %s | rest %s | auth %s | %d node(s), scene %s | %d job(s)"),
+    // The performance as its ID and not its name: this is a diagnostic, the id is the
+    // key the hub, the REST paths and every other client agree on, and the name is the
+    // one field of it that can legitimately be missing. `Looma.Performance` prints both.
+    //
+    // The two placeholders differ on purpose. `<unsaved>` is a scene the hub really has
+    // us on that has never been saved; `<unknown>` is the absence of an answer, since
+    // there is no performance the hub can put us in without naming its id.
+    return FString::Printf(
+        TEXT("%s | hub %s | rest %s | auth %s | %d node(s), performance %s, scene %s | %d job(s)"),
         *State,
         *HubUrl,
         *RestBase,
         AuthStateText(AuthState),
         Tracked.Num(),
+        ActivePerformance.Id.IsEmpty() ? TEXT("<unknown>") : *ActivePerformance.Id,
         ActiveSceneId.IsEmpty() ? TEXT("<unsaved>") : *ActiveSceneId,
         Jobs.Num());
 }
@@ -1580,12 +1601,44 @@ void ULoomaSceneSyncSubsystem::HandleScene(const TSharedPtr<FJsonObject>& Msg)
     const TArray<TSharedPtr<FJsonValue>>* Nodes = nullptr;
     if (!Msg->TryGetArrayField(TEXT("nodes"), Nodes) || !Nodes)
     {
+        // Nothing is read before this guard, including the performance, and that is the
+        // consistent answer rather than an oversight: a frame with no `nodes` is not a
+        // scene frame we can act on, so it is refused WHOLE. `sceneId` and the
+        // performance then keep their previous values together, which is the only pair
+        // of states that stays coherent — adopting a workspace off a frame whose
+        // document we had just declined would leave us reporting a room we refused to
+        // enter. They go stale together and the next real frame replaces both. It
+        // should not fire at all: `scene_message` always builds `nodes`
+        // (backend/app/sync.py), so this catches a truncated or foreign frame.
         return;
     }
     // `sceneId` is null for an unsaved working scene, and TryGet leaves the old value
     // in place on a null — so clear it first.
     ActiveSceneId.Reset();
     Msg->TryGetStringField(TEXT("sceneId"), ActiveSceneId);
+
+    // The workspace, read beside `sceneId` because it is the same statement made at the
+    // same moment, and because this frame is the ONLY carrier of it — no other message
+    // names the performance, so what is not taken here is not had at all.
+    //
+    // REPLACED WHOLE, cleared first, like `sceneId` and for a sharper reason. A null
+    // `name` beside a valid `id` is a statement rather than a gap: `_performance_info`
+    // reads `db.get_performance(id) or {}`, so it means the row has been deleted out
+    // from under this socket. The alternative — clear only what the frame omits, and so
+    // keep the last name we knew — would print a plausible name for a workspace that no
+    // longer exists, which is the exact class of silent disagreement this object was put
+    // on the wire to prevent, not a smaller version of it. The id survives the deletion
+    // and stays the truth about where we are, so (id, no name) is precisely the state
+    // worth holding. A frame carrying no `performance` at all leaves the whole thing
+    // empty, which reads as "not told" — the honest answer for a frame that did not.
+    ActivePerformance = FLoomaPerformance();
+    const TSharedPtr<FJsonObject>* Performance = nullptr;
+    if (Msg->TryGetObjectField(TEXT("performance"), Performance) && Performance && Performance->IsValid())
+    {
+        (*Performance)->TryGetStringField(TEXT("id"), ActivePerformance.Id);
+        (*Performance)->TryGetStringField(TEXT("name"), ActivePerformance.Name);
+        (*Performance)->TryGetStringField(TEXT("visibility"), ActivePerformance.Visibility);
+    }
 
     // The hub owns the live scene: this is the whole document, sent on connect and
     // whenever someone activates or clears a scene. So it *replaces* what we hold
