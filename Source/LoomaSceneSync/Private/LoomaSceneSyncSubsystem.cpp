@@ -102,6 +102,16 @@ bool IsTerminalCloseCode(int32 Code)
  */
 constexpr int32 MaxScenesToName = 20;
 
+/**
+ * Pad to a column width, for the listing commands. Ids run from `default` to
+ * `demo-walk-in-kiosk-draft`, and a ragged left column is what turns a list somebody
+ * asked for into one they have to read twice.
+ */
+FString Pad(const FString& Text, int32 Width)
+{
+    return Text.Len() >= Width ? Text : Text + FString::ChrN(Width - Text.Len(), TEXT(' '));
+}
+
 /** "id ('Name')" per scene, capped — for the messages that have to show the candidates. */
 FString DescribeScenes(const TArray<FLoomaSceneSummary>& Scenes)
 {
@@ -615,6 +625,94 @@ void ULoomaSceneSyncSubsystem::LogActiveScene()
     });
 }
 
+void ULoomaSceneSyncSubsystem::LogScenes()
+{
+    // Read before the fetch goes out, for the same reason LogActiveScene captures it:
+    // the answer describes the catalogue as it was asked for, and a `scene` frame may
+    // land while it is in flight.
+    const FString Active = ActiveSceneId;
+    FetchScenes([Active](bool bOk, const TArray<FLoomaSceneSummary>& Scenes) {
+        if (!bOk)
+        {
+            // FetchScenes has already said what failed and where; this says what it
+            // cost, which for this command is everything it was asked to do.
+            UE_LOG(LogLoomaSync, Warning, TEXT("...so there is no scene list to show."));
+            return;
+        }
+        if (Scenes.Num() == 0)
+        {
+            // Not an empty printout with a zero on it: the list is filtered per
+            // identity, so "none" is a fact about who the backend thinks we are, and
+            // that is the thing worth pointing at.
+            UE_LOG(LogLoomaSync, Display,
+                TEXT("No scenes are offered to this identity. `Looma.Whoami` says who the backend ")
+                TEXT("thinks we are."));
+            return;
+        }
+        int32 Width = 0;
+        for (const FLoomaSceneSummary& Row : Scenes)
+        {
+            Width = FMath::Max(Width, Row.Id.Len());
+        }
+        UE_LOG(LogLoomaSync, Display, TEXT("%d scene(s) this identity may open:"), Scenes.Num());
+        bool bMarkedActive = false;
+        for (const FLoomaSceneSummary& Row : Scenes)
+        {
+            const bool bIsActive = !Active.IsEmpty() && Row.Id == Active;
+            bMarkedActive = bMarkedActive || bIsActive;
+            UE_LOG(LogLoomaSync, Display, TEXT("%s %s  '%s'%s"),
+                bIsActive ? TEXT("*") : TEXT(" "),
+                *Pad(Row.Id, Width),
+                Row.Name.IsEmpty() ? TEXT("<no name>") : *Row.Name,
+                bIsActive ? TEXT("   (active)") : TEXT(""));
+        }
+        if (Active.IsEmpty())
+        {
+            // Nothing marked is a state, not an omission, and the two states behind it
+            // are not this command's to explain — `Looma.Scene` already separates "the
+            // working scene has never been saved" from "no frame has arrived", and
+            // saying it twice is how the two copies come to disagree.
+            UE_LOG(LogLoomaSync, Display,
+                TEXT("None is marked active: no saved scene is open. `Looma.Scene` with no ")
+                TEXT("arguments says which of the two reasons applies."));
+        }
+        else if (!bMarkedActive)
+        {
+            UE_LOG(LogLoomaSync, Warning,
+                TEXT("The active scene '%s' is not in this list, so the socket resolved us as one ")
+                TEXT("identity and this request as another — the subscription is real, the list is ")
+                TEXT("simply filtered for somebody else."),
+                *Active);
+        }
+    });
+}
+
+TSharedRef<IHttpRequest, ESPMode::ThreadSafe> ULoomaSceneSyncSubsystem::MakeCatalogueRequest(
+    const FString& Url) const
+{
+    const TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Request = FHttpModule::Get().CreateRequest();
+    Request->SetURL(Url);
+    Request->SetVerb(TEXT("GET"));
+    // The interactive budget: a person typed a command and is watching the log, and
+    // would rather hear "no" quickly than "yes" eventually.
+    Request->SetTimeout(InteractiveRequestTimeout);
+    ApplyAuthHeader(Request); // after SetURL, as it requires
+    // Wider than ApplyClientIdHeader's stated "asset-creating requests" scope, and
+    // deliberately so: `X-Client-Id` is what anchors a GUEST to one subject across
+    // calls, so without it a guest's own private rows are missing from the list a
+    // catalogue route returns — which makes them unopenable by name and unfindable in a
+    // listing, not merely unnamed. The contract asks for it here by name — "Send the
+    // header — the web client does, on every `/scenes` call" (docs/scene-format.md), and
+    // `/performances` resolves a guest through the identical `subject_key`. It still
+    // proves nothing: a resolved session always wins over it.
+    //
+    // Both headers fail SILENTLY when they are wrong — a missing bearer or a missing
+    // anchor returns a shorter list, not an error — which is the whole reason this is
+    // one function rather than a shape each route repeats.
+    ApplyClientIdHeader(Request);
+    return Request;
+}
+
 void ULoomaSceneSyncSubsystem::FetchScenes(
     TFunction<void(bool bOk, const TArray<FLoomaSceneSummary>& Scenes)> OnDone)
 {
@@ -631,22 +729,7 @@ void ULoomaSceneSyncSubsystem::FetchScenes(
     // It is also the only route that can answer "which scenes are there at all", which
     // is what makes one fetch serve a name lookup, an id lookup and a listing.
     const FString ListUrl = GetRestBase() + TEXT("/scenes");
-    const TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Request = FHttpModule::Get().CreateRequest();
-    Request->SetURL(ListUrl);
-    Request->SetVerb(TEXT("GET"));
-    // The interactive budget: a person typed a command and is watching the log, and
-    // would rather hear "no" quickly than "yes" eventually.
-    Request->SetTimeout(InteractiveRequestTimeout);
-    ApplyAuthHeader(Request); // after SetURL, as it requires
-    // Wider than ApplyClientIdHeader's stated "asset-creating requests" scope, and
-    // deliberately so: `X-Client-Id` is what anchors a GUEST to one subject across
-    // calls, so without it a guest's own private scenes are missing from the list this
-    // route returns — which would make them unopenable by name and unfindable in a
-    // listing, not merely unnamed. The contract asks for it here by name — "Send the
-    // header — the web client does, on every `/scenes` call" (docs/scene-format.md). It
-    // still proves nothing: a resolved session always wins over it.
-    ApplyClientIdHeader(Request);
-
+    const TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Request = MakeCatalogueRequest(ListUrl);
     Request->OnProcessRequestComplete().BindWeakLambda(this,
         [ListUrl, OnDone](FHttpRequestPtr Req, FHttpResponsePtr Resp, bool bOk) {
             // Named here, once, rather than in each caller: the URL and the status code
@@ -816,9 +899,9 @@ void ULoomaSceneSyncSubsystem::OpenSceneByNameOrId(const FString& NameOrId)
         // The whole point of resolving client-side: the miss is answered with the
         // candidates in hand, where the hub's `sceneError` can only say no.
         UE_LOG(LogLoomaSync, Warning,
-            TEXT("No scene has the id or the name '%s'. %d offered to this identity: %s. A name ")
-            TEXT("with spaces can be quoted — Looma.Scene \"Costume Test\" — though it does not ")
-            TEXT("have to be."),
+            TEXT("No scene has the id or the name '%s'. %d offered to this identity: %s. ")
+            TEXT("`Looma.Scenes` lists them all, one per line and untruncated. A name with spaces ")
+            TEXT("can be quoted — Looma.Scene \"Costume Test\" — though it does not have to be."),
             *Wanted, Scenes.Num(), *DescribeScenes(Scenes));
     });
 }
@@ -838,6 +921,164 @@ FString ULoomaSceneSyncSubsystem::GetActivePerformanceId() const
 FString ULoomaSceneSyncSubsystem::GetPendingPerformanceId() const
 {
     return bAwaitingPerformanceConfirmation ? SentPerformanceId : FString();
+}
+
+void ULoomaSceneSyncSubsystem::FetchPerformances(
+    TFunction<void(bool bOk, const TArray<FLoomaPerformanceSummary>& Performances)> OnDone)
+{
+    const FString ListUrl = GetRestBase() + TEXT("/performances");
+    const TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Request = MakeCatalogueRequest(ListUrl);
+    Request->OnProcessRequestComplete().BindWeakLambda(this,
+        [ListUrl, OnDone](FHttpRequestPtr Req, FHttpResponsePtr Resp, bool bOk) {
+            TArray<FLoomaPerformanceSummary> Performances;
+            if (!bOk || !Resp.IsValid() || Resp->GetResponseCode() >= 300)
+            {
+                UE_LOG(LogLoomaSync, Warning, TEXT("Could not read the performance list from %s (%d)"),
+                    *ListUrl, Resp.IsValid() ? Resp->GetResponseCode() : 0);
+                OnDone(false, Performances);
+                return;
+            }
+            // AN OBJECT WRAPPING AN ARRAY, unlike `/scenes`, which answers with a bare
+            // array. Worth stating rather than inferring from the code below: the two
+            // catalogue routes really do differ here, so a reader who assumes the
+            // symmetry the rest of this pair has will write the wrong parse.
+            TSharedPtr<FJsonObject> Envelope;
+            const TSharedRef<TJsonReader<TCHAR>> Reader =
+                TJsonReaderFactory<TCHAR>::Create(Resp->GetContentAsString());
+            const TArray<TSharedPtr<FJsonValue>>* Rows = nullptr;
+            if (!FJsonSerializer::Deserialize(Reader, Envelope) || !Envelope.IsValid()
+                || !Envelope->TryGetArrayField(TEXT("performances"), Rows) || !Rows)
+            {
+                UE_LOG(LogLoomaSync, Warning,
+                    TEXT("%s answered 200 but not with a performance list"), *ListUrl);
+                OnDone(false, Performances);
+                return;
+            }
+            Performances.Reserve(Rows->Num());
+            for (const TSharedPtr<FJsonValue>& Row : *Rows)
+            {
+                const TSharedPtr<FJsonObject> Entry = Row.IsValid() ? Row->AsObject() : nullptr;
+                FLoomaPerformanceSummary Summary;
+                // Same rule as the scene rows: no id, no row. An id is the only thing a
+                // performance can be switched to by, so one without it is a listing
+                // entry that could only ever be looked at.
+                if (!Entry.IsValid() || !Entry->TryGetStringField(TEXT("id"), Summary.Id)
+                    || Summary.Id.IsEmpty())
+                {
+                    continue;
+                }
+                // Both nullable, and left empty rather than defaulted. `owner_name` is
+                // null for an unowned row and `name` can be too; inventing "Untitled"
+                // here would put a word on screen the backend never said.
+                Entry->TryGetStringField(TEXT("name"), Summary.Name);
+                Entry->TryGetStringField(TEXT("role"), Summary.Role);
+                Performances.Add(MoveTemp(Summary));
+            }
+            OnDone(true, Performances);
+        });
+    Request->ProcessRequest();
+}
+
+void ULoomaSceneSyncSubsystem::LogPerformances()
+{
+    // Both read before the fetch: they are what the marker means, and a `scene` frame
+    // landing mid-flight would otherwise mark the list against a room we learned about
+    // after asking.
+    const FString Current = ActivePerformance.Id;
+    const FString Pending = GetPendingPerformanceId();
+    FetchPerformances(
+        [Current, Pending](bool bOk, const TArray<FLoomaPerformanceSummary>& Performances) {
+            if (!bOk)
+            {
+                UE_LOG(LogLoomaSync, Warning, TEXT("...so there is no performance list to show."));
+                return;
+            }
+            if (Performances.Num() == 0)
+            {
+                UE_LOG(LogLoomaSync, Display,
+                    TEXT("No performances are visible to this identity — not even `default`, which ")
+                    TEXT("is public, so this is a backend that answered without its seed row."));
+                return;
+            }
+            if (!Pending.IsEmpty())
+            {
+                // Said before the list, because it changes what every marker below
+                // means. This is the window step 3 built GetPendingPerformanceId for:
+                // nothing clears the confirmed id on a drop, so it names the room being
+                // left and looks entirely valid while it does.
+                UE_LOG(LogLoomaSync, Display,
+                    TEXT("A switch to '%s' is in flight and unconfirmed. %s"),
+                    *Pending,
+                    Current.IsEmpty()
+                        ? TEXT("No `scene` frame has named a room yet, so nothing below is current.")
+                        : TEXT("The row marked below is the one being LEFT, not the one we land in."));
+            }
+            int32 Width = 0;
+            for (const FLoomaPerformanceSummary& Row : Performances)
+            {
+                Width = FMath::Max(Width, Row.Id.Len());
+            }
+            UE_LOG(LogLoomaSync, Display, TEXT("%d performance(s) visible to this identity:"),
+                Performances.Num());
+            bool bFoundCurrent = false;
+            bool bFoundPending = false;
+            for (const FLoomaPerformanceSummary& Row : Performances)
+            {
+                const bool bIsPending = !Pending.IsEmpty() && Row.Id == Pending;
+                const bool bIsCurrent = !Current.IsEmpty() && Row.Id == Current;
+                bFoundPending = bFoundPending || bIsPending;
+                bFoundCurrent = bFoundCurrent || bIsCurrent;
+                // Pending wins the label where both are the same row — asking again for
+                // the room you are in is a real thing to type, and "requested" is the
+                // newer and more surprising of the two facts.
+                const TCHAR* Mark = TEXT("");
+                if (bIsPending)
+                {
+                    Mark = TEXT("   (requested, not confirmed)");
+                }
+                else if (bIsCurrent)
+                {
+                    Mark = Pending.IsEmpty() ? TEXT("   (current)") : TEXT("   (leaving)");
+                }
+                UE_LOG(LogLoomaSync, Display, TEXT("%s %s  '%s'  [%s]%s"),
+                    (bIsPending || bIsCurrent) ? TEXT("*") : TEXT(" "),
+                    *Pad(Row.Id, Width),
+                    Row.Name.IsEmpty() ? TEXT("<no name>") : *Row.Name,
+                    Row.Role.IsEmpty() ? TEXT("no role") : *Row.Role,
+                    Mark);
+            }
+            // A row missing from this list is one this identity cannot JOIN either, so
+            // the listing is an honest preview of what a switch will accept. Checked
+            // rather than assumed, because the two questions are asked by different
+            // code: `list_visible` filters `state="active"` itself, while the
+            // handshake's `get_visible` -> `can_read` -> `effective_role` returns None
+            // for a non-active row as its FIRST statement — so archived, nonexistent and
+            // not-yours all collapse into the same 4404 (backend/app/performances.py).
+            //
+            // The scenes side reaches the same agreement by a different route —
+            // `list_readable_scenes` is four set lookups where `effective_role` is a
+            // per-row call — which makes it the one that has to be verified rather than
+            // inferred from this one. Neither pair may be assumed from the other.
+            if (!Current.IsEmpty() && !bFoundCurrent)
+            {
+                // Two causes, and both are named because the remedies differ. A
+                // performance archived while we sat in it keeps THIS socket working and
+                // stops accepting new ones, so we could not rejoin the room we are in.
+                UE_LOG(LogLoomaSync, Warning,
+                    TEXT("The current performance '%s' is not in this list: either it was archived ")
+                    TEXT("while this socket was in it — still working, no longer joinable — or this ")
+                    TEXT("request resolved as a different identity than the socket did."),
+                    *Current);
+            }
+            if (!Pending.IsEmpty() && !bFoundPending)
+            {
+                UE_LOG(LogLoomaSync, Warning,
+                    TEXT("The requested performance '%s' is not one this identity may join, so the ")
+                    TEXT("switch in flight will close with 4404 — unless access to it changed ")
+                    TEXT("between these two requests."),
+                    *Pending);
+            }
+        });
 }
 
 void ULoomaSceneSyncSubsystem::SwitchPerformance(const FString& PerformanceId)

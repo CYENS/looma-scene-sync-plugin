@@ -85,6 +85,30 @@ struct FLoomaSceneSummary
     FString Name;
 };
 
+/**
+ * One row of `GET /performances` — what workspaces exist for this caller, and what it
+ * may do in each.
+ *
+ * A SECOND performance struct beside FLoomaPerformance, deliberately, because they come
+ * from different producers and disagree about what a performance is. FLoomaPerformance
+ * is the `scene` frame's object: where this socket IS, carrying `visibility` and a name
+ * that goes null when the row is deleted. This is a catalogue row: what exists, plus
+ * `role` — the caller's own standing, which the frame never carries and which is
+ * per-caller rather than a property of the row at all. Merging them would make a struct
+ * whose fields are empty or not depending on which half filled it in, and every reader
+ * would have to know which.
+ *
+ * The row also carries owner, visibility, state and timestamps. Same rule as
+ * FLoomaSceneSummary: this struct is where they go when something reads them.
+ */
+struct FLoomaPerformanceSummary
+{
+    FString Id;
+    FString Name;
+    /** `editor` or `viewer` — what THIS caller may do here. Empty if the row omitted it. */
+    FString Role;
+};
+
 /** Per-node bookkeeping for the outbound motion diff. */
 struct FLoomaTrackedActor
 {
@@ -367,6 +391,26 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Looma")
     void LogActiveScene();
 
+    /**
+     * Log every scene this identity may open, id and name, marking the active one.
+     * Console: `Looma.Scenes`.
+     *
+     * The answer to the question `Looma.Scene <name-or-id>` provokes — "and what are
+     * the ids?" — from the client that accepts them, rather than from a browser tab.
+     * It is FetchScenes with the result printed instead of searched, which is the shape
+     * that helper was extracted into.
+     *
+     * UNCAPPED, unlike the "no such scene" message, which names twenty and counts the
+     * rest. The cap is right there and wrong here: that message is a side effect of a
+     * different request and has to stay a sentence, while this one IS the request, and
+     * truncating the answer to a question somebody explicitly asked is the one place
+     * truncation cannot be defended. There is no pagination on the route either, so a
+     * client-side cap could only hide rows the backend was willing to show; if the list
+     * ever outgrows a console, the answer is a filter argument, not a shorter answer.
+     */
+    UFUNCTION(BlueprintCallable, Category = "Looma")
+    void LogScenes();
+
     // --- Which performance this client is in ----------------------------------
     //
     // The scene is chosen inside a workspace; the workspace is resolved once, at
@@ -435,6 +479,22 @@ public:
      */
     UFUNCTION(BlueprintPure, Category = "Looma")
     FString GetPendingPerformanceId() const;
+
+    /**
+     * Log every performance this identity may see — id, name and our own role in it —
+     * marking where this socket is. Console: `Looma.Performances`.
+     *
+     * `role` is printed because it is the field that predicts the next refusal: it is
+     * the difference between a workspace this caller may reshape and one it may only
+     * watch, and it is per-caller, so no other client's answer is ours.
+     *
+     * Honest during a switch, which is the one moment the marker could lie. The
+     * confirmed performance is the room being LEFT until the new socket's `scene` frame
+     * lands (nothing clears it on a drop), so while GetPendingPerformanceId is set the
+     * two are marked differently and a preamble says which is which.
+     */
+    UFUNCTION(BlueprintCallable, Category = "Looma")
+    void LogPerformances();
 
     // --- Local selection (outbound `selection`) -------------------------------
     //
@@ -935,6 +995,31 @@ private:
      * a C++-only API with no caller asking for it yet.
      */
     void FetchScenes(TFunction<void(bool bOk, const TArray<FLoomaSceneSummary>& Scenes)> OnDone);
+
+    /**
+     * `GET /performances` once, handing the rows to OnDone. The sibling of FetchScenes
+     * and not a reuse of it: the two routes agree about the REQUEST and disagree about
+     * the ANSWER. `/performances` replies with an OBJECT wrapping a `performances`
+     * array where `/scenes` replies with a bare array, and the rows carry different
+     * fields into different structs, so a shared fetch would have to hand back untyped
+     * JSON and push the envelope and the typing back out to both callers — the
+     * indirection without the benefit. What they genuinely share is the request, and
+     * that is shared: see MakeCatalogueRequest.
+     */
+    void FetchPerformances(
+        TFunction<void(bool bOk, const TArray<FLoomaPerformanceSummary>& Performances)> OnDone);
+
+    /**
+     * A GET against the backend, configured the one way a catalogue read has to be.
+     *
+     * Extracted because this is the half of a catalogue fetch that is easy to get wrong
+     * and whose failure is SILENT: ApplyAuthHeader must come after SetURL or it does
+     * nothing, and ApplyClientIdHeader is what anchors a guest to one subject, so
+     * omitting either returns a short list rather than an error. A second route copying
+     * fourteen lines by hand is exactly how one of them ends up missing a header and
+     * quietly showing a guest somebody else's idea of "everything".
+     */
+    TSharedRef<IHttpRequest, ESPMode::ThreadSafe> MakeCatalogueRequest(const FString& Url) const;
 
     /**
      * Compare what this socket asked for against what the `scene` frame confirms, once
