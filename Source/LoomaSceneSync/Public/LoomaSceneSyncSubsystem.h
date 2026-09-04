@@ -65,6 +65,26 @@ struct FLoomaPerformance
     FString Visibility;
 };
 
+/**
+ * One row of `GET /scenes` — the metadata list, which is the only route that answers
+ * "what scenes are there" without dragging a node document per answer.
+ *
+ * Just the two fields a resolver needs. The row carries `node_count`, `owner`,
+ * `visibility`, `public_role`, `performance_ids` and `role` as well, and this struct is
+ * where they go when something needs them — a listing command will — but parsing fields
+ * nothing reads is inventing a contract to keep in step for no caller.
+ *
+ * A plain struct and not a USTRUCT, unlike FLoomaPerformance. Nothing Blueprint-facing
+ * consumes it: the fetch it comes from is asynchronous through a TFunction, which
+ * Blueprint cannot express, so exposing the struct alone would publish half a feature.
+ * Promoting it is the easy move on the day something needs it.
+ */
+struct FLoomaSceneSummary
+{
+    FString Id;
+    FString Name;
+};
+
 /** Per-node bookkeeping for the outbound motion diff. */
 struct FLoomaTrackedActor
 {
@@ -266,6 +286,50 @@ public:
      */
     UFUNCTION(BlueprintCallable, Category = "Looma")
     void OpenScene(const FString& SceneId);
+
+    /**
+     * Open a scene named either way: `demo-costume-test` or `Costume Test`.
+     * Console: `Looma.Scene <sceneId>` / `Looma.Scene "<name>"`.
+     *
+     * Resolved against `GET /scenes` first and only then sent, so **every** open costs
+     * one metadata request — including one that names an id, which step 1 sent straight
+     * through. That fast path was worth having and is not worth keeping. Sending
+     * speculatively and falling back to the list only on a refusal was the alternative,
+     * and what rules it out is what the send IS: an `openScene` is a real subscription
+     * attempt with a real effect, not a probe. On a hit it subscribes — so the cheap
+     * path is cheap exactly when it was not needed — and on a miss it costs two round
+     * trips (the send, the refusal, then the fetch and a second send) where this costs
+     * one HTTP call always. The miss is the case that matters, because it is the one a
+     * person hunting for the right name is actually in.
+     *
+     * To be clear about what is NOT the objection, since the natural place to build it
+     * would be right here: a refusal CAN be matched to the request that caused it.
+     * `sceneError` echoes the requested `sceneId` straight back
+     * (`_send_scene_error(ws, reason, message, scene_id)`, backend/app/sync.py), so
+     * correlation is a comparison and not a guess about timing. It is simply not worth
+     * what it costs — per-request state kept on a fire-and-forget send, to save one
+     * small metadata GET at human typing speed.
+     *
+     * Uniform behaviour also means one failure message, said with the catalogue in hand
+     * instead of a bare refusal from the hub.
+     *
+     * What step 1 actually protected is untouched: nothing fetches when a `scene` frame
+     * arrives. This is still on demand, at typing speed, nowhere near the moment the
+     * GLB downloads take every connection slot.
+     *
+     * MATCHING ORDER: exact id, then exact name, then name ignoring case. Ids win
+     * because an id names exactly one scene and is what every other line here prints;
+     * where a string is one scene's id and another's name, that is said out loud rather
+     * than resolved silently. A name matching more than one scene is refused with the
+     * ids that tell them apart — names are not unique and picking the first would be
+     * choosing for the user, invisibly.
+     *
+     * If the list cannot be read at all, the argument is sent as an id and the hub
+     * answers — which is exactly step 1's behaviour, kept for the case that made a fast
+     * path attractive in the first place.
+     */
+    UFUNCTION(BlueprintCallable, Category = "Looma")
+    void OpenSceneByNameOrId(const FString& NameOrId);
 
     /**
      * Which saved scene the hub has us on. **Empty is an answer, not a failure**: it is
@@ -855,6 +919,22 @@ private:
      * not a close, so there is nothing to tear down here.
      */
     void HandleSceneError(const TSharedPtr<FJsonObject>& Msg);
+
+    /**
+     * `GET /scenes` once, handing the rows to OnDone — with bOk false and an empty array
+     * if the list could not be read, having already said why.
+     *
+     * The single door to that route. Two callers today ask opposite questions of the
+     * same answer — LogActiveScene resolves an id to a name, OpenSceneByNameOrId
+     * resolves a name to an id — and a listing command would be a third that only
+     * prints it. Keeping the request, its headers, its timeout and the reasoning behind
+     * the route choice in one place is what stops those diverging.
+     *
+     * Private, with the console reaching it through Log-style methods as `Looma.Scene`
+     * already does: TFunction is not Blueprint-expressible, so a public version would be
+     * a C++-only API with no caller asking for it yet.
+     */
+    void FetchScenes(TFunction<void(bool bOk, const TArray<FLoomaSceneSummary>& Scenes)> OnDone);
 
     /**
      * Compare what this socket asked for against what the `scene` frame confirms, once

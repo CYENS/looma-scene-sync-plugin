@@ -96,6 +96,36 @@ bool IsTerminalCloseCode(int32 Code)
 }
 
 /**
+ * How many scenes a "nothing matched" message names before it gives up and counts.
+ * A console line long enough to scroll its own explanation off the screen has stopped
+ * being an explanation; the count keeps the message honest about what it left out.
+ */
+constexpr int32 MaxScenesToName = 20;
+
+/** "id ('Name')" per scene, capped — for the messages that have to show the candidates. */
+FString DescribeScenes(const TArray<FLoomaSceneSummary>& Scenes)
+{
+    if (Scenes.Num() == 0)
+    {
+        return TEXT("none");
+    }
+    const int32 Named = FMath::Min(Scenes.Num(), MaxScenesToName);
+    TArray<FString> Parts;
+    Parts.Reserve(Named);
+    for (int32 Index = 0; Index < Named; ++Index)
+    {
+        Parts.Add(FString::Printf(TEXT("%s ('%s')"), *Scenes[Index].Id,
+            Scenes[Index].Name.IsEmpty() ? TEXT("<no name>") : *Scenes[Index].Name));
+    }
+    FString Out = FString::Join(Parts, TEXT(", "));
+    if (Scenes.Num() > Named)
+    {
+        Out += FString::Printf(TEXT(", and %d more"), Scenes.Num() - Named);
+    }
+    return Out;
+}
+
+/**
  * The persisted session's location and shape. `Saved/` because it is per-machine
  * scratch that no project commits — see GetSessionFilePath for why Project Settings
  * would be the wrong home.
@@ -549,6 +579,45 @@ void ULoomaSceneSyncSubsystem::LogActiveScene()
     UE_LOG(LogLoomaSync, Display, TEXT("Active scene id '%s' (asking the backend for its name)"),
         *ActiveSceneId);
 
+    // Captured, not re-read on arrival: this answer describes the scene we asked about,
+    // and `Looma.Scene <other>` may have been typed in the meantime.
+    const FString SceneId = ActiveSceneId;
+    FetchScenes([SceneId](bool bOk, const TArray<FLoomaSceneSummary>& Scenes) {
+        if (!bOk)
+        {
+            // FetchScenes has already said what failed and where. This adds what it
+            // cost, which is the half a reader of this command needs: the id printed
+            // above is still true, and only the name is missing.
+            UE_LOG(LogLoomaSync, Warning,
+                TEXT("...so the name of scene '%s' cannot be read. The id above still stands."),
+                *SceneId);
+            return;
+        }
+        const FLoomaSceneSummary* Row = Scenes.FindByPredicate(
+            [&SceneId](const FLoomaSceneSummary& Candidate) { return Candidate.Id == SceneId; });
+        if (!Row)
+        {
+            // Neither a failure nor a missing name: the list is non-enumerating, so a
+            // scene absent from it is one this IDENTITY may not read. Reachable in
+            // ordinary use rather than theoretical — the socket resolved us once, at
+            // handshake time, and this HTTP call resolves us again, so a guest whose
+            // `X-Client-Id` anchor does not match what the hub recorded lands exactly
+            // here. Said out loud, because "no name" would read as a backend fault.
+            UE_LOG(LogLoomaSync, Warning,
+                TEXT("Scene '%s' is not in the list this identity is offered, so its name cannot be ")
+                TEXT("read — we are still on it, but this request resolved as a different caller ")
+                TEXT("than the socket did."),
+                *SceneId);
+            return;
+        }
+        UE_LOG(LogLoomaSync, Display, TEXT("Active scene '%s' is named '%s'"),
+            *SceneId, Row->Name.IsEmpty() ? TEXT("<no name>") : *Row->Name);
+    });
+}
+
+void ULoomaSceneSyncSubsystem::FetchScenes(
+    TFunction<void(bool bOk, const TArray<FLoomaSceneSummary>& Scenes)> OnDone)
+{
     // GET /scenes, not GET /scenes/{id}. The single-scene route asks the narrower
     // question and would answer a clean 404 for an id we may not have — but it inlines
     // the whole node document, which is the one thing this client already holds and the
@@ -558,38 +627,38 @@ void ULoomaSceneSyncSubsystem::LogActiveScene()
     // filtered to what this caller may see through the same `effective_role` gate the
     // single-scene route uses (backend/app/scenes.py), and is what the web scene panel
     // already leans on, so it is the well-trodden path as well as the small one.
+    //
+    // It is also the only route that can answer "which scenes are there at all", which
+    // is what makes one fetch serve a name lookup, an id lookup and a listing.
     const FString ListUrl = GetRestBase() + TEXT("/scenes");
     const TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Request = FHttpModule::Get().CreateRequest();
     Request->SetURL(ListUrl);
     Request->SetVerb(TEXT("GET"));
-    // The interactive budget: a person typed the command and is watching the log, and
+    // The interactive budget: a person typed a command and is watching the log, and
     // would rather hear "no" quickly than "yes" eventually.
     Request->SetTimeout(InteractiveRequestTimeout);
     ApplyAuthHeader(Request); // after SetURL, as it requires
     // Wider than ApplyClientIdHeader's stated "asset-creating requests" scope, and
     // deliberately so: `X-Client-Id` is what anchors a GUEST to one subject across
-    // calls, so without it a guest's own private scene is missing from the list this
-    // route returns and we would report "not offered to us" about the scene we are
-    // plainly looking at. The contract asks for it here by name — "Send the header —
-    // the web client does, on every `/scenes` call" (docs/scene-format.md). It still
-    // proves nothing: a resolved session always wins over it.
+    // calls, so without it a guest's own private scenes are missing from the list this
+    // route returns — which would make them unopenable by name and unfindable in a
+    // listing, not merely unnamed. The contract asks for it here by name — "Send the
+    // header — the web client does, on every `/scenes` call" (docs/scene-format.md). It
+    // still proves nothing: a resolved session always wins over it.
     ApplyClientIdHeader(Request);
 
-    // Captured, not re-read on arrival: this answer describes the scene we asked about,
-    // and `Looma.Scene <other>` may have been typed in the meantime.
-    const FString SceneId = ActiveSceneId;
     Request->OnProcessRequestComplete().BindWeakLambda(this,
-        [SceneId, ListUrl](FHttpRequestPtr Req, FHttpResponsePtr Resp, bool bOk) {
+        [ListUrl, OnDone](FHttpRequestPtr Req, FHttpResponsePtr Resp, bool bOk) {
+            // Named here, once, rather than in each caller: the URL and the status code
+            // are facts about the request, and only the *consequence* differs per
+            // caller. Both halves get said — this line is what failed, the caller's is
+            // what it cost.
+            TArray<FLoomaSceneSummary> Scenes;
             if (!bOk || !Resp.IsValid() || Resp->GetResponseCode() >= 300)
             {
-                // Named as a fetch failure rather than folded into "no name": "the
-                // backend did not answer" and "the backend has no such scene for us"
-                // are different problems with different fixes, and a console that
-                // blurred them would send someone looking in the wrong place.
-                UE_LOG(LogLoomaSync, Warning,
-                    TEXT("Could not read the name of scene '%s': %s answered %d. The id above still ")
-                    TEXT("stands — only the name is missing."),
-                    *SceneId, *ListUrl, Resp.IsValid() ? Resp->GetResponseCode() : 0);
+                UE_LOG(LogLoomaSync, Warning, TEXT("Could not read the scene list from %s (%d)"),
+                    *ListUrl, Resp.IsValid() ? Resp->GetResponseCode() : 0);
+                OnDone(false, Scenes);
                 return;
             }
             TArray<TSharedPtr<FJsonValue>> Rows;
@@ -598,37 +667,160 @@ void ULoomaSceneSyncSubsystem::LogActiveScene()
             if (!FJsonSerializer::Deserialize(Reader, Rows))
             {
                 UE_LOG(LogLoomaSync, Warning,
-                    TEXT("Could not read the name of scene '%s': %s answered 200 but not with a ")
-                    TEXT("scene list."), *SceneId, *ListUrl);
+                    TEXT("%s answered 200 but not with a scene list"), *ListUrl);
+                OnDone(false, Scenes);
                 return;
             }
+            Scenes.Reserve(Rows.Num());
             for (const TSharedPtr<FJsonValue>& Row : Rows)
             {
                 const TSharedPtr<FJsonObject> Entry = Row.IsValid() ? Row->AsObject() : nullptr;
-                FString RowId;
-                if (!Entry.IsValid() || !Entry->TryGetStringField(TEXT("id"), RowId) || RowId != SceneId)
+                FLoomaSceneSummary Summary;
+                // A row with no id is not a scene anything can act on — it cannot be
+                // opened and cannot be pointed at — so it is dropped rather than
+                // carried as a half-row every caller would have to check for. Dropping
+                // it cannot make a name lookup lie either: the row it removes is one
+                // that could never have been opened even if its name had matched, so
+                // "no scene has that name" stays the true answer rather than becoming a
+                // convenient one. The name is taken as it comes — an empty one is a
+                // display problem, not a reason to discard the row.
+                if (!Entry.IsValid() || !Entry->TryGetStringField(TEXT("id"), Summary.Id)
+                    || Summary.Id.IsEmpty())
                 {
                     continue;
                 }
-                FString Name;
-                Entry->TryGetStringField(TEXT("name"), Name);
-                UE_LOG(LogLoomaSync, Display, TEXT("Active scene '%s' is named '%s'"),
-                    *SceneId, Name.IsEmpty() ? TEXT("<no name>") : *Name);
-                return;
+                Entry->TryGetStringField(TEXT("name"), Summary.Name);
+                Scenes.Add(MoveTemp(Summary));
             }
-            // Neither a failure nor a missing name: the list is non-enumerating, so a
-            // scene absent from it is one this IDENTITY may not read. Reachable in
-            // ordinary use rather than theoretical — the socket resolved us once, at
-            // handshake time, and this HTTP call resolves us again, so a guest whose
-            // `X-Client-Id` anchor does not match what the hub recorded lands exactly
-            // here. Said out loud, because "no name" would read as a backend fault.
-            UE_LOG(LogLoomaSync, Warning,
-                TEXT("Scene '%s' is not in the list %s offers this identity, so its name cannot be ")
-                TEXT("read — we are still on it, but this request resolved as a different caller ")
-                TEXT("than the socket did."),
-                *SceneId, *ListUrl);
+            OnDone(true, Scenes);
         });
     Request->ProcessRequest();
+}
+
+void ULoomaSceneSyncSubsystem::OpenSceneByNameOrId(const FString& NameOrId)
+{
+    const FString Wanted = NameOrId.TrimStartAndEnd();
+    if (Wanted.IsEmpty())
+    {
+        UE_LOG(LogLoomaSync, Warning,
+            TEXT("Opening a scene needs an id or a name — nothing was sent."));
+        return;
+    }
+    FetchScenes([this, Wanted](bool bOk, const TArray<FLoomaSceneSummary>& Scenes) {
+        if (!bOk)
+        {
+            // Degrade to exactly what step 1 did: send it as an id and let the hub be
+            // the authority, since it is the only one left standing. Not a guess and
+            // not a silent retry — the log says which reading was chosen and what the
+            // other reading would now look like.
+            UE_LOG(LogLoomaSync, Warning,
+                TEXT("...so '%s' cannot be looked up, and is being sent as an id for the hub to ")
+                TEXT("answer. If it was a name, that answer will be a `sceneError`."),
+                *Wanted);
+            OpenScene(Wanted);
+            return;
+        }
+        // 1. An exact id. First because an id names exactly one scene and is what every
+        //    other line in this plugin prints, so a string that IS an id must always
+        //    mean that scene.
+        const FLoomaSceneSummary* ById = Scenes.FindByPredicate(
+            [&Wanted](const FLoomaSceneSummary& Candidate) { return Candidate.Id == Wanted; });
+        if (ById)
+        {
+            // A collision between KINDS, not within names: this string is one scene's
+            // id and another's name. Resolving it silently is what would make the next
+            // person's bug report unreadable, so the losing reading is named along with
+            // the id that reaches it.
+            TArray<FString> AlsoNamed;
+            for (const FLoomaSceneSummary& Candidate : Scenes)
+            {
+                if (Candidate.Id != ById->Id && Candidate.Name.Equals(Wanted, ESearchCase::IgnoreCase))
+                {
+                    AlsoNamed.Add(Candidate.Id);
+                }
+            }
+            if (AlsoNamed.Num() > 0)
+            {
+                UE_LOG(LogLoomaSync, Warning,
+                    TEXT("'%s' is the ID of one scene and the NAME of %s. Opening it as the id, ")
+                    TEXT("because an id names exactly one scene; open the other by its id."),
+                    *Wanted, *FString::Join(AlsoNamed, TEXT(", ")));
+            }
+            OpenScene(ById->Id);
+            return;
+        }
+        // 2. An exact name, then 3. a name ignoring case. Two passes rather than one
+        //    case-insensitive one, so that where both exist the exactly-typed name wins
+        //    outright instead of being reported as an ambiguity the user did not create.
+        TArray<const FLoomaSceneSummary*> Exact;
+        TArray<const FLoomaSceneSummary*> Insensitive;
+        for (const FLoomaSceneSummary& Candidate : Scenes)
+        {
+            if (Candidate.Name.Equals(Wanted, ESearchCase::CaseSensitive))
+            {
+                Exact.Add(&Candidate);
+            }
+            else if (Candidate.Name.Equals(Wanted, ESearchCase::IgnoreCase))
+            {
+                Insensitive.Add(&Candidate);
+            }
+        }
+        const bool bMatchedExactly = Exact.Num() > 0;
+        const TArray<const FLoomaSceneSummary*>& Matches = bMatchedExactly ? Exact : Insensitive;
+        if (Matches.Num() == 1)
+        {
+            const FLoomaSceneSummary& Match = *Matches[0];
+            // Said out loud, because the user typed one string and is about to be moved
+            // to a scene identified by another: the id is what every later line will
+            // call it, so this is where the two are connected.
+            UE_LOG(LogLoomaSync, Display, TEXT("Scene '%s' is '%s'%s; opening it."),
+                *Match.Name, *Match.Id,
+                bMatchedExactly ? TEXT("") : TEXT(" — matched ignoring case"));
+            OpenScene(Match.Id);
+            return;
+        }
+        if (Matches.Num() > 1)
+        {
+            // Refused, not resolved to the first. Nothing stops two scenes sharing a
+            // name — `_slugify_scene` uniquifies the ID with -2, -3 precisely so the
+            // name does not have to be unique (backend/app/scenes.py) — so "the first
+            // one" is an ordering artefact of `order_idx`, and opening by it would be
+            // choosing for the user invisibly. The ids are what tell them apart, so the
+            // ids are what the refusal carries.
+            TArray<FString> Ids;
+            Ids.Reserve(Matches.Num());
+            for (const FLoomaSceneSummary* Match : Matches)
+            {
+                Ids.Add(Match->Id);
+            }
+            UE_LOG(LogLoomaSync, Warning,
+                TEXT("%d scenes are named '%s'%s, so the name does not say which: %s. Names are not ")
+                TEXT("unique here and ids are — open one by its id."),
+                Matches.Num(), *Wanted,
+                bMatchedExactly ? TEXT("") : TEXT(" ignoring case"),
+                *FString::Join(Ids, TEXT(", ")));
+            return;
+        }
+        if (Scenes.Num() == 0)
+        {
+            // Distinct from "no match among these", and a real state rather than a
+            // defensive branch: `GET /scenes` is filtered per identity, so a guest whose
+            // anchor the backend does not recognise is offered an empty list and every
+            // name would "not match" for a reason that has nothing to do with the name.
+            UE_LOG(LogLoomaSync, Warning,
+                TEXT("Cannot open '%s': this identity is offered no scenes at all. `Looma.Whoami` ")
+                TEXT("says who the backend thinks we are."),
+                *Wanted);
+            return;
+        }
+        // The whole point of resolving client-side: the miss is answered with the
+        // candidates in hand, where the hub's `sceneError` can only say no.
+        UE_LOG(LogLoomaSync, Warning,
+            TEXT("No scene has the id or the name '%s'. %d offered to this identity: %s. A name ")
+            TEXT("with spaces can be quoted — Looma.Scene \"Costume Test\" — though it does not ")
+            TEXT("have to be."),
+            *Wanted, Scenes.Num(), *DescribeScenes(Scenes));
+    });
 }
 
 // --- Which performance this client is in -------------------------------------
