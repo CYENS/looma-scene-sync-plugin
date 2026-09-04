@@ -1,15 +1,18 @@
 #include "LoomaSceneSyncSubsystem.h"
 
+#include "Components/PrimitiveComponent.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 #include "Engine/GameInstance.h"
 #include "GenericPlatform/GenericPlatformHttp.h"
 #include "Engine/World.h"
 #include "HAL/FileManager.h"
+#include "HAL/IConsoleManager.h"
 #include "HttpModule.h"
 #include "Interfaces/IHttpRequest.h"
 #include "Interfaces/IHttpResponse.h"
 #include "IWebSocket.h"
+#include "Kismet/KismetMaterialLibrary.h"
 #include "LoomaAuthTypes.h"
 #include "LoomaGenerationHandle.h"
 #include "LoomaGenerationTypes.h"
@@ -18,6 +21,7 @@
 #include "LoomaSceneSyncSettings.h"
 #include "LoomaSyncedActor.h"
 #include "LoomaWireConvert.h"
+#include "Materials/MaterialParameterCollection.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Guid.h"
 #include "Misc/Paths.h"
@@ -380,6 +384,12 @@ void ULoomaSceneSyncSubsystem::CloseSocket()
     Socket->Close();
     Socket.Reset();
     bConnecting = false;
+    // The room was derived from this socket's registration in the hub's presence
+    // table, so it means nothing the moment the socket goes. Note the scene state is
+    // deliberately NOT cleared alongside it — the hub answers a fresh connection with
+    // the whole `scene`, which reconciles it, whereas nothing ever replays a roster we
+    // kept a stale copy of.
+    ClearPresence();
 }
 
 void ULoomaSceneSyncSubsystem::Connect()
@@ -421,9 +431,10 @@ void ULoomaSceneSyncSubsystem::Connect()
         Hello->SetStringField(TEXT("role"), TEXT("unreal"));
         // Suggest a roster name. With none, the hub names us `Guest-` plus the first
         // six characters of our clientId — an unreadable string in everybody else's
-        // roster, and one this client cannot even discover for itself, since inbound
-        // `clients` is not handled here and GET /auth/me mints a fresh random guest
-        // name on every call. Proposing the name is the only way we come to know it.
+        // roster. `GET /auth/me` mints a fresh random guest name on every call and so
+        // cannot report it; since HAM-159 the inbound `clients` roster can (see
+        // GetOwnClientId / GetClient), but proposing a name here is still the only way
+        // to have a readable one to read back.
         //
         // Decides anything only for a GUEST connection: identity_from_websocket
         // resolves a token first and never consults the suggestion when one resolves
@@ -485,6 +496,9 @@ void ULoomaSceneSyncSubsystem::Connect()
         bConnecting = false;
         UE_LOG(LogLoomaSync, Warning, TEXT("Connection error on %s: %s (retrying)"), *SocketUrl, *Error);
         ReconnectCooldown = ReconnectDelay;
+        // Before the disconnect event, not after: a listener that reads GetClients()
+        // from OnSyncDisconnected must see the empty room, not the one that just died.
+        ClearPresence();
         OnSyncDisconnected.Broadcast();
     });
     Socket->OnClosed().AddWeakLambda(this, [this](int32 Code, const FString& Reason, bool bWasClean) {
@@ -503,6 +517,12 @@ void ULoomaSceneSyncSubsystem::Connect()
             UE_LOG(LogLoomaSync, Warning, TEXT("Socket closed (%d %s), retrying"), Code, *Reason);
             ReconnectCooldown = ReconnectDelay;
         }
+        // Dropped here as well as in CloseSocket, and on both branches above: neither
+        // this handler nor OnConnectionError routes through CloseSocket, so without
+        // this a departed room would outlive the socket that described it for as long
+        // as the reconnect took. Before the disconnect event, not after, so a listener
+        // reading GetClients() from OnSyncDisconnected sees the empty room.
+        ClearPresence();
         OnSyncDisconnected.Broadcast();
     });
     Socket->OnMessage().AddUObject(this, &ULoomaSceneSyncSubsystem::OnRawMessage);
@@ -2581,6 +2601,14 @@ void ULoomaSceneSyncSubsystem::OnRawMessage(const FString& Text)
     {
         HandleSceneError(Msg);
     }
+    else if (Type == TEXT("clients"))
+    {
+        HandleClients(Msg);
+    }
+    else if (Type == TEXT("selection"))
+    {
+        HandleSelection(Msg);
+    }
     else
     {
         // Not an error — the hub may speak messages a newer backend added — but
@@ -2781,6 +2809,10 @@ void ULoomaSceneSyncSubsystem::UpsertNode(const TSharedPtr<FJsonObject>& Node)
         FLoomaTrackedActor Entry;
         Entry.Actor = Actor;
         Tracked.Add(NodeId, Entry);
+        // A node arriving may be one a remote client already claims — a `selection`
+        // legitimately races the `spawn` that created its node — so the border has to be
+        // worked out again now that there is finally something to mark.
+        MarkBordersDirty();
     }
 
     Actor->DisplayName = Name.IsEmpty() ? NodeId : Name;
@@ -2868,6 +2900,9 @@ void ULoomaSceneSyncSubsystem::DropNode(const FString& NodeId)
     {
         return;
     }
+    // Its claim stays in the ledger — nothing retracts a claim but its owner — but the
+    // primitive carrying the border is going away, so the marked set needs rebuilding.
+    MarkBordersDirty();
     if (ALoomaSyncedActor* Actor = Entry.Actor.Get())
     {
         Actor->Destroy(); // bApplyingRemote suppresses the despawn echo
@@ -3070,6 +3105,7 @@ void ULoomaSceneSyncSubsystem::OnSyncedActorDestroyed(AActor* DestroyedActor)
         return;
     }
     const bool bWasTracked = Tracked.Remove(Actor->Id) > 0;
+    MarkBordersDirty();
     if (bWasTracked && !bApplyingRemote)
     {
         // Just the one node: the hub expands the cascade to its descendants and hands
@@ -3105,6 +3141,10 @@ void ULoomaSceneSyncSubsystem::Tick(float DeltaTime)
     // arrives, precisely because "a selection legitimately races the spawn that created
     // the node".
     TickSelection();
+    // After TickSelection, because a local selection change in this same frame is one
+    // of the things the borders subtract — running it first would draw one frame of a
+    // remote border on a node we had just taken.
+    TickBorders();
 
     if (ReconnectCooldown > 0.0f)
     {
@@ -3241,6 +3281,9 @@ void ULoomaSceneSyncSubsystem::TickSelection()
     if (Ids != LastNotifiedSelectionIds)
     {
         LastNotifiedSelectionIds = Ids;
+        // Our selection is subtracted from every remote border, so it moving changes what
+        // they draw even though the room itself has not moved.
+        MarkBordersDirty();
         OnLocalSelectionChanged.Broadcast(Ids);
     }
 
@@ -3626,6 +3669,845 @@ void ULoomaSceneSyncSubsystem::DespawnSyncedActor(ALoomaSyncedActor* Actor)
     if (Actor)
     {
         Actor->Destroy(); // OnSyncedActorDestroyed broadcasts the despawn
+    }
+}
+
+// --- Presence: who else is in the room ----------------------------------------
+
+void ULoomaSceneSyncSubsystem::HandleClients(const TSharedPtr<FJsonObject>& Msg)
+{
+    const TArray<TSharedPtr<FJsonValue>>* Entries = nullptr;
+    if (!Msg->TryGetArrayField(TEXT("clients"), Entries) || !Entries)
+    {
+        return;
+    }
+
+    FString You;
+    Msg->TryGetStringField(TEXT("you"), You);
+    // Belt and braces, exactly as the web passes both `you` and its socket's own id.
+    // `you` is the contract's answer and wins where the two differ, but a hub that
+    // named someone else as us would otherwise be invisible — and its consequence is
+    // the worst one this feature has: we would treat our own entry as a remote client
+    // and paint our colour over our own selection. Cheap to notice, so notice it.
+    if (!You.IsEmpty() && You != ClientId)
+    {
+        UE_LOG(LogLoomaSync, Warning,
+            TEXT("Roster names us '%s' but our hello sent clientId '%s' — treating both as ours. ")
+            TEXT("A hub that renamed our socket would make us draw our own colour on our own selection."),
+            *You, *ClientId);
+    }
+
+    // Rebuilt wholesale, never merged. The roster is the whole room every time: a
+    // client that has left is simply absent, and dropping it here is the only thing
+    // that will ever clear its borders, because there is no teardown message.
+    // Roster order is join order and is the claim tiebreak, so nothing below sorts.
+    TArray<FLoomaClient> NextClients;
+    NextClients.Reserve(Entries->Num());
+    FLoomaClient NextSelf;
+    FString NextOwnId = You;
+
+    for (const TSharedPtr<FJsonValue>& Value : *Entries)
+    {
+        const TSharedPtr<FJsonObject>* Entry = nullptr;
+        if (!Value.IsValid() || !Value->TryGetObject(Entry) || !Entry)
+        {
+            continue;
+        }
+        FLoomaClient Client = LoomaParseClient(*Entry);
+        if (Client.Id.IsEmpty())
+        {
+            // Nobody: an entry with no id cannot be attributed, so it cannot own a
+            // border either. Verbose rather than a warning — this is a malformed hub,
+            // not a state a running room reaches.
+            UE_LOG(LogLoomaSync, Verbose, TEXT("Roster entry with no id, ignored"));
+            continue;
+        }
+        // Ours goes aside rather than into the list. See GetClients() for why this one
+        // line is the rule the whole feature rests on.
+        if (Client.Id == You || Client.Id == ClientId)
+        {
+            NextSelf = MoveTemp(Client);
+            // Where `you` was absent — an older hub, or a truncated message — our own
+            // clientId is still a usable self name, so adopt it rather than leaving
+            // GetOwnClientId() empty with a self entry sitting right there.
+            if (NextOwnId.IsEmpty())
+            {
+                NextOwnId = NextSelf.Id;
+            }
+            continue;
+        }
+        NextClients.Add(MoveTemp(Client));
+    }
+
+    // --- The roster meets the ledger ----------------------------------------
+    //
+    // "Hydrate from the roster, then apply increments" (docs/scene-format.md). The
+    // roster's job is to hydrate a client we are meeting for the first time — nothing
+    // replays the `selection` messages we were not connected for — and NOT to restate
+    // one we have been tracking incrementally since.
+    //
+    // So a client already in the room keeps the selection we hold for it, and only its
+    // colour, role, name and kind are taken from the new roster. Two things go wrong
+    // if the roster's copy is applied to a known client instead. It reorders: rebuilding
+    // the ledger from roster order would re-seat every claim in JOIN order, so a node B
+    // claimed before A would silently flip to A the next time an unrelated third party
+    // joined — a border changing colour because somebody else walked in. And it can
+    // lose: the hub awaits between roster recipients, so a roster generated before our
+    // `selection` was recorded can be delivered after it, and treating that stale copy
+    // as authoritative would retract a claim nothing will ever re-send.
+    //
+    // Membership and order are still wholesale, which is the step-1 rule intact: this
+    // carries forward one field of an entry the roster still has to list at all.
+    TSet<FString> PreviousIds;
+    PreviousIds.Reserve(RemoteClients.Num());
+    for (const FLoomaClient& Client : RemoteClients)
+    {
+        PreviousIds.Add(Client.Id);
+    }
+    for (FLoomaClient& Client : NextClients)
+    {
+        if (const FLoomaClient* Known = RemoteClients.FindByPredicate(
+                [&Client](const FLoomaClient& Candidate) { return Candidate.Id == Client.Id; }))
+        {
+            Client.Selection = Known->Selection;
+        }
+    }
+
+    const bool bSelfMoved = NextSelf != SelfClient || NextOwnId != OwnClientId;
+    const bool bRoomMoved = NextClients != RemoteClients;
+    SelfClient = MoveTemp(NextSelf);
+    OwnClientId = MoveTemp(NextOwnId);
+
+    // Rule 3, and it must run before the hydration below rather than after: a client
+    // that left has no borders, which is the only way a disconnect clears them — there
+    // is no teardown message — and freeing its slots first is what lets a newcomer
+    // inherit a contested node in the same roster that reports both events.
+    TSet<FString> NextIds;
+    NextIds.Reserve(NextClients.Num());
+    for (const FLoomaClient& Client : NextClients)
+    {
+        NextIds.Add(Client.Id);
+    }
+    for (const FString& OldId : PreviousIds)
+    {
+        if (!NextIds.Contains(OldId))
+        {
+            ReleaseAllClaims(OldId);
+        }
+    }
+
+    RemoteClients = MoveTemp(NextClients);
+
+    // Hydration proper, in roster order, which is join order — the tiebreak the
+    // contract specifies for nodes that arrive already selected in a roster. Only
+    // clients we had not met: everyone else's claims are already in the ledger, at the
+    // positions their `selection` messages earned them.
+    for (const FLoomaClient& Client : RemoteClients)
+    {
+        if (PreviousIds.Contains(Client.Id))
+        {
+            continue;
+        }
+        for (const FString& NodeId : Client.Selection)
+        {
+            ClaimNode(NodeId, Client.Id);
+        }
+    }
+
+    // Only on an actual change — see FLoomaClientsEvent. The self half is folded into
+    // the same event rather than given one of its own: a consumer showing "the colour
+    // everyone else sees me in" has exactly one roster to read, and two events for one
+    // message would only ever fire together.
+    if (bRoomMoved || bSelfMoved)
+    {
+        MarkBordersDirty();
+        OnClientsChanged.Broadcast(RemoteClients);
+    }
+}
+
+void ULoomaSceneSyncSubsystem::HandleSelection(const TSharedPtr<FJsonObject>& Msg)
+{
+    FString SenderId;
+    if (!Msg->TryGetStringField(TEXT("clientId"), SenderId) || SenderId.IsEmpty())
+    {
+        // Server-stamped and never optional on the inbound copy. Without it the claim
+        // is unattributable — there is no colour to draw it in and no way to retract
+        // it later — so there is nothing useful to do but drop the message.
+        return;
+    }
+    // The hub echo-suppresses, so this should never be us. Checked anyway, for the
+    // same reason step 1 keeps the self entry out of the remote list: our own colour
+    // drawn on our own selection is the exact confusion per-client colours exist to
+    // remove, and a one-line guard is cheaper than trusting a remote invariant.
+    if (SenderId == ClientId || (!OwnClientId.IsEmpty() && SenderId == OwnClientId))
+    {
+        return;
+    }
+
+    const TArray<TSharedPtr<FJsonValue>>* IdValues = nullptr;
+    if (!Msg->TryGetArrayField(TEXT("ids"), IdValues) || !IdValues)
+    {
+        // A *missing* `ids` is malformed; an EMPTY `ids` is a real message that clears
+        // this client's borders everywhere. Reading the first as the second would let a
+        // truncated message silently retract a live claim, so absence is refused here
+        // rather than folded into the empty case.
+        return;
+    }
+    TArray<FString> Ids;
+    Ids.Reserve(IdValues->Num());
+    for (const TSharedPtr<FJsonValue>& Value : *IdValues)
+    {
+        FString NodeId;
+        if (Value.IsValid() && Value->TryGetString(NodeId) && !NodeId.IsEmpty())
+        {
+            // Kept whether or not we hold a node by this name. A selection legitimately
+            // races the `spawn` that created its node, and filtering here would drop a
+            // claim nothing ever re-sends; it simply becomes drawable if the node
+            // arrives. Note this is the exact opposite of the OUTBOUND rule, where
+            // Looma.Select refuses an id this client does not hold.
+            Ids.Add(NodeId);
+        }
+    }
+
+    FString ColorWire;
+    Msg->TryGetStringField(TEXT("color"), ColorWire);
+    const FString MessageHex = LoomaNormalizeClientColorHex(ColorWire);
+
+    int32 Index = RemoteClients.IndexOfByPredicate(
+        [&SenderId](const FLoomaClient& Candidate) { return Candidate.Id == SenderId; });
+    if (Index == INDEX_NONE)
+    {
+        // A sender the roster has not introduced yet. Appended rather than ignored:
+        // the roster and a `selection` are fanned out independently — the hub awaits
+        // between roster recipients — so a selection really can land just before the
+        // roster that names its sender, and dropping it would lose the claim for good.
+        // The hub stamps `color` on this message precisely so the border can be drawn
+        // anyway. Appended at the end, which is not its join position; the next roster
+        // rebuilds membership and order and seats it correctly.
+        FLoomaClient Provisional;
+        Provisional.Id = SenderId;
+        Provisional.Role = TEXT("unknown");
+        // DisplayName left empty and Kind left Guest: neither field is on this message
+        // — both are roster-only — and inventing either would put a name or an account
+        // in the room that no other client is showing.
+        Index = RemoteClients.Add(MoveTemp(Provisional));
+    }
+
+    FLoomaClient& Sender = RemoteClients[Index];
+    // Colour precedence: this message, then whatever the last roster gave this client,
+    // then the neutral fallback. The message's copy is the same value as the roster's,
+    // so the first two can only differ when the hub has recoloured someone — and a
+    // client we learned about from a `selection` alone has nothing but the message.
+    if (!MessageHex.IsEmpty())
+    {
+        LoomaParseClientColor(MessageHex, Sender.ColorHex, Sender.Color);
+    }
+    else if (Sender.ColorHex.IsEmpty())
+    {
+        LoomaParseClientColor(FString(), Sender.ColorHex, Sender.Color);
+    }
+
+    if (Sender.Selection == Ids)
+    {
+        // Nothing moved. The ledger would be unchanged too — MoveClaims would compute
+        // an empty diff — so returning here only skips an event, which is the rule
+        // OnClientsChanged states.
+        return;
+    }
+    // The whole set, replacing what it held; the wire never sends a delta. The ledger
+    // gets the difference, which is why the old set has to be read before the new one
+    // is stored.
+    MoveClaims(SenderId, Sender.Selection, Ids);
+    Sender.Selection = MoveTemp(Ids);
+
+    MarkBordersDirty();
+    OnClientsChanged.Broadcast(RemoteClients);
+}
+
+// --- The claim ledger ---------------------------------------------------------
+
+void ULoomaSceneSyncSubsystem::ClaimNode(const FString& NodeId, const FString& ClaimantId)
+{
+    TArray<FString>& Claimants = Claims.FindOrAdd(NodeId);
+    // AddUnique, spelled out: a claimant already on the list keeps the position it
+    // has. Appending again would move it to the back of a queue it may be at the front
+    // of, which is the one thing the tiebreak may never do.
+    Claimants.AddUnique(ClaimantId);
+}
+
+void ULoomaSceneSyncSubsystem::ReleaseNode(const FString& NodeId, const FString& ClaimantId)
+{
+    TArray<FString>* Claimants = Claims.Find(NodeId);
+    if (!Claimants)
+    {
+        return;
+    }
+    Claimants->Remove(ClaimantId);
+    if (Claimants->Num() == 0)
+    {
+        // Dropped rather than left empty, so that "no entry" is the only way a node is
+        // unclaimed. Two representations of the same state is how a lookup that checks
+        // one of them starts drawing borders nobody holds.
+        Claims.Remove(NodeId);
+    }
+}
+
+void ULoomaSceneSyncSubsystem::ReleaseAllClaims(const FString& ClaimantId)
+{
+    // The one operation that scans, and the reason the ledger can afford to be keyed
+    // by node alone — it runs once per roster, over the nodes a room has selected.
+    for (auto It = Claims.CreateIterator(); It; ++It)
+    {
+        It.Value().Remove(ClaimantId);
+        if (It.Value().Num() == 0)
+        {
+            It.RemoveCurrent();
+        }
+    }
+}
+
+void ULoomaSceneSyncSubsystem::MoveClaims(
+    const FString& ClaimantId, const TArray<FString>& Held, const TArray<FString>& Next)
+{
+    const TSet<FString> StillHeld(Next);
+    for (const FString& NodeId : Held)
+    {
+        if (!StillHeld.Contains(NodeId))
+        {
+            ReleaseNode(NodeId, ClaimantId);
+        }
+    }
+    // ClaimNode is already idempotent, so the ids in both sets could simply be
+    // re-claimed — but going through them anyway would make the no-op path depend on
+    // AddUnique's silence for correctness rather than by construction. Diff both ways.
+    const TSet<FString> WasHeld(Held);
+    for (const FString& NodeId : Next)
+    {
+        if (!WasHeld.Contains(NodeId))
+        {
+            ClaimNode(NodeId, ClaimantId);
+        }
+    }
+}
+
+bool ULoomaSceneSyncSubsystem::GetNodeBorderOwner(const FString& NodeId, FLoomaClient& OutClient) const
+{
+    const TArray<FString>* Claimants = Claims.Find(NodeId);
+    if (!Claimants || Claimants->Num() == 0)
+    {
+        return false;
+    }
+    // The head, and that is the whole rule. Derived here rather than read from a
+    // maintained owner table: it is an array index, and a cached copy of a
+    // one-element derivation is a thing that can disagree with its source.
+    return GetClient((*Claimants)[0], OutClient);
+}
+
+TArray<FString> ULoomaSceneSyncSubsystem::GetNodeClaimants(const FString& NodeId) const
+{
+    if (const TArray<FString>* Claimants = Claims.Find(NodeId))
+    {
+        return *Claimants;
+    }
+    return TArray<FString>();
+}
+
+TArray<FString> ULoomaSceneSyncSubsystem::GetClientBorderNodes(const FString& InClientId) const
+{
+    FLoomaClient Client;
+    if (!GetClient(InClientId, Client))
+    {
+        return TArray<FString>();
+    }
+    // The reverse index the ledger deliberately does not keep: that client's own
+    // selection, filtered through one O(1) lookup per id. Order is the selection's,
+    // so a renderer that groups by client gets a stable list across redraws.
+    TArray<FString> Won;
+    Won.Reserve(Client.Selection.Num());
+    for (const FString& NodeId : Client.Selection)
+    {
+        const TArray<FString>* Claimants = Claims.Find(NodeId);
+        if (Claimants && Claimants->Num() > 0 && (*Claimants)[0] == InClientId)
+        {
+            Won.Add(NodeId);
+        }
+    }
+    return Won;
+}
+
+// --- Drawing the borders ------------------------------------------------------
+
+TArray<FLoomaBorderGroup> ULoomaSceneSyncSubsystem::GetRemoteBorderGroups() const
+{
+    return BorderGroups;
+}
+
+TArray<FString> ULoomaSceneSyncSubsystem::GetUndrawnClients() const
+{
+    return UndrawnClientIds;
+}
+
+void ULoomaSceneSyncSubsystem::TickBorders()
+{
+    if (!bBordersDirty)
+    {
+        return;
+    }
+    bBordersDirty = false;
+    RefreshRemoteBorders();
+}
+
+void ULoomaSceneSyncSubsystem::RefreshRemoteBorders()
+{
+    // --- Subtraction 1: our own selection ------------------------------------
+    // On our screen ours always wins. A remote claim may never make us lose track of
+    // what we hold, so these ids are removed from the remote borders entirely — both
+    // the thick pass and the descendant hint — before anything is allocated.
+    const TSet<FString> LocalIds(GetLocalSelectionIds());
+
+    // --- Subtraction 2: a claimed node is never a descendant hint ------------
+    // Seeded with EVERY claimed node, ours included, not merely the ones that end up
+    // drawn: the same precedence a selection has over a child hint locally, so one
+    // node keeps one border however many claimed subtrees it happens to sit under.
+    TSet<FString> Taken;
+    Taken.Reserve(Claims.Num());
+    for (const TPair<FString, TArray<FString>>& Entry : Claims)
+    {
+        Taken.Add(Entry.Key);
+    }
+
+    // The parent -> children index, rebuilt here rather than maintained. It is derived
+    // from ParentId, which UpsertNode and HandleReparent already keep true, and a
+    // second maintained copy of the hierarchy is a thing that can disagree with the
+    // attachment. O(nodes) against a recompute that only runs when something moved.
+    TMap<FString, TArray<FString>> ChildIds;
+    ChildIds.Reserve(Tracked.Num());
+    for (const TPair<FString, FLoomaTrackedActor>& Entry : Tracked)
+    {
+        const ALoomaSyncedActor* Actor = Entry.Value.Actor.Get();
+        if (Actor && !Actor->ParentId.IsEmpty())
+        {
+            ChildIds.FindOrAdd(Actor->ParentId).Add(Entry.Key);
+        }
+    }
+
+    TArray<FLoomaBorderGroup> NextGroups;
+    TArray<FString> NextUndrawn;
+    int32 NextSlot = 1; // 0 is reserved for "no border" and is never allocated.
+
+    // Roster order, which is join order: the same order the web's allocator spends its
+    // passes in, so two clients looking at one room agree about who is drawn and who
+    // was left out rather than each picking a different eight.
+    for (const FLoomaClient& Client : RemoteClients)
+    {
+        FLoomaBorderGroup Group;
+        Group.ClientId = Client.Id;
+        Group.Color = Client.Color;
+        for (const FString& NodeId : Client.Selection)
+        {
+            if (LocalIds.Contains(NodeId))
+            {
+                continue;
+            }
+            const TArray<FString>* Claimants = Claims.Find(NodeId);
+            // The tiebreak, and the only place drawing consults it: the head, or
+            // nothing. A node this client selected but did not claim first is somebody
+            // else's border, and it is not drawn twice.
+            if (Claimants && Claimants->Num() > 0 && (*Claimants)[0] == Client.Id)
+            {
+                Group.OwnNodeIds.Add(NodeId);
+            }
+        }
+        if (Group.OwnNodeIds.Num() == 0)
+        {
+            // A client holding nothing spends no slot. That is what keeps the budget
+            // spent on people who are actually working rather than on people present.
+            continue;
+        }
+        if (NextSlot > LoomaRemoteBorderSlots)
+        {
+            NextUndrawn.Add(Client.Id);
+            continue;
+        }
+        Group.Slot = NextSlot++;
+
+        // The descendant hint: everything under what this client won. Breadth-first
+        // from its own nodes, skipping ours, skipping anything already claimed
+        // outright, and skipping what an earlier group already took — one node, one
+        // border, and earlier means earlier in the roster.
+        // `Taken` doubles as the visited set, which is what makes this safe on a
+        // malformed hierarchy: a node is pushed only in the same statement that adds it
+        // to `Taken`, and nothing is ever removed from `Taken` during a recompute, so
+        // each id is enqueued at most once and the loop is bounded by the node count.
+        // A `ParentId` cycle therefore terminates rather than spinning — including a
+        // cycle that closes back onto a seed, since every node in `Group.OwnNodeIds` is
+        // a claimed node and `Taken` was seeded with every one of those above.
+        TArray<FString> Frontier = Group.OwnNodeIds;
+        while (Frontier.Num() > 0)
+        {
+            const FString ParentId = Frontier.Pop(EAllowShrinking::No);
+            const TArray<FString>* Kids = ChildIds.Find(ParentId);
+            if (!Kids)
+            {
+                continue;
+            }
+            for (const FString& ChildId : *Kids)
+            {
+                if (LocalIds.Contains(ChildId) || Taken.Contains(ChildId))
+                {
+                    continue;
+                }
+                Taken.Add(ChildId);
+                Group.ChildNodeIds.Add(ChildId);
+                // Only a node we actually took is descended into. A skipped one is
+                // somebody else's outright claim or our own selection, and both own
+                // their subtree — walking through them would paint hints on children
+                // that belong to whoever holds the node above them.
+                Frontier.Add(ChildId);
+            }
+        }
+        NextGroups.Add(MoveTemp(Group));
+    }
+
+    // --- Apply -----------------------------------------------------------------
+    TSet<TWeakObjectPtr<UPrimitiveComponent>> Touched;
+    Touched.Reserve(StencilComponents.Num());
+    for (const FLoomaBorderGroup& Group : NextGroups)
+    {
+        for (const FString& NodeId : Group.OwnNodeIds)
+        {
+            ApplyStencilToNode(NodeId, LoomaBorderStencilValue(Group.Slot, /*bChild=*/false), Touched);
+        }
+        for (const FString& NodeId : Group.ChildNodeIds)
+        {
+            ApplyStencilToNode(NodeId, LoomaBorderStencilValue(Group.Slot, /*bChild=*/true), Touched);
+        }
+    }
+    // Everything we had marked and no longer do, restored. This is the half that goes
+    // wrong if it is left to a sweep: without the explicit set we would either have to
+    // walk every actor in the world or leave a border on a node whose owner
+    // disconnected, and the second is exactly the stale claim presence exists to
+    // avoid. A component destroyed in the meantime resolves to null and is simply
+    // dropped.
+    for (const TWeakObjectPtr<UPrimitiveComponent>& Weak : StencilComponents)
+    {
+        if (Touched.Contains(Weak))
+        {
+            continue;
+        }
+        if (UPrimitiveComponent* Primitive = Weak.Get())
+        {
+            Primitive->SetCustomDepthStencilValue(0);
+            Primitive->SetRenderCustomDepth(false);
+        }
+    }
+    StencilComponents = MoveTemp(Touched);
+
+    if (NextUndrawn != UndrawnClientIds && NextUndrawn.Num() > 0)
+    {
+        // Said out loud, once per change. A client that is present, working and
+        // invisible is indistinguishable from an empty room, and a budget nobody is
+        // told about is a bug report about borders that "sometimes do not work".
+        UE_LOG(LogLoomaSync, Warning,
+            TEXT("%d client(s) hold a border with no stencil slot left (budget is %d): %s. ")
+            TEXT("Show Get Undrawn Clients in your UI — they are in the room and drawing nothing."),
+            NextUndrawn.Num(), LoomaRemoteBorderSlots, *FString::Join(NextUndrawn, TEXT(", ")));
+    }
+    BorderGroups = MoveTemp(NextGroups);
+    UndrawnClientIds = MoveTemp(NextUndrawn);
+
+    // Checked here rather than at startup, and only once there is something to draw:
+    // a project that never has a remote client in it does not need to hear about a
+    // render setting it is not using, and a warning nobody can act on is noise that
+    // teaches people to ignore the log.
+    if (BorderGroups.Num() > 0)
+    {
+        static IConsoleVariable* CustomDepthCVar =
+            IConsoleManager::Get().FindConsoleVariable(TEXT("r.CustomDepth"));
+        const int32 CustomDepth = CustomDepthCVar ? CustomDepthCVar->GetInt() : -1;
+        // 3 is "Enabled with Stencil". At 0 or 1 the stencil buffer is not written at
+        // all and NOTHING appears, however correct everything else is — the failure
+        // that looks like a broken plugin and is a project setting. It cannot be set
+        // from here: it is the host project's Project Settings > Rendering >
+        // Postprocessing > Custom Depth-Stencil Pass, and writing to a host's render
+        // config from a plugin would be a worse surprise than the warning.
+        if (CustomDepth != 3 && !bWarnedCustomDepthOff)
+        {
+            bWarnedCustomDepthOff = true;
+            UE_LOG(LogLoomaSync, Warning,
+                TEXT("r.CustomDepth is %d, so remote selection borders will NOT render. Set Project ")
+                TEXT("Settings > Rendering > Postprocessing > Custom Depth-Stencil Pass to ")
+                TEXT("'Enabled with Stencil' (r.CustomDepth=3). Stencil values are being written; ")
+                TEXT("nothing is reading them."),
+                CustomDepth);
+        }
+        else if (CustomDepth == 3)
+        {
+            bWarnedCustomDepthOff = false;
+        }
+    }
+
+    PublishBorderColors();
+}
+
+void ULoomaSceneSyncSubsystem::ApplyStencilToNode(
+    const FString& NodeId, int32 StencilValue, TSet<TWeakObjectPtr<UPrimitiveComponent>>& OutTouched)
+{
+    const FLoomaTrackedActor* Entry = Tracked.Find(NodeId);
+    ALoomaSyncedActor* Actor = Entry ? Entry->Actor.Get() : nullptr;
+    if (!Actor)
+    {
+        // A claim on a node this client does not hold, which is a legitimate state and
+        // not an error: a `selection` races the `spawn` that created its node, and the
+        // claim stays in the ledger so the border appears if the node arrives. Nothing
+        // to mark, so nothing happens.
+        return;
+    }
+    // Every primitive on the actor, rather than ModelComponent and MeshComponent by
+    // name. A node renders through whichever of them its components asked for, both
+    // may be present at once, and reading the class rather than the two fields means a
+    // third component type added later is outlined without this code being touched.
+    //
+    // Note what this does NOT reach: a `light` node and an empty group node have no
+    // primitive at all, so their claim is held in the ledger and draws nothing. The
+    // web solved that with a pick proxy (HAM-148); this plugin has none, and the
+    // README says so rather than the behaviour being a surprise.
+    //
+    // `AActor::` is not optional here: ALoomaSyncedActor has its own GetComponents()
+    // returning the node's *wire* components (FLoomaNodeComponents), which hides the
+    // engine one entirely. Two meanings of "components" one call apart, and only the
+    // qualification says which is meant.
+    TInlineComponentArray<UPrimitiveComponent*> Primitives;
+    Actor->AActor::GetComponents(Primitives);
+    for (UPrimitiveComponent* Primitive : Primitives)
+    {
+        if (!Primitive)
+        {
+            continue;
+        }
+        Primitive->SetCustomDepthStencilValue(StencilValue);
+        Primitive->SetRenderCustomDepth(true);
+        OutTouched.Add(Primitive);
+    }
+}
+
+void ULoomaSceneSyncSubsystem::PublishBorderColors()
+{
+    const FSoftObjectPath& Path = ULoomaSceneSyncSettings::Get().RemoteSelectionCollection;
+    if (Path.IsNull())
+    {
+        // Not an error — a project may be driving its own material from
+        // GetRemoteBorderGroups — but never silent either, because "no collection
+        // configured" and "the feature is broken" produce the identical symptom of no
+        // borders, and only one of them has an obvious fix.
+        if (BorderGroups.Num() > 0 && !bWarnedNoBorderCollection)
+        {
+            bWarnedNoBorderCollection = true;
+            UE_LOG(LogLoomaSync, Warning,
+                TEXT("A remote client holds a border, but no Remote Selection Parameter Collection is ")
+                TEXT("set (Project Settings > Plugins > Looma Scene Sync). Stencil values are being ")
+                TEXT("written; no colours are being published. See the plugin README, 'Wiring the ")
+                TEXT("outline' — or drive your own material from Get Remote Border Groups."));
+        }
+        return;
+    }
+    bWarnedNoBorderCollection = false;
+
+    if (!ResolvedBorderCollection || ResolvedBorderCollection->GetPathName() != Path.ToString())
+    {
+        // Synchronous, and deliberately: this is one small uasset, it is loaded once
+        // for the life of the game instance, and the first frame a border exists is
+        // the wrong one to defer it to — an async load would leave the stencil written
+        // and the colours absent for however long it took, which reads as the wrong
+        // colours rather than as a load in progress.
+        ResolvedBorderCollection = Cast<UMaterialParameterCollection>(Path.TryLoad());
+        if (!ResolvedBorderCollection)
+        {
+            UE_LOG(LogLoomaSync, Warning,
+                TEXT("Remote Selection Parameter Collection '%s' could not be loaded as a Material ")
+                TEXT("Parameter Collection. Remote borders will have no colours."), *Path.ToString());
+            return;
+        }
+    }
+
+    UWorld* World = GetGameInstance() ? GetGameInstance()->GetWorld() : nullptr;
+    if (!World)
+    {
+        return;
+    }
+
+    // Every slot written every time, including the empty ones. Writing only the
+    // occupied slots would leave a departed client's colour sitting in the collection,
+    // and a material that reads a slot the stencil no longer names would draw with it
+    // — which is the "border in the wrong colour" failure, strictly worse than none.
+    // Alpha is the occupancy flag, so a material can reject an unused slot without a
+    // second parameter to keep in step.
+    for (int32 Slot = 1; Slot <= LoomaRemoteBorderSlots; ++Slot)
+    {
+        const FLoomaBorderGroup* Group = BorderGroups.FindByPredicate(
+            [Slot](const FLoomaBorderGroup& Candidate) { return Candidate.Slot == Slot; });
+        FLinearColor Value = FLinearColor(0.0f, 0.0f, 0.0f, 0.0f);
+        if (Group)
+        {
+            Value = Group->Color;
+            Value.A = 1.0f;
+        }
+        UKismetMaterialLibrary::SetVectorParameterValue(World, ResolvedBorderCollection,
+            FName(*FString::Printf(TEXT("LoomaClient%d"), Slot)), Value);
+    }
+    UKismetMaterialLibrary::SetScalarParameterValue(World, ResolvedBorderCollection,
+        TEXT("LoomaClientCount"), static_cast<float>(BorderGroups.Num()));
+}
+
+void ULoomaSceneSyncSubsystem::ClearPresence()
+{
+    const bool bHadRoom = RemoteClients.Num() > 0 || !OwnClientId.IsEmpty() || !SelfClient.Id.IsEmpty();
+    RemoteClients.Reset();
+    SelfClient = FLoomaClient();
+    OwnClientId.Reset();
+    // The ledger goes with the room it describes. It is derived entirely from the
+    // roster and the `selection` messages of the socket that just died, and nothing
+    // will retract a claim made over a connection that no longer exists.
+    Claims.Reset();
+    if (bHadRoom)
+    {
+        // Dirty, not cleared inline: the recompute is the one place that knows which
+        // primitives we marked, and it will now find nothing to draw and restore every
+        // one of them. Clearing here as well would be a second implementation of the
+        // same sweep, and the two would drift.
+        MarkBordersDirty();
+        OnClientsChanged.Broadcast(RemoteClients);
+    }
+}
+
+TArray<FLoomaClient> ULoomaSceneSyncSubsystem::GetClients() const
+{
+    return RemoteClients;
+}
+
+FString ULoomaSceneSyncSubsystem::GetOwnClientId() const
+{
+    return OwnClientId;
+}
+
+// `InClientId` rather than the header's `ClientId`, which is the Blueprint pin name:
+// the member of the same name is this socket's own id, and shadowing it here would be
+// one typo away from answering "is this us" with the wrong variable.
+bool ULoomaSceneSyncSubsystem::GetClient(const FString& InClientId, FLoomaClient& OutClient) const
+{
+    if (InClientId.IsEmpty())
+    {
+        return false;
+    }
+    // Ours first, and it is not in the array — the split is a storage decision, not an
+    // "our entry is unreachable" one.
+    if (!SelfClient.Id.IsEmpty() && SelfClient.Id == InClientId)
+    {
+        OutClient = SelfClient;
+        return true;
+    }
+    if (const FLoomaClient* Found = RemoteClients.FindByPredicate(
+            [&InClientId](const FLoomaClient& Client) { return Client.Id == InClientId; }))
+    {
+        OutClient = *Found;
+        return true;
+    }
+    return false;
+}
+
+void ULoomaSceneSyncSubsystem::LogRoom() const
+{
+    // One log call per client rather than one joined block, so the engine's line
+    // wrapping does not fold a roster of five into an unreadable paragraph.
+    auto LogClient = [](const FLoomaClient& Client, bool bIsSelf) {
+        UE_LOG(LogLoomaSync, Display, TEXT("  %s %s | %s | %s | %s | %s | selection: %s"),
+            bIsSelf ? TEXT("*") : TEXT(" "),
+            *Client.Id,
+            Client.DisplayName.IsEmpty() ? TEXT("<no name>") : *Client.DisplayName,
+            Client.Kind == ELoomaClientKind::User ? TEXT("user") : TEXT("guest"),
+            *Client.Role,
+            *Client.ColorHex,
+            Client.Selection.Num() == 0 ? TEXT("<empty>") : *FString::Join(Client.Selection, TEXT(", ")));
+    };
+
+    if (OwnClientId.IsEmpty() && RemoteClients.Num() == 0)
+    {
+        // Distinguished, because "no roster yet" and "a room with nobody else in it"
+        // look identical from an empty list and mean opposite things — the first is a
+        // socket problem, the second is simply being alone.
+        UE_LOG(LogLoomaSync, Display, TEXT("Looma room: no roster held (%s)"),
+            IsSyncConnected() ? TEXT("connected, none received yet") : TEXT("not connected"));
+        return;
+    }
+
+    UE_LOG(LogLoomaSync, Display, TEXT("Looma room: %d other client(s); our id is %s (* marks us)"),
+        RemoteClients.Num(), OwnClientId.IsEmpty() ? TEXT("<unknown>") : *OwnClientId);
+    // Ours first rather than in its roster position: the position is not kept, since
+    // nothing but the remote list needs join order.
+    if (!SelfClient.Id.IsEmpty())
+    {
+        LogClient(SelfClient, /*bIsSelf=*/true);
+    }
+    else if (!OwnClientId.IsEmpty())
+    {
+        UE_LOG(LogLoomaSync, Display,
+            TEXT("  * %s | <not in the roster the hub sent us>"), *OwnClientId);
+    }
+    for (const FLoomaClient& Client : RemoteClients)
+    {
+        LogClient(Client, /*bIsSelf=*/false);
+    }
+}
+
+void ULoomaSceneSyncSubsystem::LogClaims() const
+{
+    if (Claims.Num() == 0)
+    {
+        UE_LOG(LogLoomaSync, Display, TEXT("Looma claims: nobody in the room has anything selected"));
+        return;
+    }
+
+    UE_LOG(LogLoomaSync, Display, TEXT("Looma claims: %d node(s) claimed (winner first, '<-' marks the border)"),
+        Claims.Num());
+    // Iteration order of a TMap is its internal one, so this listing is not stable
+    // between calls. Deliberately not sorted: the order WITHIN each list is the
+    // load-bearing thing and it is preserved, while sorting the nodes would suggest an
+    // ordering between them that the ledger does not have.
+    for (const TPair<FString, TArray<FString>>& Entry : Claims)
+    {
+        UE_LOG(LogLoomaSync, Display, TEXT("  %s <- %s"),
+            *Entry.Key, *FString::Join(Entry.Value, TEXT(", then ")));
+    }
+
+    // The other direction, and the reason both are printed: what a client selected and
+    // what it actually draws are different numbers the moment anyone is contested, and
+    // a border that is simply missing looks identical to a client that is not there.
+    UE_LOG(LogLoomaSync, Display, TEXT("Looma claims by client:"));
+    for (const FLoomaClient& Client : RemoteClients)
+    {
+        const TArray<FString> Won = GetClientBorderNodes(Client.Id);
+        UE_LOG(LogLoomaSync, Display, TEXT("    %s (%s) wins %d of %d selected%s%s"),
+            *Client.Id,
+            Client.DisplayName.IsEmpty() ? *Client.ColorHex : *Client.DisplayName,
+            Won.Num(), Client.Selection.Num(),
+            Won.Num() > 0 ? TEXT(": ") : TEXT(""),
+            Won.Num() > 0 ? *FString::Join(Won, TEXT(", ")) : TEXT(""));
+    }
+
+    // What is actually being marked, which is a third number again: a client can win a
+    // claim and still draw nothing, either because the budget ran out or because the
+    // node it won has no primitive to outline (a light, or an empty group node).
+    UE_LOG(LogLoomaSync, Display, TEXT("Looma borders: %d of %d stencil slot(s) in use%s%s"),
+        BorderGroups.Num(), LoomaRemoteBorderSlots,
+        UndrawnClientIds.Num() > 0 ? TEXT("; no slot left for: ") : TEXT(""),
+        UndrawnClientIds.Num() > 0 ? *FString::Join(UndrawnClientIds, TEXT(", ")) : TEXT(""));
+    for (const FLoomaBorderGroup& Group : BorderGroups)
+    {
+        UE_LOG(LogLoomaSync, Display, TEXT("    slot %d (%s) stencil %d/%d: %d node(s), %d descendant(s)"),
+            Group.Slot, *Group.ClientId,
+            LoomaBorderStencilValue(Group.Slot, /*bChild=*/false),
+            LoomaBorderStencilValue(Group.Slot, /*bChild=*/true),
+            Group.OwnNodeIds.Num(), Group.ChildNodeIds.Num());
     }
 }
 

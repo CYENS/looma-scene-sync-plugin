@@ -3,6 +3,7 @@
 #include "CoreMinimal.h"
 #include "LoomaAuthTypes.h"
 #include "LoomaGenerationTypes.h"
+#include "LoomaPresenceTypes.h"
 #include "LoomaSyncedActor.h"
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "Tickable.h"
@@ -13,6 +14,8 @@ class IHttpRequest;
 class FJsonObject;
 class FJsonValue;
 class ULoomaGenerationHandle;
+class UMaterialParameterCollection;
+class UPrimitiveComponent;
 
 /**
  * The performance — the workspace — this socket is in, as the `scene` frame reports it
@@ -230,6 +233,25 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FLoomaIdentityEvent, const FLoomaIde
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FLoomaSelectionEvent, const TArray<FString>&, NodeIds);
 
 /**
+ * The room moved: a client joined, left, or arrived holding a different selection.
+ * Carries the **remote** clients in roster order — never our own entry, for the
+ * reason GetClients() gives.
+ *
+ * Fires only when the roster actually differs from the one we held, the same rule
+ * OnAuthStateChanged and OnIdentityChanged follow: binding is then enough and nothing
+ * has to poll or diff defensively. The hub re-sends the whole roster on every join
+ * and every leave, so the traffic is low enough that firing unconditionally would
+ * have been affordable — the objection is not cost. It is that a delegate which fires
+ * when nothing moved teaches every consumer to diff before acting, and step 3's
+ * consumer rebuilds border geometry, which is exactly the work not worth doing twice.
+ *
+ * It DOES fire with an empty array when the socket drops, and that is not a
+ * formality: presence dies with the socket, and this event is the only thing that
+ * will ever tell a consumer to take those borders down. There is no teardown message.
+ */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FLoomaClientsEvent, const TArray<FLoomaClient>&, Clients);
+
+/**
  * Client of the LoomaXR scene-sync hub (backend /ws/scene), speaking **scene format
  * v3** — the normative contract is looma-xr-asset-demo/docs/scene-format.md.
  *
@@ -241,7 +263,8 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FLoomaSelectionEvent, const TArray<F
  * Inbound: hello -> `scene` (the whole document, on connect and on activation), then
  * `spawn` / `despawn` / `transform` / `reparent` / `patch`. Structural ops are
  * re-broadcast by the hub from its own normalised state to *every* client including
- * the sender, so all of them are applied idempotently.
+ * the sender, so all of them are applied idempotently. `clients` rides alongside as
+ * presence rather than scene state — the room roster, never merged into the document.
  *
  * Outbound: every tick, each tracked actor's parent-local transform is diffed against
  * a last-sent cache — any motion (editor/PIE gizmo, physics, sequencer, code) streams
@@ -666,6 +689,177 @@ public:
     /** Our selection changed and has been reported. See FLoomaSelectionEvent. */
     UPROPERTY(BlueprintAssignable, Category = "Looma|Selection")
     FLoomaSelectionEvent OnLocalSelectionChanged;
+
+    // --- Presence: who else is in the room (inbound `clients`) ----------------
+    //
+    // The normative contract is docs/scene-format.md, "Who else is in the room — the
+    // `clients` message". The hub gives every connected client a colour and tells
+    // everyone who is present, so a shared scene reads as shared.
+    //
+    // Three properties of that contract shape everything below. The roster is the
+    // **whole room every time**, so it is replaced wholesale and never merged: a
+    // client that has left is simply absent, and dropping it is the only thing that
+    // clears its borders, because there is no teardown message. Its **order is join
+    // order**, which step 2 uses as the tiebreak when two clients claim one node, so
+    // nothing here sorts it. And **nothing in it is ours to invent** — the colour is
+    // server-assigned, the display name server-resolved, `kind` whatever the hub said.
+    //
+    // This is presence, not scene state: never merged into the document, never saved,
+    // never sent in a `scene`, and cleared the moment the socket dies.
+
+    /**
+     * The **other** clients in the room, in roster order. Empty while disconnected.
+     *
+     * Our own entry is deliberately not in this list — GetOwnClientId() and
+     * GetClient() reach it instead. That is not tidiness: everything downstream of
+     * this list draws a border in that client's colour, and our own colour drawn on
+     * our own selection is exactly the confusion per-client colours exist to remove.
+     * Our selection already has its local highlight.
+     */
+    UFUNCTION(BlueprintPure, Category = "Looma|Presence")
+    TArray<FLoomaClient> GetClients() const;
+
+    /**
+     * Our own id in the room — the roster's `you` — or empty until a roster lands.
+     *
+     * Worth more than it looks: it is the only way this client can learn its own
+     * room name. `GET /auth/me` mints a fresh random `Guest-xxxxxx` on every call
+     * when no session is held, so that name matches nothing anybody else sees; the
+     * roster's self entry is the one place our real name appears. Feed this to
+     * GetClient() to read it.
+     */
+    UFUNCTION(BlueprintPure, Category = "Looma|Presence")
+    FString GetOwnClientId() const;
+
+    /**
+     * One client by id, ours included — the self entry is held separately from the
+     * remote list but is still findable here, so `GetClient(GetOwnClientId())` is how
+     * you read the colour and name everyone else sees for us.
+     *
+     * Note the self entry's `Selection` is the hub's copy, refreshed only on a join
+     * or a leave, so it is stale for us the moment we click something. A reader that
+     * wants our live selection wants GetLocalSelectionIds().
+     */
+    UFUNCTION(BlueprintPure, Category = "Looma|Presence")
+    bool GetClient(const FString& ClientId, FLoomaClient& OutClient) const;
+
+    /**
+     * The room moved. See FLoomaClientsEvent.
+     *
+     * Also fires for an inbound `selection`, which changes no membership at all: a
+     * client's selection is part of FLoomaClient and part of its equality, so "who is
+     * here" and "what are they working on" are one question with one event. A second
+     * delegate for selections would fire in lockstep with this one on every roster —
+     * every roster carries selections — and give a consumer two ways to be told the
+     * same thing.
+     */
+    UPROPERTY(BlueprintAssignable, Category = "Looma|Presence")
+    FLoomaClientsEvent OnClientsChanged;
+
+    // --- The claim ledger: who gets to draw a border on a node ----------------
+    //
+    // Nothing stops two people selecting one node and **nothing is locked** — both can
+    // still edit it. This is a drawing rule only, so that one node has one border, and
+    // it is the contract's "Two clients on one node — first claim wins".
+    //
+    // The ledger is nodeId -> claimants, oldest claim first, maintained by the four
+    // rules the spec gives: append a sender for each id it did not previously hold,
+    // remove it from each id it no longer sends, remove a departed client from every
+    // list, and draw the head. Every client receives hub messages in the same order,
+    // so maintaining arrival order locally is what makes every client agree on the
+    // winner with no arbitration and no extra protocol. A real per-selection lock is
+    // planned and will replace this rule, which is why the tiebreak lives here rather
+    // than being re-decided by whatever draws.
+
+    /**
+     * Who currently wins the border on this node — the oldest live claim — or false if
+     * nobody claims it. Ours is never in the ledger, so this only ever names someone
+     * else.
+     */
+    UFUNCTION(BlueprintPure, Category = "Looma|Presence")
+    bool GetNodeBorderOwner(const FString& NodeId, FLoomaClient& OutClient) const;
+
+    /**
+     * Everyone claiming this node, oldest claim first — the head is the winner. For
+     * a UI that wants to say "and two others", which the border alone cannot.
+     */
+    UFUNCTION(BlueprintPure, Category = "Looma|Presence")
+    TArray<FString> GetNodeClaimants(const FString& NodeId) const;
+
+    /**
+     * The nodes this client both selected **and won**, in that client's selection
+     * order — one outline group's worth, which is what makes it the call a renderer
+     * wants rather than GetClient().Selection.
+     *
+     * Ids for nodes this client does not hold are included, deliberately: a selection
+     * legitimately races the spawn that created its node, filtering here would drop a
+     * claim nothing ever re-sends, and resolving an id to an actor is the caller's job
+     * anyway (FindSyncedActor). Draw nothing for an id you cannot resolve; do not
+     * treat it as an error.
+     */
+    UFUNCTION(BlueprintPure, Category = "Looma|Presence")
+    TArray<FString> GetClientBorderNodes(const FString& ClientId) const;
+
+    // --- Drawing the borders (custom depth stencil) ---------------------------
+    //
+    // The plugin does not draw. It marks: it sets `CustomDepthStencilValue` on the
+    // primitives whose borders this client should show, and publishes the per-client
+    // colours, leaving a consumer project's post-process material to turn the two into
+    // an outline. That split is forced — `"CanContainContent": false` means the plugin
+    // can ship no material and no parameter collection — and it is also the right
+    // shape: a project that already has an outline material wires this in without
+    // adopting a second one. The README's *Wiring the outline* is the whole recipe.
+    //
+    // The weighting mirrors the web client (frontend/src/scene/Scene.jsx): thick on
+    // the claimed node, thinner on everything under it, in the owner's colour. Two
+    // subtractions come before it, both from `remoteBorders` in presence.js. Our own
+    // selection is removed from remote borders first, own and child alike — on our
+    // screen ours always wins, so a remote claim can never make us lose track of what
+    // we hold. And a node someone claimed outright never doubles as another client's
+    // descendant hint, the same precedence a selection has over a child hint locally,
+    // so one node keeps one border however many claimed subtrees it sits under.
+    //
+    // This plugin does NOT drive a stencil for the local selection. That is HAM-188's
+    // half and a consumer's own business — its visuals never change when the room
+    // does, which is the point.
+
+    /**
+     * What to draw, one entry per remote client that holds a border, in roster order.
+     *
+     * For a consumer driving its own material instead of the parameter collection.
+     * Recomputed when the room, the local selection or the scene moves — bind
+     * `On Clients Changed` and re-read, or just read it each frame; it is a cached
+     * array, not a computation.
+     */
+    UFUNCTION(BlueprintPure, Category = "Looma|Presence")
+    TArray<FLoomaBorderGroup> GetRemoteBorderGroups() const;
+
+    /**
+     * Clients holding a border that there was no stencil slot left to draw.
+     *
+     * Never empty silently: a room bigger than LoomaRemoteBorderSlots is a real state,
+     * and a client that is present, working and invisible is indistinguishable from an
+     * empty room unless something says so. Show these in a HUD, the way the web names
+     * them in its room panel; the plugin also logs the list once each time it changes.
+     */
+    UFUNCTION(BlueprintPure, Category = "Looma|Presence")
+    TArray<FString> GetUndrawnClients() const;
+
+    /**
+     * Log the room one line per client — id, name, kind, role, colour and selection —
+     * with our own entry marked. Console: `Looma.Room`.
+     */
+    UFUNCTION(BlueprintCallable, Category = "Looma|Presence")
+    void LogRoom() const;
+
+    /**
+     * Log the claim ledger both ways round: each claimed node with its claimants
+     * oldest-first, and each client with how much of its selection it actually wins.
+     * The two differ whenever anyone is contested, and that difference is the whole
+     * point of the tiebreak. Console: `Looma.Claims`.
+     */
+    UFUNCTION(BlueprintCallable, Category = "Looma|Presence")
+    void LogClaims() const;
 
     // --- Connection control / diagnostics -------------------------------------
 
@@ -1092,6 +1286,65 @@ private:
      */
     void HandleSceneError(const TSharedPtr<FJsonObject>& Msg);
 
+    /** The room roster: rebuild RemoteClients / SelfClient wholesale. See the Presence block. */
+    void HandleClients(const TSharedPtr<FJsonObject>& Msg);
+    /** One client's whole selection, replacing what it held. See the claim-ledger block. */
+    void HandleSelection(const TSharedPtr<FJsonObject>& Msg);
+
+    // --- Claim ledger maintenance --------------------------------------------
+    // The spec's four rules, one function each, so that nothing else in the plugin
+    // decides who draws what. See the public claim-ledger block.
+
+    /** Rule 1: append a claimant to a node's list, if it is not already on it. */
+    void ClaimNode(const FString& NodeId, const FString& ClaimantId);
+    /** Rule 2: drop a claimant from a node's list, and the list itself once empty. */
+    void ReleaseNode(const FString& NodeId, const FString& ClaimantId);
+    /** Rule 3: a departed client holds nothing. The one operation that scans the ledger. */
+    void ReleaseAllClaims(const FString& ClaimantId);
+    /**
+     * Move one client from the set it held to the set it now sends: append for what is
+     * new, release what it let go, and leave everything it still holds exactly where
+     * it is. That last clause is the tiebreak — re-appending an unchanged claim would
+     * silently promote a client to the back of a queue it was already at the front of.
+     */
+    void MoveClaims(const FString& ClaimantId, const TArray<FString>& Held, const TArray<FString>& Next);
+
+    // --- Border rendering ------------------------------------------------------
+
+    /**
+     * The room, the local selection or the scene moved, so the borders need working
+     * out again. A flag rather than an immediate recompute: a roster arriving while
+     * four nodes spawn is one redraw, not five, and the two events that dirty this
+     * most often — a `selection` and a local selection change — can both land in the
+     * same frame.
+     */
+    void MarkBordersDirty() { bBordersDirty = true; }
+
+    /** Recompute BorderGroups and push them to the stencil and the collection, if dirty. */
+    void TickBorders();
+
+    /** Work out who draws what, apply it, and name anyone the budget left out. */
+    void RefreshRemoteBorders();
+
+    /** Write one group's stencil value onto a node's primitives; slot 0 clears. */
+    void ApplyStencilToNode(const FString& NodeId, int32 StencilValue, TSet<TWeakObjectPtr<UPrimitiveComponent>>& OutTouched);
+
+    /** Publish the slot colours to the configured Material Parameter Collection. */
+    void PublishBorderColors();
+
+    /**
+     * Forget the room, because presence dies with the socket.
+     *
+     * Called from every one of the three ways a socket ends — CloseSocket for a
+     * deliberate teardown, and the OnClosed / OnConnectionError handlers for a drop,
+     * which do NOT route through CloseSocket. Missing the last two is the bug worth
+     * naming: the roster would then survive the disconnection that invalidated it, and
+     * step 3 would leave a departed client's borders on screen until a reconnect that
+     * may never come. Broadcasts OnClientsChanged if the room was not already empty,
+     * which is what takes them down.
+     */
+    void ClearPresence();
+
     /**
      * `GET /scenes` once, handing the rows to OnDone — with bOk false and an empty array
      * if the list could not be read, having already said why.
@@ -1436,6 +1689,98 @@ private:
      * happens several times in an ordinary session, not once at startup.
      */
     bool bForceSelectionSend = false;
+
+    /**
+     * The room, from the last `clients` roster: everyone but us, in join order.
+     *
+     * A flat array rather than a map keyed by id, though GetClient() then has to scan
+     * it. Order is load-bearing — it is the claim tiebreak step 2 resolves conflicts
+     * with, and every client receives hub messages in the same order, so preserving it
+     * is what makes all of them agree without a byte of extra protocol. A TMap would
+     * have thrown it away for a lookup on a set whose size is a handful of people in a
+     * room.
+     *
+     * Kept next to the selection state above rather than beside the scene state,
+     * because its lifetime is the selection's, not the scene's: the scene document
+     * survives a reconnect and is re-reconciled from the hub's `scene`, while this
+     * dies with the socket outright — see ClearPresence.
+     */
+    TArray<FLoomaClient> RemoteClients;
+
+    /**
+     * Our own roster entry, held apart from RemoteClients so nothing that iterates
+     * that list can draw our colour on our own selection. Id is empty when we have no
+     * self entry — before the first roster, or if the hub sent one that does not name
+     * us at all.
+     */
+    FLoomaClient SelfClient;
+
+    /**
+     * The roster's `you`: the id the hub says is ours. Empty until a roster lands.
+     *
+     * Stored rather than assumed equal to ClientId, even though the hub echoes back
+     * the id we sent in `hello`. The message is built per recipient and `you` is how
+     * the contract says a client finds itself; deriving it from ClientId instead would
+     * mean we could never notice the two disagreeing, and a disagreement is precisely
+     * the case where we would start painting our own colour on our own selection.
+     * HandleClients cross-checks them and warns.
+     */
+    FString OwnClientId;
+
+    /**
+     * The claim ledger: nodeId -> claimants, oldest claim first. A node with no
+     * claimants has no entry at all, so a lookup miss and an empty list never both
+     * mean "unclaimed".
+     *
+     * Keyed by NODE and only by node, though step 3 needs both directions — "who owns
+     * this node" and "every node this client draws". The second direction is already
+     * held, once, as FLoomaClient::Selection: it is what the wire sends and what the
+     * roster carries, so a per-client index here would be a second copy of a fact the
+     * room already stores, kept in step by hand. The reverse mapping is therefore free
+     * (GetClientBorderNodes filters that client's own selection through this map, one
+     * O(1) lookup per id) and the price is paid in exactly one place: removing a
+     * departed client scans every list, once per roster, over the handful of nodes a
+     * room has selected. Cheap where it is rare, free where it is hot.
+     *
+     * There is deliberately no cached "owner per node" alongside it. The owner IS the
+     * head of a list — deriving it is an array index, and a maintained second copy of
+     * a one-element derivation is a thing that can disagree with its source.
+     */
+    TMap<FString, TArray<FString>> Claims;
+
+    /** What the last recompute decided to draw, in roster order. See GetRemoteBorderGroups. */
+    TArray<FLoomaBorderGroup> BorderGroups;
+
+    /** Clients that hold a border and did not get a slot. See GetUndrawnClients. */
+    TArray<FString> UndrawnClientIds;
+
+    /**
+     * Every primitive we currently have a non-zero stencil value on.
+     *
+     * Held weakly and kept explicitly, because clearing is the half that goes wrong:
+     * a node that loses its border has to be restored to
+     * `SetRenderCustomDepth(false)`, and without this the only way to find it would be
+     * to sweep every actor in the world — which would also stamp on a stencil value
+     * the consumer project set for its own reasons. Weak, so an actor destroyed while
+     * claimed simply drops out; nothing here ever dereferences a stale pointer, and
+     * the ledger itself holds node ids rather than pointers.
+     */
+    TSet<TWeakObjectPtr<UPrimitiveComponent>> StencilComponents;
+
+    /** The collection resolved from the setting, held so it is not collected under us. */
+    UPROPERTY()
+    TObjectPtr<UMaterialParameterCollection> ResolvedBorderCollection;
+
+    /** Set by MarkBordersDirty, spent by TickBorders. */
+    bool bBordersDirty = false;
+
+    /**
+     * One-shot latches for the two diagnostics that would otherwise print every frame.
+     * Both reset when the condition clears, so a fixed setting says so once and a
+     * regression is reported again rather than swallowed.
+     */
+    bool bWarnedNoBorderCollection = false;
+    bool bWarnedCustomDepthOff = false;
 
     /** jobId -> per-job event handle. Only jobs a caller asked about get one. */
     UPROPERTY()
