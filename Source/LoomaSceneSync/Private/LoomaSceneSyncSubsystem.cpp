@@ -77,6 +77,25 @@ constexpr const TCHAR* AuthHeaderBearerPrefix = TEXT("Bearer ");
 constexpr const TCHAR* ClientIdHeaderName = TEXT("X-Client-Id");
 
 /**
+ * The handshake refusals that mean START OVER rather than TRY AGAIN
+ * (docs/scene-format.md, "Performance selection (HAM-197)"). Every other close — a
+ * dropped tunnel, a restarted uvicorn, a laptop lid — is worth retrying, and the
+ * default therefore stays "retry"; these three are the enumerated exceptions.
+ *
+ * They arrive as BARE closes with no error frame, which is the contract's choice and
+ * not an omission: a client that cannot parse an error body it was not expecting is no
+ * better off than one that sees its socket close and knows to stop.
+ */
+constexpr int32 CloseMalformedHello = 4400;   // `expected hello with clientId`
+constexpr int32 CloseKicked = 4403;           // this subject is kicked from that performance
+constexpr int32 ClosePerformanceNotFound = 4404; // no such performance, or private and not ours
+
+bool IsTerminalCloseCode(int32 Code)
+{
+    return Code == CloseMalformedHello || Code == CloseKicked || Code == ClosePerformanceNotFound;
+}
+
+/**
  * The persisted session's location and shape. `Saved/` because it is per-machine
  * scratch that no project commits — see GetSessionFilePath for why Project Settings
  * would be the wrong home.
@@ -298,6 +317,9 @@ void ULoomaSceneSyncSubsystem::Deinitialize()
     PendingHandleReplays.Empty();
     SuggestedTransforms.Empty();
     ActiveSceneId.Reset();
+    ActivePerformance = FLoomaPerformance();
+    RequestedPerformanceId.Reset();
+    SentPerformanceId.Reset();
     Super::Deinitialize();
 }
 
@@ -326,6 +348,19 @@ void ULoomaSceneSyncSubsystem::Connect()
     // what we recorded and what we sent cannot drift if the settings change between
     // creating the socket and it opening.
     SentDisplayName = ULoomaSceneSyncSettings::Get().GuestDisplayName.TrimStartAndEnd();
+    // Snapshotted here for the same reason as the line above and with a sharper edge:
+    // this one is compared against the hub's answer once the `scene` frame lands, so a
+    // request that moved in between — a second `Looma.Performance` typed while the first
+    // switch is still coming up — would make us announce a mismatch that never happened.
+    // RequestedPerformanceId is the durable intent; this is what this socket said.
+    SentPerformanceId = RequestedPerformanceId;
+    bAwaitingPerformanceConfirmation = !SentPerformanceId.IsEmpty();
+    // Making a socket supersedes the refusal that stopped the last one. Cleared here
+    // rather than in Reconnect() so that every door in — a console reconnect, a backend
+    // address change, Initialize — goes through one line, and none of them has to
+    // remember. Nothing reaches here on its own while the code is set: a terminal close
+    // arms no cooldown, so Tick never calls Connect().
+    TerminalCloseCode = 0;
     // The handshake carries the session, so the hub resolves this socket as the account
     // rather than as a guest — the roster every other client draws comes from what it
     // decides here, once, at connect time. Which is why a login has to reconnect: there
@@ -361,6 +396,20 @@ void ULoomaSceneSyncSubsystem::Connect()
         if (!SentDisplayName.IsEmpty())
         {
             Hello->SetStringField(TEXT("displayName"), SentDisplayName);
+        }
+        // Which room to join, and OMITTED ENTIRELY when nothing was asked for — never
+        // sent empty. An absent field is what lands a client wherever the hub decides:
+        // the room this `clientKey` was last in, else `default`. That is what every
+        // build before this one did and it must keep working exactly so. An empty
+        // string is not the same request: `sync.py` treats only a non-empty string as
+        // an explicit choice, and a client that sent "" would be asking for a
+        // performance whose id is "" and collecting a 4404 for it.
+        //
+        // A request and not a claim, like `displayName` above: the hub re-resolves
+        // identity and re-runs the visibility gate, so this decides nothing on its own.
+        if (!SentPerformanceId.IsEmpty())
+        {
+            Hello->SetStringField(TEXT("performanceId"), SentPerformanceId);
         }
         // Belt and braces, both documented: the hub's precedence is bearer header,
         // then session cookie, then `hello.token` (docs/scene-format.md), and all three
@@ -398,8 +447,20 @@ void ULoomaSceneSyncSubsystem::Connect()
     });
     Socket->OnClosed().AddWeakLambda(this, [this](int32 Code, const FString& Reason, bool bWasClean) {
         bConnecting = false;
-        UE_LOG(LogLoomaSync, Warning, TEXT("Socket closed (%d %s), retrying"), Code, *Reason);
-        ReconnectCooldown = ReconnectDelay;
+        // Retry unless the hub has told us the handshake itself is the problem. Only
+        // this handler can make that call: OnConnectionError above never sees a code —
+        // a TCP-level failure has none — so it stays an unconditional retry, which is
+        // right for it. The two paths agree on everything else, including broadcasting
+        // last.
+        if (IsTerminalCloseCode(Code))
+        {
+            HandleTerminalClose(Code, Reason);
+        }
+        else
+        {
+            UE_LOG(LogLoomaSync, Warning, TEXT("Socket closed (%d %s), retrying"), Code, *Reason);
+            ReconnectCooldown = ReconnectDelay;
+        }
         OnSyncDisconnected.Broadcast();
     });
     Socket->OnMessage().AddUObject(this, &ULoomaSceneSyncSubsystem::OnRawMessage);
@@ -582,6 +643,154 @@ FString ULoomaSceneSyncSubsystem::GetActivePerformanceId() const
     return ActivePerformance.Id;
 }
 
+FString ULoomaSceneSyncSubsystem::GetPendingPerformanceId() const
+{
+    return bAwaitingPerformanceConfirmation ? SentPerformanceId : FString();
+}
+
+void ULoomaSceneSyncSubsystem::SwitchPerformance(const FString& PerformanceId)
+{
+    const FString Wanted = PerformanceId.TrimStartAndEnd();
+    if (Wanted.IsEmpty())
+    {
+        // Refused rather than treated as "unset the request and let the hub choose".
+        // That state exists and is reachable — it is what a client that never asked is
+        // in — but there is no console spelling for it (`Looma.Performance` with no
+        // arguments is the report), and reconnecting someone into a room they did not
+        // name is the one move this whole mechanism exists to make visible.
+        UE_LOG(LogLoomaSync, Warning,
+            TEXT("Looma: a performance switch needs an id — nothing was sent, and this client stays ")
+            TEXT("in %s."),
+            ActivePerformance.Id.IsEmpty() ? TEXT("whichever room the hub gave it") : *ActivePerformance.Id);
+        return;
+    }
+    // No early-out when Wanted already equals ActivePerformance.Id, though it looks
+    // free. That id can be one socket out of date — nothing clears it on a drop — so
+    // "you are already there" would be answered from stale state at exactly the moment
+    // somebody types this to get unstuck, and asking for the room you are in is a
+    // legitimate way to force a clean rejoin. A reconnect is the documented cost of
+    // this command, not a surprise it should try to dodge.
+    RequestedPerformanceId = Wanted;
+    UE_LOG(LogLoomaSync, Display,
+        TEXT("Asking for performance '%s' — reconnecting, because a socket's performance is fixed at ")
+        TEXT("`hello` and never changes for the life of the connection."),
+        *Wanted);
+    Reconnect();
+}
+
+void ULoomaSceneSyncSubsystem::ConfirmRequestedPerformance()
+{
+    if (!bAwaitingPerformanceConfirmation)
+    {
+        return;
+    }
+    // Answered, whatever the answer is. Left set, this would re-announce the switch on
+    // every later `scene` frame — and every `openScene` reply is one.
+    bAwaitingPerformanceConfirmation = false;
+    if (ActivePerformance.Id.IsEmpty())
+    {
+        // The frame named no performance, which the hub does not do. Nothing to compare
+        // against, and nothing worth alarming a user about: the frame we did get is
+        // still applied, and `Looma.Performance` will report the emptiness honestly.
+        UE_LOG(LogLoomaSync, Verbose,
+            TEXT("A `scene` frame answered our request for '%s' without naming a performance"),
+            *SentPerformanceId);
+        return;
+    }
+    if (ActivePerformance.Id == SentPerformanceId)
+    {
+        UE_LOG(LogLoomaSync, Display, TEXT("Performance '%s' confirmed by the hub%s"),
+            *ActivePerformance.Id,
+            ActivePerformance.Name.IsEmpty()
+                ? TEXT("")
+                : *FString::Printf(TEXT(" — '%s'"), *ActivePerformance.Name));
+        return;
+    }
+    // NOT an error, and it must not read as one. The contract explicitly allows the hub
+    // to place a client somewhere other than where it asked, and that possibility is the
+    // entire reason the `performance` object is on the wire — a client that assumed it
+    // got what it asked for could never detect the difference. But it must not pass
+    // silently either: somebody typed an id and is now somewhere else, and the log is
+    // where that gets said.
+    UE_LOG(LogLoomaSync, Display,
+        TEXT("Asked for performance '%s'; the hub put this client in '%s'%s instead. Not an error — ")
+        TEXT("the hub decides, and it says so on the `scene` frame for exactly this reason."),
+        *SentPerformanceId,
+        *ActivePerformance.Id,
+        ActivePerformance.Name.IsEmpty()
+            ? TEXT("")
+            : *FString::Printf(TEXT(" ('%s')"), *ActivePerformance.Name));
+}
+
+void ULoomaSceneSyncSubsystem::HandleTerminalClose(int32 Code, const FString& Reason)
+{
+    TerminalCloseCode = Code;
+    // Nothing armed, so Tick's countdown never reaches Connect(). This is the whole of
+    // "terminal": the client rests DISCONNECTED and idle rather than looping, and only
+    // an explicit act starts it again.
+    ReconnectCooldown = 0.0f;
+    // The switch is over however it ended. Left pending, `Looma.Status` and
+    // `Looma.Performance` would go on announcing a switch that was refused.
+    bAwaitingPerformanceConfirmation = false;
+
+    // What THIS socket asked for — the only id a refusal can be about. Deliberately not
+    // cleared: see below.
+    const FString Asked = SentPerformanceId;
+    FString Explanation;
+    if (Code == CloseMalformedHello)
+    {
+        Explanation = TEXT("the hub rejected our handshake as malformed, and retrying would send the ")
+                      TEXT("identical `hello`. That makes it a bug in this plugin rather than ")
+                      TEXT("something to wait out");
+    }
+    else if (Code == CloseKicked)
+    {
+        Explanation = Asked.IsEmpty()
+            ? FString(TEXT("this identity is kicked from the performance the hub placed it in, and only ")
+                      TEXT("a moderator can lift that"))
+            : FString::Printf(
+                TEXT("this identity is kicked from performance '%s', and only a moderator can lift that"),
+                *Asked);
+    }
+    else
+    {
+        // Non-enumerating on purpose: "does not exist" and "private, and you are not a
+        // member" are indistinguishable from the wire, exactly as they are through
+        // `GET /performances/{id}`. So this names both and guesses neither — a message
+        // that picked one would be inventing the half the contract refuses to disclose.
+        Explanation = Asked.IsEmpty()
+            ? FString(TEXT("the hub has no performance available to this identity"))
+            : FString::Printf(
+                TEXT("no performance '%s' is available to this identity — either it does not exist, or ")
+                TEXT("it is private and this identity is not a member. The wire cannot tell those apart"),
+                *Asked);
+    }
+
+    // The two doors out, named every time, because a client that stops and says nothing
+    // more is a headset that looks broken — which is the failure this replaced the retry
+    // loop with if the message is not carried properly.
+    //
+    // THE REQUEST IS KEPT. Clearing it was the alternative and it is worse: a 4403 is
+    // explicitly temporary (a kick gets lifted) and a 4404 becomes a success the moment
+    // somebody shares the performance, so retrying the same id is usually the right next
+    // move — and dropping it would move the user somewhere they never asked for, quietly,
+    // which is precisely the failure `_performance_info` was put on the wire to expose.
+    // Walking back into the same refusal stays possible, but only by typing
+    // `Looma.Reconnect` after being told in this line that it will.
+    //
+    // Warning and not Error, though this is the most final thing the plugin can say:
+    // nothing else in the plugin uses Error, and a lone one would rank a refusal above a
+    // backend that never comes up at all. Finality is carried by the words and by the
+    // state, not by the verbosity.
+    UE_LOG(LogLoomaSync, Warning,
+        TEXT("Socket refused (%d %s) and NOT retrying: %s. %s"),
+        Code, *Reason, *Explanation,
+        Asked.IsEmpty()
+            ? TEXT("`Looma.Reconnect` tries again; `Looma.Performance <id>` asks for a different room.")
+            : TEXT("The request is kept, so `Looma.Reconnect` retries this same id; ")
+              TEXT("`Looma.Performance <other-id>` goes somewhere else."));
+}
+
 // --- Connection control / diagnostics ----------------------------------------
 
 void ULoomaSceneSyncSubsystem::Reconnect()
@@ -685,7 +894,15 @@ FString ULoomaSceneSyncSubsystem::GetSceneSyncUrl() const
 FString ULoomaSceneSyncSubsystem::GetConnectionStatusText() const
 {
     FString State;
-    if (IsSyncConnected())
+    // First, because it outranks everything below and cannot coexist with it: Connect()
+    // clears the code, so a set one means no socket is up or coming up. It also has to
+    // be said instead of "DISCONNECTED", which reads as a state that resolves itself.
+    // This one does not, and that is the whole point of it.
+    if (TerminalCloseCode != 0)
+    {
+        State = FString::Printf(TEXT("REFUSED (%d), not retrying"), TerminalCloseCode);
+    }
+    else if (IsSyncConnected())
     {
         State = TEXT("CONNECTED");
     }
@@ -713,6 +930,17 @@ FString ULoomaSceneSyncSubsystem::GetConnectionStatusText() const
     // The two placeholders differ on purpose. `<unsaved>` is a scene the hub really has
     // us on that has never been saved; `<unknown>` is the absence of an answer, since
     // there is no performance the hub can put us in without naming its id.
+    FString Performance = ActivePerformance.Id.IsEmpty() ? TEXT("<unknown>") : ActivePerformance.Id;
+    // A switch in flight is printed BESIDE the confirmed id rather than in place of it,
+    // for as long as the two can disagree. Nothing clears ActivePerformance on a drop,
+    // so through the whole of a reconnect it names the room being left — and it looks
+    // entirely valid while doing so, which is the most misleading kind of stale a status
+    // line can be. Both facts are true; only together are they the answer.
+    const FString Pending = GetPendingPerformanceId();
+    if (!Pending.IsEmpty())
+    {
+        Performance += FString::Printf(TEXT(" (switching to '%s')"), *Pending);
+    }
     return FString::Printf(
         TEXT("%s | hub %s | rest %s | auth %s | %d node(s), performance %s, scene %s | %d job(s)"),
         *State,
@@ -720,7 +948,7 @@ FString ULoomaSceneSyncSubsystem::GetConnectionStatusText() const
         *RestBase,
         AuthStateText(AuthState),
         Tracked.Num(),
-        ActivePerformance.Id.IsEmpty() ? TEXT("<unknown>") : *ActivePerformance.Id,
+        *Performance,
         ActiveSceneId.IsEmpty() ? TEXT("<unsaved>") : *ActiveSceneId,
         Jobs.Num());
 }
@@ -1639,6 +1867,11 @@ void ULoomaSceneSyncSubsystem::HandleScene(const TSharedPtr<FJsonObject>& Msg)
         (*Performance)->TryGetStringField(TEXT("name"), ActivePerformance.Name);
         (*Performance)->TryGetStringField(TEXT("visibility"), ActivePerformance.Visibility);
     }
+    // Now that the confirmed value is in hand, settle what this socket asked for against
+    // it. Here rather than at the end of the function because it is about the frame's
+    // header and not its document: whether the nodes apply cleanly has no bearing on
+    // which room we are in.
+    ConfirmRequestedPerformance();
 
     // The hub owns the live scene: this is the whole document, sent on connect and
     // whenever someone activates or clears a scene. So it *replaces* what we hold
