@@ -331,6 +331,47 @@ public:
     UFUNCTION(BlueprintPure, Category = "Looma")
     FString GetActivePerformanceId() const;
 
+    /**
+     * Ask the hub to put this client in a different performance, and reconnect —
+     * because a switch **is** a reconnect. A socket's performance is chosen exactly
+     * once, from `hello.performanceId`, and never changes for the life of that
+     * connection (docs/scene-format.md, "Performance selection (HAM-197)"), so there is
+     * no message to send and nothing here could avoid dropping the socket.
+     * Console: `Looma.Performance <performance-id>`.
+     *
+     * A REQUEST, never a grant, and deliberately not validated here — the same posture
+     * as GuestDisplayName. The hub resolves identity first and then runs the identical
+     * non-enumerating `get_visible` check `GET /performances/{id}` runs, so an id this
+     * client thought fine can still be refused, and an id it thought malformed is not
+     * its business: `sync.py` does not have a "malformed performance id" rejection at
+     * all, because a garbage string simply fails that same lookup. The empty check
+     * below is not validation either — it is declining to send a field whose only
+     * possible outcome is a refusal.
+     *
+     * The id OUTLIVES the socket, on purpose: it is the user's stated intent, so a
+     * later `Looma.Reconnect`, a backend-address change and every automatic retry all
+     * keep the room they chose. Only another call to this moves it.
+     *
+     * Refusal arrives as a bare close — 4403 or 4404, no error frame — which stops the
+     * retry loop for good rather than being waited out. See OnClosed.
+     */
+    UFUNCTION(BlueprintCallable, Category = "Looma")
+    void SwitchPerformance(const FString& PerformanceId);
+
+    /**
+     * The performance id this socket asked for and the hub has not yet confirmed;
+     * empty when nothing is in flight.
+     *
+     * Exists because GetActivePerformance() is stale for the whole of that window and
+     * does not look it. Nothing clears the confirmed value on a disconnect — see
+     * HandleScene — so between a switch starting and the new socket's first `scene`
+     * frame, the "current" performance is the room we are LEAVING, reported with a
+     * perfectly valid-looking id. Anything that shows one of these must show the other
+     * while they can disagree.
+     */
+    UFUNCTION(BlueprintPure, Category = "Looma")
+    FString GetPendingPerformanceId() const;
+
     // --- Local selection (outbound `selection`) -------------------------------
     //
     // What this client has selected, reported to the hub so every other client can
@@ -815,6 +856,23 @@ private:
      */
     void HandleSceneError(const TSharedPtr<FJsonObject>& Msg);
 
+    /**
+     * Compare what this socket asked for against what the `scene` frame confirms, once
+     * per connection, and say which happened.
+     *
+     * Once per connection rather than per frame: every `openScene` reply is a `scene`
+     * frame too, so a comparison made on every one of them would repeat the story of a
+     * switch for the whole session. Only a socket that actually carried a request has
+     * anything to confirm, which is what the latch encodes.
+     */
+    void ConfirmRequestedPerformance();
+
+    /**
+     * A close code that means START OVER, not TRY AGAIN. Stops the retry loop and
+     * explains which of the two doors out of it applies.
+     */
+    void HandleTerminalClose(int32 Code, const FString& Reason);
+
     /** Spawn-or-update from one whole wire node (used by `scene` and `spawn`). */
     void UpsertNode(const TSharedPtr<FJsonObject>& Node);
     /** Apply a batch of whole nodes, parents first, then resolve any late parents. */
@@ -973,6 +1031,36 @@ private:
      */
     FLoomaPerformance ActivePerformance;
 
+    // Three pieces of performance state, not one, because "what we want", "what this
+    // socket said" and "what the hub confirmed" are three different facts that are
+    // routinely all different at once — for the whole of a switch, which is a reconnect
+    // and therefore not instant.
+
+    /**
+     * The performance the user asked for, or empty for "wherever the hub puts us".
+     * Survives the socket by design: it is an intent, so every reconnect — a retry, a
+     * `Looma.Reconnect`, a backend-address change — carries it again. Only
+     * SwitchPerformance moves it, including after a refusal, because quietly revising
+     * where somebody asked to be is the one thing a client must not do about this.
+     */
+    FString RequestedPerformanceId;
+
+    /**
+     * What THIS socket's `hello` actually carried. Snapshotted in Connect() beside
+     * SentDisplayName and for the same reason, with a sharper edge: this one is
+     * compared against the hub's answer later, so a request that moved between making
+     * the socket and the `scene` frame landing would otherwise make us report a
+     * mismatch that never happened.
+     */
+    FString SentPerformanceId;
+
+    /**
+     * This socket carried a request and no `scene` frame has answered it yet. The
+     * window in which ActivePerformance is one socket out of date while looking
+     * entirely valid, which is why GetPendingPerformanceId exists to be shown beside it.
+     */
+    bool bAwaitingPerformanceConfirmation = false;
+
     /**
      * The local selection, held **weakly and as actors** rather than as node ids.
      *
@@ -1029,5 +1117,15 @@ private:
 
     bool bApplyingRemote = false;              // suppress outbound while applying inbound
     float ReconnectCooldown = 0.0f;
+    /**
+     * The close code that stopped us, or 0. Non-zero means no retry is armed and none
+     * will be: the handshake was refused in a way that repeating it cannot fix.
+     *
+     * The code and not a bool, so `Looma.Status` can say WHICH refusal without the
+     * answer living only in a log line that has since scrolled away. Cleared by
+     * Connect(), so making a socket is what supersedes it and no caller has to
+     * remember to.
+     */
+    int32 TerminalCloseCode = 0;
     float SinceLastTransientSend = 1.0f;
 };

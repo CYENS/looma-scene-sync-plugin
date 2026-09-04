@@ -11,8 +11,9 @@
  * `Looma.Reconnect` / `Looma.Status` — the two things you want from a console when the
  * viewer shows an empty scene, in the editor console, in PIE, or in a packaged build —
  * plus `Looma.Login` / `Looma.Logout` / `Looma.Whoami` for the auth surface and
- * `Looma.Scene` / `Looma.Performance` for which scene this client is looking at and
- * which workspace it is looking at it in.
+ * `Looma.Scene` / `Looma.Performance` for which scene this client is looking at, and
+ * which workspace it is looking at it in — the second of which is also the one command
+ * that can move it, since a performance switch is a reconnect rather than a message.
  *
  * The subsystem is per-GameInstance while a console command is global, so each command
  * resolves the subsystem when it runs: from the world the console handed us, else from
@@ -221,14 +222,20 @@ FAutoConsoleCommandWithWorldAndArgs GLoomaSceneCommand(
     }));
 
 /**
- * `Looma.Performance` — which workspace this socket is in.
+ * `Looma.Performance [performance-id]` — which workspace this socket is in, and how to
+ * move it.
  *
- * Read-only, and that is a fact about the wire rather than an unfinished command. The
- * hub resolves the workspace once, from the `hello`, and there is no message that moves
- * a socket already up: switching PERFORMANCE is a reconnect where switching SCENE is a
- * message. So an argument gets a usage line that names what is missing instead of being
- * quietly ignored — a `Looma.Performance <id>` that accepted an id and did nothing is
- * the one outcome worse than not having the command at all.
+ * With an id it RECONNECTS, and there is no gentler option: a socket's performance is
+ * chosen once, from the `hello`, and never changes for the life of that connection
+ * (docs/scene-format.md, "Performance selection (HAM-197)"). That is the asymmetry with
+ * `Looma.Scene`, which sends a message and keeps its socket — and it is why this command
+ * does NOT test IsSyncConnected() first the way that one does. A switch typed while the
+ * socket is down is not lost, it is the whole repair: it records the intent and starts
+ * the connection that carries it.
+ *
+ * With no arguments it reports, and reports the pending switch first when there is one.
+ * That order is not cosmetic — during a switch the "current" performance is the room
+ * being left, and it looks perfectly valid.
  *
  * The prose lives here rather than behind a subsystem Log... method, unlike
  * `Looma.Scene`. That one had to sit in the subsystem because a scene's name costs a
@@ -238,15 +245,16 @@ FAutoConsoleCommandWithWorldAndArgs GLoomaSceneCommand(
  */
 FAutoConsoleCommandWithWorldAndArgs GLoomaPerformanceCommand(
     TEXT("Looma.Performance"),
-    TEXT("Log the performance (workspace) this client is in: its id, name and visibility."),
+    TEXT("Switch this client to a performance: Looma.Performance <performance-id> (a reconnect). ")
+    TEXT("With no arguments, log the performance this client is in."),
     FConsoleCommandWithWorldAndArgsDelegate::CreateStatic([](const TArray<FString>& Args, UWorld* World) {
-        if (Args.Num() != 0)
+        // One id or none, like `Looma.Scene` and for the same reason: an id is a slug on
+        // the wire and a second argument is a typo, not a value that needed quoting.
+        if (Args.Num() > 1)
         {
             UE_LOG(LogLoomaSync, Display,
-                TEXT("Usage: Looma.Performance  (no arguments — reports the current performance). ")
-                TEXT("Switching with `Looma.Performance <performance-id>` is not implemented yet: it ")
-                TEXT("is a reconnect and not a message, so it arrives with `hello.performanceId` and ")
-                TEXT("the terminal close codes that go with it."));
+                TEXT("Usage: Looma.Performance <performance-id>  (with no arguments, reports the ")
+                TEXT("current performance)"));
             return;
         }
         ULoomaSceneSyncSubsystem* Subsystem = FindLoomaSubsystem(World);
@@ -254,6 +262,27 @@ FAutoConsoleCommandWithWorldAndArgs GLoomaPerformanceCommand(
         {
             LogNoSubsystem(TEXT("Looma.Performance"));
             return;
+        }
+        if (Args.Num() == 1)
+        {
+            // No local check on the id, and no connectivity check either. The hub owns
+            // both questions: it re-resolves identity and re-runs the visibility gate,
+            // and it answers a refusal with a bare 4403/4404 close that stops the retry
+            // loop and explains itself. Nothing said from here could improve on that.
+            Subsystem->SwitchPerformance(Args[0]);
+            return;
+        }
+        const FString Pending = Subsystem->GetPendingPerformanceId();
+        if (!Pending.IsEmpty())
+        {
+            // Before anything about the current performance, because until the new
+            // socket's `scene` frame lands the "current" one is the room being left —
+            // nothing clears it on a drop, so it reads as valid while being one socket
+            // out of date.
+            UE_LOG(LogLoomaSync, Display,
+                TEXT("Switching to performance '%s' — waiting for the new socket's `scene` frame. ")
+                TEXT("Until it lands, what follows is the performance being left."),
+                *Pending);
         }
         const FLoomaPerformance Performance = Subsystem->GetActivePerformance();
         if (Performance.Id.IsEmpty())
