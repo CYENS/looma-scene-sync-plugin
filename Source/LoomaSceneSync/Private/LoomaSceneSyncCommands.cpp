@@ -13,7 +13,9 @@
  * plus `Looma.Login` / `Looma.Logout` / `Looma.Whoami` for the auth surface and
  * `Looma.Scene` / `Looma.Performance` for which scene this client is looking at, and
  * which workspace it is looking at it in — the second of which is also the one command
- * that can move it, since a performance switch is a reconnect rather than a message.
+ * that can move it, since a performance switch is a reconnect rather than a message —
+ * with `Looma.Scenes` / `Looma.Performances` printing every id and name those two will
+ * accept, so the console needs no browser tab beside it.
  *
  * The subsystem is per-GameInstance while a console command is global, so each command
  * resolves the subsystem when it runs: from the world the console handed us, else from
@@ -233,6 +235,38 @@ FAutoConsoleCommandWithWorldAndArgs GLoomaSceneCommand(
     }));
 
 /**
+ * `Looma.Scenes` — every scene this identity may open, id and name, active one marked.
+ *
+ * The command the user actually asked for: `Looma.Scene <name-or-id>` accepts two kinds
+ * of string and, before this, nothing in the client would tell them either. Answering
+ * "what are the ids" by alt-tabbing to a browser is not answering it.
+ *
+ * No arguments of any kind, not even a filter. A filter is a second matching rule to
+ * keep in step with the one in OpenSceneByNameOrId, and on six rows it would be
+ * answering a question nobody has yet asked.
+ */
+FAutoConsoleCommandWithWorldAndArgs GLoomaScenesCommand(
+    TEXT("Looma.Scenes"),
+    TEXT("List every scene this client may open: id, name, and which one is active."),
+    FConsoleCommandWithWorldAndArgsDelegate::CreateStatic([](const TArray<FString>& Args, UWorld* World) {
+        ULoomaSceneSyncSubsystem* Subsystem = FindLoomaSubsystem(World);
+        if (!Subsystem)
+        {
+            LogNoSubsystem(TEXT("Looma.Scenes"));
+            return;
+        }
+        // Arguments ignored rather than refused. There is nothing they could mean, the
+        // command is harmless, and a usage line for a command that takes nothing is a
+        // paragraph explaining a blank.
+        //
+        // No connectivity check either, and the asymmetry with `Looma.Scene <id>` is the
+        // point: this reads the catalogue over HTTP and never touches the socket, so it
+        // answers perfectly well while disconnected — which is exactly when somebody is
+        // working out where to reconnect to.
+        Subsystem->LogScenes();
+    }));
+
+/**
  * `Looma.Performance [performance-id]` — which workspace this socket is in, and how to
  * move it.
  *
@@ -328,6 +362,31 @@ FAutoConsoleCommandWithWorldAndArgs GLoomaPerformanceCommand(
         }
         UE_LOG(LogLoomaSync, Display, TEXT("Current performance '%s' — '%s' (%s)"),
             *Performance.Id, *Performance.Name, Visibility);
+    }));
+
+/**
+ * `Looma.Performances` — every workspace this identity may see, with our role in each.
+ *
+ * The other half of `Looma.Scenes`, and the one that makes `Looma.Performance <id>`
+ * usable: a switch takes an id, and this is where the ids come from. It prints `role`
+ * as well, because a workspace this caller may only watch and one it may reshape are
+ * different answers to "should I switch to this".
+ */
+FAutoConsoleCommandWithWorldAndArgs GLoomaPerformancesCommand(
+    TEXT("Looma.Performances"),
+    TEXT("List every performance (workspace) this client may see: id, name, our role, and which ")
+    TEXT("one this socket is in."),
+    FConsoleCommandWithWorldAndArgsDelegate::CreateStatic([](const TArray<FString>& Args, UWorld* World) {
+        ULoomaSceneSyncSubsystem* Subsystem = FindLoomaSubsystem(World);
+        if (!Subsystem)
+        {
+            LogNoSubsystem(TEXT("Looma.Performances"));
+            return;
+        }
+        // Arguments ignored and no connectivity check, for the same two reasons as
+        // `Looma.Scenes` — and the second matters more here, since the reason to read
+        // this list is often that a switch was refused and the socket is stopped.
+        Subsystem->LogPerformances();
     }));
 
 /**
