@@ -495,6 +495,38 @@ public:
     void SwitchPerformance(const FString& PerformanceId);
 
     /**
+     * Switch performance and, once the new socket is actually in one, open the cue at
+     * `CueIndex`. Console: `Looma.Performance <performance-id> <index>`.
+     *
+     * The two halves cannot simply be called in order, and that is the whole of this
+     * function. A switch is a RECONNECT, so the socket the `openScene` needs does not
+     * exist when this returns; a send before it opens is dropped silently; and the
+     * running order has to be read for the performance we LAND in, which the hub is
+     * free to make a different one from the one we asked for. So the index is parked
+     * and fired from ConfirmRequestedPerformance — the one moment "the switch landed,
+     * and here is where we actually are" first becomes true.
+     *
+     * NOT VALIDATED AGAINST THE TARGET'S RAIL FIRST, though `GET /performances/{id}/cues`
+     * would answer before the socket is dropped. Three reasons, and the last is
+     * decisive. It would re-ask a question the handshake asks anyway, so a scene shared
+     * or archived in between makes the two disagree and this one refuses a switch the
+     * hub would have allowed. It would read the rail of the performance we ASKED for,
+     * which is exactly the list that may not be the one we end up in — the bug the
+     * fire-on-confirmation rule exists to avoid. And every performance on this backend
+     * currently has an empty running order, so a pre-flight check would refuse every
+     * two-argument command outright rather than switching and reporting an empty rail,
+     * which is a worse answer to the state the user is actually in.
+     *
+     * The cost of that choice is real and is not hidden: an index that turns out to be
+     * out of range is discovered AFTER a reconnect everyone in the room has already
+     * paid for. The failure line therefore separates the halves — the switch stands,
+     * only the jump was dropped — because "nothing happened" would be a lie and
+     * "it failed" would be two.
+     */
+    UFUNCTION(BlueprintCallable, Category = "Looma")
+    void SwitchPerformanceToCue(const FString& PerformanceId, int32 CueIndex);
+
+    /**
      * The performance id this socket asked for and the hub has not yet confirmed;
      * empty when nothing is in flight.
      *
@@ -1110,6 +1142,24 @@ private:
         TFunction<void(bool bOk, const TArray<FLoomaCue>& Cues)> OnDone);
 
     /**
+     * Read one performance's running order, resolve a 0-based index against it, and
+     * open that cue's scene. The single implementation behind both ways to fire a cue.
+     *
+     * Two callers with opposite preconditions, which is the seam: `Looma.Cue <index>`
+     * REFUSES while a switch is in flight, because acting on the outgoing room's rail
+     * is a race, while the post-switch jump fires at the one instant that race is over
+     * — ConfirmRequestedPerformance has already cleared the pending id by the time it
+     * calls this. Keeping the guard in the callers and the resolve here is what stops
+     * the second one from being a copy that drifts.
+     *
+     * FailureNote is appended to every outcome that does not fire. It exists for one
+     * caller: after a switch, "there is no cue 9" must not read as "the switch failed",
+     * so that path passes a sentence saying the switch stands. `Looma.Cue` passes
+     * nothing, because there is no other action for it to disclaim.
+     */
+    void ResolveAndOpenCue(const FString& PerformanceId, int32 CueIndex, const FString& FailureNote);
+
+    /**
      * A GET against the backend, configured the one way a catalogue read has to be.
      *
      * Extracted because this is the half of a catalogue fetch that is easy to get wrong
@@ -1325,6 +1375,23 @@ private:
      * entirely valid, which is why GetPendingPerformanceId exists to be shown beside it.
      */
     bool bAwaitingPerformanceConfirmation = false;
+
+    /**
+     * A cue to open once the switch lands, or INDEX_NONE. The only piece of intent here
+     * that has to survive a reconnect, because the action it describes cannot happen
+     * until the socket it needs has been replaced.
+     *
+     * Dropped by everything that makes it meaningless, each handled where that happens:
+     * a terminal 4400/4403/4404 close, since the socket it was waiting for will never
+     * open; a plain `Looma.Performance <id>` with no index, which supersedes it (which
+     * is why SwitchPerformance clears it and SwitchPerformanceToCue arms it after
+     * calling through); and landing anywhere other than the performance asked for,
+     * where an index chosen against one running order would otherwise be applied to a
+     * different one the user has never seen. It survives a plain reconnect on purpose:
+     * a retry, or a `Looma.Reconnect` typed to hurry one along, is the same switch
+     * still trying to happen.
+     */
+    int32 PendingCueIndex = INDEX_NONE;
 
     /**
      * The local selection, held **weakly and as actors** rather than as node ids.

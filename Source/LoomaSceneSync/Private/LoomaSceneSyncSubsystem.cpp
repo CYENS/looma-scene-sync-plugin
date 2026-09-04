@@ -3,6 +3,7 @@
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 #include "Engine/GameInstance.h"
+#include "GenericPlatform/GenericPlatformHttp.h"
 #include "Engine/World.h"
 #include "HAL/FileManager.h"
 #include "HttpModule.h"
@@ -360,6 +361,7 @@ void ULoomaSceneSyncSubsystem::Deinitialize()
     ActivePerformance = FLoomaPerformance();
     RequestedPerformanceId.Reset();
     SentPerformanceId.Reset();
+    PendingCueIndex = INDEX_NONE;
     Super::Deinitialize();
 }
 
@@ -1084,8 +1086,17 @@ void ULoomaSceneSyncSubsystem::LogPerformances()
 void ULoomaSceneSyncSubsystem::FetchCues(const FString& PerformanceId,
     TFunction<void(bool bOk, const TArray<FLoomaCue>& Cues)> OnDone)
 {
-    const FString ListUrl =
-        GetRestBase() + FString::Printf(TEXT("/performances/%s/cues"), *PerformanceId);
+    // Escaped, and the note in the header about where escaping would earn its place was
+    // half wrong, so it is corrected here rather than left to look prophetic: the
+    // prediction was that a command taking a performance id from a person would build
+    // this path, and no command does. Both callers pass the CONFIRMED id — the fire
+    // path deliberately reads the rail of where we landed, not where we asked — so a
+    // typed string never reaches a URL. What does reach it is still a string from the
+    // wire being spliced into a path, and one call is cheaper than an argument about
+    // whether a `/` could ever appear in an id the hub minted.
+    const FString ListUrl = GetRestBase()
+        + FString::Printf(TEXT("/performances/%s/cues"),
+            *FGenericPlatformHttp::UrlEncode(PerformanceId));
     const TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Request = MakeCatalogueRequest(ListUrl);
     Request->OnProcessRequestComplete().BindWeakLambda(this,
         [ListUrl, OnDone](FHttpRequestPtr Req, FHttpResponsePtr Resp, bool bOk) {
@@ -1259,43 +1270,55 @@ void ULoomaSceneSyncSubsystem::OpenCue(int32 CueIndex)
             CueIndex);
         return;
     }
-    FetchCues(PerformanceId, [this, CueIndex, PerformanceId](bool bOk, const TArray<FLoomaCue>& Cues) {
-        if (!bOk)
-        {
-            UE_LOG(LogLoomaSync, Warning, TEXT("...so cue %d cannot be resolved."), CueIndex);
-            return;
-        }
-        if (Cues.Num() == 0)
-        {
-            UE_LOG(LogLoomaSync, Warning,
-                TEXT("Performance '%s' has no cues at all, so there is no cue %d to fire. Nothing ")
-                TEXT("is wrong with it — a running order is arranged separately from the pool, and ")
-                TEXT("this one has not been. `Looma.Scene <name-or-id>` opens a scene directly."),
-                *PerformanceId, CueIndex);
-            return;
-        }
-        if (!Cues.IsValidIndex(CueIndex))
-        {
-            // The range, not a clamp. Clamping is how a performance shows the wrong
-            // scene to a room, and it would hide the off-by-one this console is
-            // probably being used to find.
-            UE_LOG(LogLoomaSync, Warning,
-                TEXT("There is no cue %d: performance '%s' has %d, numbered 0 to %d. `Looma.Cue` ")
-                TEXT("with no argument prints them."),
-                CueIndex, *PerformanceId, Cues.Num(), Cues.Num() - 1);
-            return;
-        }
-        const FLoomaCue& Cue = Cues[CueIndex];
-        // The index, the scene and the label together, because the index is what was
-        // typed and the scene id is what every later line will call it — and a cue
-        // fired by number should say what it turned out to be before it happens.
-        UE_LOG(LogLoomaSync, Display, TEXT("Cue %d of '%s' is scene '%s'%s; opening it."),
-            CueIndex, *PerformanceId, *Cue.SceneId,
-            Cue.Label.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" ('%s')"), *Cue.Label));
-        // An `openScene` and nothing else: the cue names a scene in the performance this
-        // socket is already in, so there is no reconnect and no identity to re-resolve.
-        OpenScene(Cue.SceneId);
-    });
+    // Nothing to disclaim: this command did one thing and the outcome is about that
+    // one thing. The post-switch caller passes a sentence here instead.
+    ResolveAndOpenCue(PerformanceId, CueIndex, FString());
+}
+
+void ULoomaSceneSyncSubsystem::ResolveAndOpenCue(const FString& PerformanceId, int32 CueIndex,
+    const FString& FailureNote)
+{
+    FetchCues(PerformanceId,
+        [this, CueIndex, PerformanceId, FailureNote](bool bOk, const TArray<FLoomaCue>& Cues) {
+            if (!bOk)
+            {
+                UE_LOG(LogLoomaSync, Warning, TEXT("...so cue %d cannot be resolved.%s"),
+                    CueIndex, *FailureNote);
+                return;
+            }
+            if (Cues.Num() == 0)
+            {
+                UE_LOG(LogLoomaSync, Warning,
+                    TEXT("Performance '%s' has no cues at all, so there is no cue %d to fire. ")
+                    TEXT("Nothing is wrong with it — a running order is arranged separately from ")
+                    TEXT("the pool, and this one has not been. `Looma.Scene <name-or-id>` opens a ")
+                    TEXT("scene directly.%s"),
+                    *PerformanceId, CueIndex, *FailureNote);
+                return;
+            }
+            if (!Cues.IsValidIndex(CueIndex))
+            {
+                // The range, not a clamp. Clamping is how a performance shows the wrong
+                // scene to a room, and it would hide the off-by-one this console is
+                // probably being used to find.
+                UE_LOG(LogLoomaSync, Warning,
+                    TEXT("There is no cue %d: performance '%s' has %d, numbered 0 to %d. ")
+                    TEXT("`Looma.Cue` with no argument prints them.%s"),
+                    CueIndex, *PerformanceId, Cues.Num(), Cues.Num() - 1, *FailureNote);
+                return;
+            }
+            const FLoomaCue& Cue = Cues[CueIndex];
+            // The index, the scene and the label together, because the index is what was
+            // typed and the scene id is what every later line will call it — and a cue
+            // fired by number should say what it turned out to be before it happens.
+            UE_LOG(LogLoomaSync, Display, TEXT("Cue %d of '%s' is scene '%s'%s; opening it."),
+                CueIndex, *PerformanceId, *Cue.SceneId,
+                Cue.Label.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" ('%s')"), *Cue.Label));
+            // An `openScene` and nothing else: the cue names a scene in the performance
+            // this socket is already in, so there is no reconnect and no identity to
+            // re-resolve.
+            OpenScene(Cue.SceneId);
+        });
 }
 
 void ULoomaSceneSyncSubsystem::SwitchPerformance(const FString& PerformanceId)
@@ -1321,11 +1344,51 @@ void ULoomaSceneSyncSubsystem::SwitchPerformance(const FString& PerformanceId)
     // legitimate way to force a clean rejoin. A reconnect is the documented cost of
     // this command, not a surprise it should try to dodge.
     RequestedPerformanceId = Wanted;
+    // A plain switch supersedes a parked jump, and clearing it HERE rather than in the
+    // console command is what makes that true of every caller — including
+    // SwitchPerformanceToCue, which calls through and then arms its own. Left behind, a
+    // cue number typed a minute ago would fire into a room chosen since.
+    PendingCueIndex = INDEX_NONE;
     UE_LOG(LogLoomaSync, Display,
         TEXT("Asking for performance '%s' — reconnecting, because a socket's performance is fixed at ")
         TEXT("`hello` and never changes for the life of the connection."),
         *Wanted);
     Reconnect();
+}
+
+void ULoomaSceneSyncSubsystem::SwitchPerformanceToCue(const FString& PerformanceId, int32 CueIndex)
+{
+    if (CueIndex < 0)
+    {
+        // Refused before the socket is touched, because this much IS knowable now: no
+        // running order has a negative position, whatever the destination turns out to
+        // hold. The RANGE cannot be known until the new rail is read, which is why only
+        // this half is checked early — a reconnect that everybody in the room pays for
+        // should not be spent proving something arithmetic.
+        UE_LOG(LogLoomaSync, Warning,
+            TEXT("Not switching: cue indices are 0-based and cannot be negative, so %d names no cue ")
+            TEXT("in any performance."),
+            CueIndex);
+        return;
+    }
+    // Through the plain switch, so there is one implementation of "ask for a
+    // performance" — its empty-id refusal, its request bookkeeping and its reconnect —
+    // and this adds only the parked intent. It also clears PendingCueIndex on the way
+    // through, so arming after the call is what makes a second two-argument command
+    // supersede the first rather than queue behind it.
+    SwitchPerformance(PerformanceId);
+    if (RequestedPerformanceId.IsEmpty())
+    {
+        // The switch was refused (an empty id), and it has already said so. Arming a
+        // jump for a reconnect that is not happening would leave it to fire on whatever
+        // reconnect came next.
+        return;
+    }
+    PendingCueIndex = CueIndex;
+    UE_LOG(LogLoomaSync, Display,
+        TEXT("Cue %d will open once the new socket is confirmed in a performance — the running ")
+        TEXT("order is read then, for where we actually land."),
+        CueIndex);
 }
 
 void ULoomaSceneSyncSubsystem::ConfirmRequestedPerformance()
@@ -1337,6 +1400,11 @@ void ULoomaSceneSyncSubsystem::ConfirmRequestedPerformance()
     // Answered, whatever the answer is. Left set, this would re-announce the switch on
     // every later `scene` frame — and every `openScene` reply is one.
     bAwaitingPerformanceConfirmation = false;
+    // Taken and cleared together with the latch, for the same reason: this is the one
+    // instant the parked jump is meaningful, and a copy left behind would fire again on
+    // the next `scene` frame — which the jump itself is about to cause.
+    const int32 Jump = PendingCueIndex;
+    PendingCueIndex = INDEX_NONE;
     if (ActivePerformance.Id.IsEmpty())
     {
         // The frame named no performance, which the hub does not do. Nothing to compare
@@ -1345,6 +1413,13 @@ void ULoomaSceneSyncSubsystem::ConfirmRequestedPerformance()
         UE_LOG(LogLoomaSync, Verbose,
             TEXT("A `scene` frame answered our request for '%s' without naming a performance"),
             *SentPerformanceId);
+        if (Jump != INDEX_NONE)
+        {
+            UE_LOG(LogLoomaSync, Warning,
+                TEXT("Cue %d was not opened: the frame that answered the switch named no ")
+                TEXT("performance, so there is no running order to index into."),
+                Jump);
+        }
         return;
     }
     if (ActivePerformance.Id == SentPerformanceId)
@@ -1354,6 +1429,17 @@ void ULoomaSceneSyncSubsystem::ConfirmRequestedPerformance()
             ActivePerformance.Name.IsEmpty()
                 ? TEXT("")
                 : *FString::Printf(TEXT(" — '%s'"), *ActivePerformance.Name));
+        if (Jump != INDEX_NONE)
+        {
+            // The one path that fires. GetPendingPerformanceId is already empty — the
+            // latch above cleared it — so the guard on `Looma.Cue` is not tripped, and
+            // this is precisely the instant that guard was protecting: the switch has
+            // resolved, so the rail about to be read is the one we are actually in.
+            ResolveAndOpenCue(ActivePerformance.Id, Jump,
+                FString::Printf(
+                    TEXT(" The switch itself stands: this client is in '%s'."),
+                    *ActivePerformance.Id));
+        }
         return;
     }
     // NOT an error, and it must not read as one. The contract explicitly allows the hub
@@ -1370,6 +1456,23 @@ void ULoomaSceneSyncSubsystem::ConfirmRequestedPerformance()
         ActivePerformance.Name.IsEmpty()
             ? TEXT("")
             : *FString::Printf(TEXT(" ('%s')"), *ActivePerformance.Name));
+    if (Jump != INDEX_NONE)
+    {
+        // DROPPED, not applied to the room we ended up in. The number was chosen
+        // against the running order of the performance the user named, and every
+        // running order is a different show of a different length — so firing it here
+        // would open a scene picked from a list they have never seen, in a room they
+        // did not choose. Two surprises compounding, and the second one silent.
+        //
+        // The other reading — "cue 3 means the fourth thing that happens, wherever I
+        // am" — is coherent, and it is what makes this worth stating rather than
+        // assuming. It loses because the index is not a name: it means nothing without
+        // the list it points into, and the user has not seen this one.
+        UE_LOG(LogLoomaSync, Warning,
+            TEXT("Cue %d was not opened: it was chosen for '%s' and this client is in '%s', whose ")
+            TEXT("running order is a different list. `Looma.Cue` prints this one."),
+            Jump, *SentPerformanceId, *ActivePerformance.Id);
+    }
 }
 
 void ULoomaSceneSyncSubsystem::HandleTerminalClose(int32 Code, const FString& Reason)
@@ -1382,6 +1485,14 @@ void ULoomaSceneSyncSubsystem::HandleTerminalClose(int32 Code, const FString& Re
     // The switch is over however it ended. Left pending, `Looma.Status` and
     // `Looma.Performance` would go on announcing a switch that was refused.
     bAwaitingPerformanceConfirmation = false;
+    // And so is any cue parked behind it. The socket it was waiting for will never
+    // open, so the jump would otherwise sit armed until some unrelated reconnect
+    // happened to fire it — the failure mode of every intent that outlives its reason.
+    // Reported rather than dropped quietly: a two-part command deserves to be told
+    // which parts did not happen, and only the first part's failure is announced below.
+    const bool bHadJump = PendingCueIndex != INDEX_NONE;
+    const int32 DroppedJump = PendingCueIndex;
+    PendingCueIndex = INDEX_NONE;
 
     // What THIS socket asked for — the only id a refusal can be about. Deliberately not
     // cleared: see below.
@@ -1439,6 +1550,12 @@ void ULoomaSceneSyncSubsystem::HandleTerminalClose(int32 Code, const FString& Re
             ? TEXT("`Looma.Reconnect` tries again; `Looma.Performance <id>` asks for a different room.")
             : TEXT("The request is kept, so `Looma.Reconnect` retries this same id; ")
               TEXT("`Looma.Performance <other-id>` goes somewhere else."));
+    if (bHadJump)
+    {
+        UE_LOG(LogLoomaSync, Warning,
+            TEXT("Cue %d was dropped with it: it was waiting for a socket that will not open."),
+            DroppedJump);
+    }
 }
 
 // --- Connection control / diagnostics ----------------------------------------
