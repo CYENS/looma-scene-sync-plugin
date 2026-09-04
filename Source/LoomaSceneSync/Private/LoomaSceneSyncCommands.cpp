@@ -11,7 +11,8 @@
  * `Looma.Reconnect` / `Looma.Status` — the two things you want from a console when the
  * viewer shows an empty scene, in the editor console, in PIE, or in a packaged build —
  * plus `Looma.Login` / `Looma.Logout` / `Looma.Whoami` for the auth surface and
- * `Looma.Scene` for which scene this client is looking at.
+ * `Looma.Scene` / `Looma.Performance` for which scene this client is looking at and
+ * which workspace it is looking at it in.
  *
  * The subsystem is per-GameInstance while a console command is global, so each command
  * resolves the subsystem when it runs: from the world the console handed us, else from
@@ -217,6 +218,76 @@ FAutoConsoleCommandWithWorldAndArgs GLoomaSceneCommand(
         // happened arrives as a `scene` frame ("Scene 'x': N node(s) applied") or as a
         // refusal from HandleSceneError. A cheerful line at this point would be the one
         // entry in the log that cannot be trusted.
+    }));
+
+/**
+ * `Looma.Performance` — which workspace this socket is in.
+ *
+ * Read-only, and that is a fact about the wire rather than an unfinished command. The
+ * hub resolves the workspace once, from the `hello`, and there is no message that moves
+ * a socket already up: switching PERFORMANCE is a reconnect where switching SCENE is a
+ * message. So an argument gets a usage line that names what is missing instead of being
+ * quietly ignored — a `Looma.Performance <id>` that accepted an id and did nothing is
+ * the one outcome worse than not having the command at all.
+ *
+ * The prose lives here rather than behind a subsystem Log... method, unlike
+ * `Looma.Scene`. That one had to sit in the subsystem because a scene's name costs a
+ * request needing GetRestBase and ApplyAuthHeader; this needs nothing the getters do
+ * not already hand out, and `Looma.Selection` is the precedent for a command that
+ * formats a public getter itself.
+ */
+FAutoConsoleCommandWithWorldAndArgs GLoomaPerformanceCommand(
+    TEXT("Looma.Performance"),
+    TEXT("Log the performance (workspace) this client is in: its id, name and visibility."),
+    FConsoleCommandWithWorldAndArgsDelegate::CreateStatic([](const TArray<FString>& Args, UWorld* World) {
+        if (Args.Num() != 0)
+        {
+            UE_LOG(LogLoomaSync, Display,
+                TEXT("Usage: Looma.Performance  (no arguments — reports the current performance). ")
+                TEXT("Switching with `Looma.Performance <performance-id>` is not implemented yet: it ")
+                TEXT("is a reconnect and not a message, so it arrives with `hello.performanceId` and ")
+                TEXT("the terminal close codes that go with it."));
+            return;
+        }
+        ULoomaSceneSyncSubsystem* Subsystem = FindLoomaSubsystem(World);
+        if (!Subsystem)
+        {
+            LogNoSubsystem(TEXT("Looma.Performance"));
+            return;
+        }
+        const FLoomaPerformance Performance = Subsystem->GetActivePerformance();
+        if (Performance.Id.IsEmpty())
+        {
+            // Ignorance, not a property of any workspace: the hub cannot put us
+            // somewhere without naming its id, so an empty one means no `scene` frame
+            // has arrived — the only carrier there is.
+            UE_LOG(LogLoomaSync, Warning,
+                TEXT("Current performance: unknown — no `scene` frame has named one%s."),
+                Subsystem->IsSyncConnected()
+                    ? TEXT(" yet")
+                    : TEXT(", because the socket is not connected (`Looma.Status` says why)"));
+            return;
+        }
+        // Never empty in practice — the hub defaults it to `public` — but printing bare
+        // parentheses if it ever were would read as a bug in this line rather than as a
+        // field the frame left out.
+        const TCHAR* Visibility = Performance.Visibility.IsEmpty()
+            ? TEXT("visibility unknown")
+            : *Performance.Visibility;
+        if (Performance.Name.IsEmpty())
+        {
+            // A different state from the one above, and worth its own branch: this is
+            // the hub telling us the row behind the id is gone, not the hub failing to
+            // tell us anything. The socket is still in it and still works, so the line
+            // says where we are before it says what is missing.
+            UE_LOG(LogLoomaSync, Warning,
+                TEXT("Current performance '%s' (%s) — the hub sent no name, which is what it sends ")
+                TEXT("for a row that has been deleted. The id is still where this socket is."),
+                *Performance.Id, Visibility);
+            return;
+        }
+        UE_LOG(LogLoomaSync, Display, TEXT("Current performance '%s' — '%s' (%s)"),
+            *Performance.Id, *Performance.Name, Visibility);
     }));
 
 /**

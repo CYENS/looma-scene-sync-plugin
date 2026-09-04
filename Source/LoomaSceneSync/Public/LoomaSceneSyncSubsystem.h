@@ -14,6 +14,57 @@ class FJsonObject;
 class FJsonValue;
 class ULoomaGenerationHandle;
 
+/**
+ * The performance — the workspace — this socket is in, as the `scene` frame reports it
+ * (`_performance_info`, backend/app/sync.py).
+ *
+ * It rides on that frame because the hub may put a client somewhere it did not ask for:
+ * one that names no performance is returned to whichever its `clientKey` was last in.
+ * That is the entire reason the object exists. A client that assumed it got what it
+ * asked for would show the wrong name, create scenes into the wrong workspace and read
+ * the wrong chat while its socket sat in the right one — a disagreement no client could
+ * detect, because nothing else on the wire ever names the performance.
+ *
+ * One struct rather than three getters, because the three fields are one frame's
+ * snapshot and are only ever true together — and because `Name` cannot be read without
+ * `Id` beside it: an empty name means "the row behind THIS id is gone", which is not a
+ * statement either field can make alone.
+ */
+USTRUCT(BlueprintType)
+struct FLoomaPerformance
+{
+    GENERATED_BODY()
+
+    /**
+     * Where the socket actually is. Always on the frame and always true, including when
+     * the row it names has been deleted — which is what makes it the field to route on
+     * and to compare against, and the only one a REST path may be built from.
+     *
+     * Empty means one thing and nothing else: no `scene` frame has arrived yet. It is
+     * not a state the hub can put us in.
+     */
+    UPROPERTY(BlueprintReadOnly, Category = "Looma")
+    FString Id;
+
+    /**
+     * The workspace's name, for a badge or a log line. **Empty is a real answer, not a
+     * missing one**: the hub sends `name: null` for a row that has gone, because
+     * `_performance_info` reads `db.get_performance(id) or {}`. So an empty name beside
+     * a valid id says the performance was deleted out from under this socket, which is
+     * still in it and still working.
+     *
+     * It cannot mean "the name is blank". `performances.create` and `performances.update`
+     * both refuse a name that strips to nothing, so a stored name is never empty; the
+     * null/"" distinction FString cannot hold is one the backend cannot produce.
+     */
+    UPROPERTY(BlueprintReadOnly, Category = "Looma")
+    FString Name;
+
+    /** `public` or `private`. The hub falls back to `public` for a row that has gone. */
+    UPROPERTY(BlueprintReadOnly, Category = "Looma")
+    FString Visibility;
+};
+
 /** Per-node bookkeeping for the outbound motion diff. */
 struct FLoomaTrackedActor
 {
@@ -251,6 +302,34 @@ public:
      */
     UFUNCTION(BlueprintCallable, Category = "Looma")
     void LogActiveScene();
+
+    // --- Which performance this client is in ----------------------------------
+    //
+    // The scene is chosen inside a workspace; the workspace is resolved once, at
+    // handshake time, from the `hello`. So this pair is read-only where the scene pair
+    // is not: there is no message that moves a socket already up, which is why
+    // switching performance is a reconnect and switching scene is not.
+
+    /**
+     * The workspace this socket is in, as of the last `scene` frame. `Id` is empty
+     * until one arrives.
+     *
+     * A whole-object read rather than per-field getters: a caller that wants to REPORT
+     * the performance needs all of it, and a caller that wants to ROUTE on it wants
+     * GetActivePerformanceId() below. Nothing wants one descriptive field on its own,
+     * and `Name` handed out alone would be unreadable — see FLoomaPerformance.
+     */
+    UFUNCTION(BlueprintPure, Category = "Looma")
+    FLoomaPerformance GetActivePerformance() const;
+
+    /**
+     * Just the id: the routing key, and the one field that is true even when the row
+     * behind it has gone. Kept beside the whole-object getter, and parallel to
+     * GetActiveSceneId(), because it is what every non-display caller actually holds —
+     * a REST path to build, or an id to compare a request's answer against.
+     */
+    UFUNCTION(BlueprintPure, Category = "Looma")
+    FString GetActivePerformanceId() const;
 
     // --- Local selection (outbound `selection`) -------------------------------
     //
@@ -886,6 +965,13 @@ private:
 
     /** Which saved scene the hub says is live (`sceneId`); empty for an unsaved one. */
     FString ActiveSceneId;
+
+    /**
+     * Which workspace the hub says this socket is in. Replaced whole by every `scene`
+     * frame, never merged into — see HandleScene for why a null name must not be
+     * papered over with the last one we knew.
+     */
+    FLoomaPerformance ActivePerformance;
 
     /**
      * The local selection, held **weakly and as actors** rather than as node ids.
