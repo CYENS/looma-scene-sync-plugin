@@ -1081,6 +1081,223 @@ void ULoomaSceneSyncSubsystem::LogPerformances()
         });
 }
 
+void ULoomaSceneSyncSubsystem::FetchCues(const FString& PerformanceId,
+    TFunction<void(bool bOk, const TArray<FLoomaCue>& Cues)> OnDone)
+{
+    const FString ListUrl =
+        GetRestBase() + FString::Printf(TEXT("/performances/%s/cues"), *PerformanceId);
+    const TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Request = MakeCatalogueRequest(ListUrl);
+    Request->OnProcessRequestComplete().BindWeakLambda(this,
+        [ListUrl, OnDone](FHttpRequestPtr Req, FHttpResponsePtr Resp, bool bOk) {
+            TArray<FLoomaCue> Cues;
+            if (!bOk || !Resp.IsValid() || Resp->GetResponseCode() >= 300)
+            {
+                UE_LOG(LogLoomaSync, Warning, TEXT("Could not read the running order from %s (%d)"),
+                    *ListUrl, Resp.IsValid() ? Resp->GetResponseCode() : 0);
+                OnDone(false, Cues);
+                return;
+            }
+            // A `cues` envelope — the third route and the third shape. `/scenes` answers
+            // with a bare array, `/performances` wraps one in `performances`, this wraps
+            // one in `cues`. Assuming the symmetry is how a parse ends up silently
+            // reading an empty list off a perfectly good response.
+            TSharedPtr<FJsonObject> Envelope;
+            const TSharedRef<TJsonReader<TCHAR>> Reader =
+                TJsonReaderFactory<TCHAR>::Create(Resp->GetContentAsString());
+            const TArray<TSharedPtr<FJsonValue>>* Rows = nullptr;
+            if (!FJsonSerializer::Deserialize(Reader, Envelope) || !Envelope.IsValid()
+                || !Envelope->TryGetArrayField(TEXT("cues"), Rows) || !Rows)
+            {
+                UE_LOG(LogLoomaSync, Warning,
+                    TEXT("%s answered 200 but not with a running order"), *ListUrl);
+                OnDone(false, Cues);
+                return;
+            }
+            // Order preserved exactly as received, and that is load-bearing rather than
+            // incidental: `list_performance_cues` selects `ORDER BY order_idx, rowid`
+            // (backend/app/db.py), so the array IS the running order and its positions
+            // are the indices a person types. Nothing here sorts or renumbers.
+            Cues.Reserve(Rows->Num());
+            for (const TSharedPtr<FJsonValue>& Row : *Rows)
+            {
+                const TSharedPtr<FJsonObject> Entry = Row.IsValid() ? Row->AsObject() : nullptr;
+                FLoomaCue Cue;
+                // No scene, no cue: a cue exists to fire a scene, so a row without one
+                // could only ever be counted. Dropping it does shift the indices of
+                // everything after it, which is the argument for keeping it — but a
+                // placeholder that cannot be fired would shift them just as much the
+                // moment somebody typed its number and got nothing.
+                if (!Entry.IsValid() || !Entry->TryGetStringField(TEXT("scene_id"), Cue.SceneId)
+                    || Cue.SceneId.IsEmpty())
+                {
+                    continue;
+                }
+                // Nullable by design — `add_cue` stores `clean_label or None` — so an
+                // absent one is an unlabelled cue, not a broken row.
+                Entry->TryGetStringField(TEXT("label"), Cue.Label);
+                Cues.Add(MoveTemp(Cue));
+            }
+            OnDone(true, Cues);
+        });
+    Request->ProcessRequest();
+}
+
+void ULoomaSceneSyncSubsystem::LogCues()
+{
+    const FString PerformanceId = ActivePerformance.Id;
+    const FString Pending = GetPendingPerformanceId();
+    if (PerformanceId.IsEmpty())
+    {
+        UE_LOG(LogLoomaSync, Warning,
+            TEXT("No running order to show: no `scene` frame has named a performance yet. ")
+            TEXT("`Looma.Status` says whether the socket is up."));
+        return;
+    }
+    if (!Pending.IsEmpty())
+    {
+        // Answered anyway, unlike OpenCue, but only after saying whose rail this is.
+        // The list is real and reading it is harmless; what would be misleading is the
+        // heading "the running order" over the room we are on our way out of.
+        UE_LOG(LogLoomaSync, Warning,
+            TEXT("A switch to '%s' is in flight, so what follows is the running order of '%s' — the ")
+            TEXT("performance being LEFT. `Looma.Cue <index>` is refused until the new socket's ")
+            TEXT("`scene` frame lands."),
+            *Pending, *PerformanceId);
+    }
+    const FString ActiveScene = ActiveSceneId;
+    FetchCues(PerformanceId, [PerformanceId, ActiveScene](bool bOk, const TArray<FLoomaCue>& Cues) {
+        if (!bOk)
+        {
+            UE_LOG(LogLoomaSync, Warning, TEXT("...so there is no running order to show."));
+            return;
+        }
+        if (Cues.Num() == 0)
+        {
+            // The common case today, and emphatically not a fault — every performance on
+            // both backends has an empty rail because nobody has arranged one yet. Said
+            // in a way that does not send somebody hunting for a bug: the pool and the
+            // running order are separate lists, so a performance full of scenes and
+            // empty of cues is an ordinary, working, unarranged performance.
+            UE_LOG(LogLoomaSync, Display,
+                TEXT("Performance '%s' has an empty running order — no scenes have been put on the ")
+                TEXT("line yet. Nothing is wrong: the pool and the running order are different ")
+                TEXT("lists, so it can hold scenes that are not on the rail. `Looma.Scenes` lists ")
+                TEXT("what there is to open directly."),
+                *PerformanceId);
+            return;
+        }
+        int32 SceneWidth = 0;
+        for (const FLoomaCue& Cue : Cues)
+        {
+            SceneWidth = FMath::Max(SceneWidth, Cue.SceneId.Len());
+        }
+        const int32 IndexWidth = FString::FromInt(Cues.Num() - 1).Len();
+        UE_LOG(LogLoomaSync, Display, TEXT("Running order of performance '%s' — %d cue(s), 0-based:"),
+            *PerformanceId, Cues.Num());
+        int32 Marked = 0;
+        for (int32 Index = 0; Index < Cues.Num(); ++Index)
+        {
+            const FLoomaCue& Cue = Cues[Index];
+            const bool bIsActive = !ActiveScene.IsEmpty() && Cue.SceneId == ActiveScene;
+            Marked += bIsActive ? 1 : 0;
+            UE_LOG(LogLoomaSync, Display, TEXT("%s %s  %s  %s%s"),
+                bIsActive ? TEXT("*") : TEXT(" "),
+                *Pad(FString::FromInt(Index), IndexWidth),
+                *Pad(Cue.SceneId, SceneWidth),
+                Cue.Label.IsEmpty() ? TEXT("<no label>") : *Cue.Label,
+                bIsActive ? TEXT("   (active scene)") : TEXT(""));
+        }
+        if (Marked > 1)
+        {
+            // The reprise case, said out loud rather than hidden by marking the first.
+            // A scene may sit on the line more than once, and the wire moves by SCENE —
+            // `openScene` carries a `sceneId` and the `scene` frame answers with one —
+            // so nothing this client holds distinguishes two cues that name the same
+            // scene. The marker is therefore "the active scene is here", not "we are at
+            // this cue", and the difference is the user's to resolve.
+            UE_LOG(LogLoomaSync, Display,
+                TEXT("The active scene is on the line %d times (a reprise). Which of those cues is ")
+                TEXT("live is not on the wire — the hub moves clients by scene, not by position — ")
+                TEXT("so all of them are marked."),
+                Marked);
+        }
+        else if (Marked == 0 && !ActiveScene.IsEmpty())
+        {
+            UE_LOG(LogLoomaSync, Display,
+                TEXT("The active scene '%s' is not on this line. That is ordinary: a scene can be ")
+                TEXT("opened straight from the pool without being in the running order."),
+                *ActiveScene);
+        }
+        UE_LOG(LogLoomaSync, Display,
+            TEXT("`Looma.Cue <index>` opens one; `Looma.Scenes` pairs these ids with their names."));
+    });
+}
+
+void ULoomaSceneSyncSubsystem::OpenCue(int32 CueIndex)
+{
+    const FString Pending = GetPendingPerformanceId();
+    if (!Pending.IsEmpty())
+    {
+        // Refused rather than raced. Both halves of firing a cue here would look
+        // correct on their own — read the running order we are in, send an `openScene`
+        // — while together they can open a scene from the room being left into the room
+        // we land in, which is the one outcome nobody could explain afterwards.
+        UE_LOG(LogLoomaSync, Warning,
+            TEXT("Not firing cue %d: a switch to '%s' is in flight, so the running order we would ")
+            TEXT("read belongs to the performance being left and the socket may be in another one ")
+            TEXT("by the time it arrives. Wait for the `scene` frame — `Looma.Performance` says ")
+            TEXT("when it lands."),
+            CueIndex, *Pending);
+        return;
+    }
+    const FString PerformanceId = ActivePerformance.Id;
+    if (PerformanceId.IsEmpty())
+    {
+        UE_LOG(LogLoomaSync, Warning,
+            TEXT("Not firing cue %d: no `scene` frame has named a performance, so there is no ")
+            TEXT("running order to index into. `Looma.Status` says whether the socket is up."),
+            CueIndex);
+        return;
+    }
+    FetchCues(PerformanceId, [this, CueIndex, PerformanceId](bool bOk, const TArray<FLoomaCue>& Cues) {
+        if (!bOk)
+        {
+            UE_LOG(LogLoomaSync, Warning, TEXT("...so cue %d cannot be resolved."), CueIndex);
+            return;
+        }
+        if (Cues.Num() == 0)
+        {
+            UE_LOG(LogLoomaSync, Warning,
+                TEXT("Performance '%s' has no cues at all, so there is no cue %d to fire. Nothing ")
+                TEXT("is wrong with it — a running order is arranged separately from the pool, and ")
+                TEXT("this one has not been. `Looma.Scene <name-or-id>` opens a scene directly."),
+                *PerformanceId, CueIndex);
+            return;
+        }
+        if (!Cues.IsValidIndex(CueIndex))
+        {
+            // The range, not a clamp. Clamping is how a performance shows the wrong
+            // scene to a room, and it would hide the off-by-one this console is
+            // probably being used to find.
+            UE_LOG(LogLoomaSync, Warning,
+                TEXT("There is no cue %d: performance '%s' has %d, numbered 0 to %d. `Looma.Cue` ")
+                TEXT("with no argument prints them."),
+                CueIndex, *PerformanceId, Cues.Num(), Cues.Num() - 1);
+            return;
+        }
+        const FLoomaCue& Cue = Cues[CueIndex];
+        // The index, the scene and the label together, because the index is what was
+        // typed and the scene id is what every later line will call it — and a cue
+        // fired by number should say what it turned out to be before it happens.
+        UE_LOG(LogLoomaSync, Display, TEXT("Cue %d of '%s' is scene '%s'%s; opening it."),
+            CueIndex, *PerformanceId, *Cue.SceneId,
+            Cue.Label.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" ('%s')"), *Cue.Label));
+        // An `openScene` and nothing else: the cue names a scene in the performance this
+        // socket is already in, so there is no reconnect and no identity to re-resolve.
+        OpenScene(Cue.SceneId);
+    });
+}
+
 void ULoomaSceneSyncSubsystem::SwitchPerformance(const FString& PerformanceId)
 {
     const FString Wanted = PerformanceId.TrimStartAndEnd();
