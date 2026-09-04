@@ -10,7 +10,8 @@
 /**
  * `Looma.Reconnect` / `Looma.Status` — the two things you want from a console when the
  * viewer shows an empty scene, in the editor console, in PIE, or in a packaged build —
- * plus `Looma.Login` / `Looma.Logout` / `Looma.Whoami` for the auth surface.
+ * plus `Looma.Login` / `Looma.Logout` / `Looma.Whoami` for the auth surface and
+ * `Looma.Scene` for which scene this client is looking at.
  *
  * The subsystem is per-GameInstance while a console command is global, so each command
  * resolves the subsystem when it runs: from the world the console handed us, else from
@@ -157,6 +158,67 @@ FAutoConsoleCommandWithWorldAndArgs GLoomaWhoamiCommand(
             Subsystem->RefreshIdentity();
         }
     }));
+/**
+ * `Looma.Scene [sceneId]` — which saved scene this client is on, and how to move it.
+ *
+ * With an id it sends `openScene`, which subscribes THIS client and moves nobody else
+ * in the room (docs/scene-format.md, "Choosing a scene (HAM-185)"). Note the asymmetry
+ * the contract draws and this command inherits: switching PERFORMANCE is a reconnect,
+ * switching scene is a message.
+ *
+ * It checks the socket first, which the auth commands deliberately do not — they act
+ * over HTTP and have their own answer when the backend is unreachable. An `openScene`
+ * typed while the socket is down is not merely ineffective, it is *invisible*: SendJson
+ * returns silently on a dead socket, and the contract says the same of a send before
+ * the socket is open. So this says no rather than looking like it worked. It does not
+ * park the id for the next connect — the web client does exactly that for its `#/s/<id>`
+ * deep links, and it is a real feature with its own ordering rules, not a line to slip
+ * into a console command.
+ */
+FAutoConsoleCommandWithWorldAndArgs GLoomaSceneCommand(
+    TEXT("Looma.Scene"),
+    TEXT("Open a saved scene for this client: Looma.Scene <sceneId>. With no arguments, log the ")
+    TEXT("active scene's id and name."),
+    FConsoleCommandWithWorldAndArgsDelegate::CreateStatic([](const TArray<FString>& Args, UWorld* World) {
+        // One id, or none. A scene id is a slug and cannot contain a space
+        // (`_slugify_scene`, backend/app/scenes.py), so a second argument is a typo
+        // rather than a value that needed quoting — the same reasoning as
+        // `Looma.Login`'s argument count, and the opposite of `Looma.Select`, where a
+        // list of ids is the whole point.
+        if (Args.Num() > 1)
+        {
+            UE_LOG(LogLoomaSync, Display,
+                TEXT("Usage: Looma.Scene <sceneId>  (with no arguments, reports the active scene)"));
+            return;
+        }
+        ULoomaSceneSyncSubsystem* Subsystem = FindLoomaSubsystem(World);
+        if (!Subsystem)
+        {
+            LogNoSubsystem(TEXT("Looma.Scene"));
+            return;
+        }
+        if (Args.Num() == 0)
+        {
+            // Two lines, the second arriving later — see LogActiveScene for why the id
+            // is not made to wait for the name.
+            Subsystem->LogActiveScene();
+            return;
+        }
+        if (!Subsystem->IsSyncConnected())
+        {
+            UE_LOG(LogLoomaSync, Warning,
+                TEXT("Looma.Scene: not sent — the scene-sync socket is not connected, and `openScene` ")
+                TEXT("on a closed socket is dropped, not queued. `Looma.Status` for why, ")
+                TEXT("`Looma.Reconnect` to retry now, then type this again."));
+            return;
+        }
+        Subsystem->OpenScene(Args[0]);
+        // Nothing is printed here about the outcome, because none is known yet: what
+        // happened arrives as a `scene` frame ("Scene 'x': N node(s) applied") or as a
+        // refusal from HandleSceneError. A cheerful line at this point would be the one
+        // entry in the log that cannot be trusted.
+    }));
+
 /**
  * `Looma.Select <nodeId...>` / `Looma.Deselect [nodeId...]` / `Looma.Selection` — the
  * only way in as of step 1, since nothing hooks the editor's own selection yet.

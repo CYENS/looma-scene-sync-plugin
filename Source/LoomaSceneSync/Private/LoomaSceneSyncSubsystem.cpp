@@ -428,6 +428,148 @@ bool ULoomaSceneSyncSubsystem::IsSyncConnected() const
     return Socket.IsValid() && Socket->IsConnected();
 }
 
+// --- Which scene this client is on -------------------------------------------
+
+void ULoomaSceneSyncSubsystem::OpenScene(const FString& SceneId)
+{
+    if (!IsSyncConnected())
+    {
+        // SendJson would drop this without a word. That silence is right for a pose
+        // diff the next tick sends again and wrong for a one-shot intent that nothing
+        // repeats, so the exception is made here rather than in SendJson — this is the
+        // sender that cannot survive being ignored, not a reason to make every send
+        // noisy.
+        UE_LOG(LogLoomaSync, Warning,
+            TEXT("Cannot open scene '%s': the scene-sync socket is not connected, and a send on a ")
+            TEXT("closed socket is dropped rather than queued. `Looma.Status` says why, ")
+            TEXT("`Looma.Reconnect` retries now."),
+            *SceneId);
+        return;
+    }
+    TSharedRef<FJsonObject> Msg = MakeShared<FJsonObject>();
+    Msg->SetStringField(TEXT("type"), TEXT("openScene"));
+    Msg->SetStringField(TEXT("sceneId"), SceneId);
+    SendJson(Msg);
+    // Sent, which is all this can honestly claim. What actually happened arrives later
+    // as a `scene` frame or as a `sceneError`, both of which log for themselves.
+    UE_LOG(LogLoomaSync, Log, TEXT("openScene '%s' sent"), *SceneId);
+}
+
+FString ULoomaSceneSyncSubsystem::GetActiveSceneId() const
+{
+    return ActiveSceneId;
+}
+
+void ULoomaSceneSyncSubsystem::LogActiveScene()
+{
+    if (ActiveSceneId.IsEmpty())
+    {
+        // Two different emptinesses, and they must not read alike. The hub sends
+        // `sceneId: null` for a working scene nobody has saved — a real scene, with a
+        // real document in it, that merely has no row to be named by. Before the first
+        // `scene` frame lands we hold the same empty string and know nothing at all.
+        // Only the socket separates them, which is why GetActiveSceneId cannot.
+        if (IsSyncConnected())
+        {
+            UE_LOG(LogLoomaSync, Display,
+                TEXT("Active scene: <unsaved> — the hub has us on a working scene with no saved row ")
+                TEXT("behind it, so it has neither an id nor a name."));
+        }
+        else
+        {
+            UE_LOG(LogLoomaSync, Warning,
+                TEXT("Active scene: unknown — the socket is not connected, so no `scene` frame has ")
+                TEXT("named one. `Looma.Status` says why."));
+        }
+        return;
+    }
+    // The id first and on its own, because it is the half we already know and it must
+    // not be held hostage to a round trip that can fail. The name follows below.
+    UE_LOG(LogLoomaSync, Display, TEXT("Active scene id '%s' (asking the backend for its name)"),
+        *ActiveSceneId);
+
+    // GET /scenes, not GET /scenes/{id}. The single-scene route asks the narrower
+    // question and would answer a clean 404 for an id we may not have — but it inlines
+    // the whole node document, which is the one thing this client already holds and the
+    // largest payload the backend serves. Re-fetching a scene graph across the same
+    // 16-slot connection pool the GLB downloads live in, to read one string off it, is
+    // the wrong trade for a console command. The list route is metadata only, is
+    // filtered to what this caller may see through the same `effective_role` gate the
+    // single-scene route uses (backend/app/scenes.py), and is what the web scene panel
+    // already leans on, so it is the well-trodden path as well as the small one.
+    const FString ListUrl = GetRestBase() + TEXT("/scenes");
+    const TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Request = FHttpModule::Get().CreateRequest();
+    Request->SetURL(ListUrl);
+    Request->SetVerb(TEXT("GET"));
+    // The interactive budget: a person typed the command and is watching the log, and
+    // would rather hear "no" quickly than "yes" eventually.
+    Request->SetTimeout(InteractiveRequestTimeout);
+    ApplyAuthHeader(Request); // after SetURL, as it requires
+    // Wider than ApplyClientIdHeader's stated "asset-creating requests" scope, and
+    // deliberately so: `X-Client-Id` is what anchors a GUEST to one subject across
+    // calls, so without it a guest's own private scene is missing from the list this
+    // route returns and we would report "not offered to us" about the scene we are
+    // plainly looking at. The contract asks for it here by name — "Send the header —
+    // the web client does, on every `/scenes` call" (docs/scene-format.md). It still
+    // proves nothing: a resolved session always wins over it.
+    ApplyClientIdHeader(Request);
+
+    // Captured, not re-read on arrival: this answer describes the scene we asked about,
+    // and `Looma.Scene <other>` may have been typed in the meantime.
+    const FString SceneId = ActiveSceneId;
+    Request->OnProcessRequestComplete().BindWeakLambda(this,
+        [SceneId, ListUrl](FHttpRequestPtr Req, FHttpResponsePtr Resp, bool bOk) {
+            if (!bOk || !Resp.IsValid() || Resp->GetResponseCode() >= 300)
+            {
+                // Named as a fetch failure rather than folded into "no name": "the
+                // backend did not answer" and "the backend has no such scene for us"
+                // are different problems with different fixes, and a console that
+                // blurred them would send someone looking in the wrong place.
+                UE_LOG(LogLoomaSync, Warning,
+                    TEXT("Could not read the name of scene '%s': %s answered %d. The id above still ")
+                    TEXT("stands — only the name is missing."),
+                    *SceneId, *ListUrl, Resp.IsValid() ? Resp->GetResponseCode() : 0);
+                return;
+            }
+            TArray<TSharedPtr<FJsonValue>> Rows;
+            const TSharedRef<TJsonReader<TCHAR>> Reader =
+                TJsonReaderFactory<TCHAR>::Create(Resp->GetContentAsString());
+            if (!FJsonSerializer::Deserialize(Reader, Rows))
+            {
+                UE_LOG(LogLoomaSync, Warning,
+                    TEXT("Could not read the name of scene '%s': %s answered 200 but not with a ")
+                    TEXT("scene list."), *SceneId, *ListUrl);
+                return;
+            }
+            for (const TSharedPtr<FJsonValue>& Row : Rows)
+            {
+                const TSharedPtr<FJsonObject> Entry = Row.IsValid() ? Row->AsObject() : nullptr;
+                FString RowId;
+                if (!Entry.IsValid() || !Entry->TryGetStringField(TEXT("id"), RowId) || RowId != SceneId)
+                {
+                    continue;
+                }
+                FString Name;
+                Entry->TryGetStringField(TEXT("name"), Name);
+                UE_LOG(LogLoomaSync, Display, TEXT("Active scene '%s' is named '%s'"),
+                    *SceneId, Name.IsEmpty() ? TEXT("<no name>") : *Name);
+                return;
+            }
+            // Neither a failure nor a missing name: the list is non-enumerating, so a
+            // scene absent from it is one this IDENTITY may not read. Reachable in
+            // ordinary use rather than theoretical — the socket resolved us once, at
+            // handshake time, and this HTTP call resolves us again, so a guest whose
+            // `X-Client-Id` anchor does not match what the hub recorded lands exactly
+            // here. Said out loud, because "no name" would read as a backend fault.
+            UE_LOG(LogLoomaSync, Warning,
+                TEXT("Scene '%s' is not in the list %s offers this identity, so its name cannot be ")
+                TEXT("read — we are still on it, but this request resolved as a different caller ")
+                TEXT("than the socket did."),
+                *SceneId, *ListUrl);
+        });
+    Request->ProcessRequest();
+}
+
 // --- Connection control / diagnostics ----------------------------------------
 
 void ULoomaSceneSyncSubsystem::Reconnect()
@@ -1419,6 +1561,10 @@ void ULoomaSceneSyncSubsystem::OnRawMessage(const FString& Text)
     {
         HandleGeneration(Msg);
     }
+    else if (Type == TEXT("sceneError"))
+    {
+        HandleSceneError(Msg);
+    }
     else
     {
         // Not an error — the hub may speak messages a newer backend added — but
@@ -1474,6 +1620,34 @@ void ULoomaSceneSyncSubsystem::HandleScene(const TSharedPtr<FJsonObject>& Msg)
     UE_LOG(LogLoomaSync, Log, TEXT("Scene%s: %d node(s) applied, %d dropped"),
         ActiveSceneId.IsEmpty() ? TEXT(" (unsaved)") : *FString::Printf(TEXT(" '%s'"), *ActiveSceneId),
         Nodes->Num(), Stale.Num());
+}
+
+void ULoomaSceneSyncSubsystem::HandleSceneError(const TSharedPtr<FJsonObject>& Msg)
+{
+    // A FRAME, not a close: this socket is fine and only the last thing it asked for is
+    // not, unlike the handshake's 4400/4403/4404 which all mean start over
+    // (docs/scene-format.md, "Choosing a scene (HAM-185)"; `_send_scene_error` in
+    // backend/app/sync.py). So there is nothing to tear down, nothing to reconnect and
+    // nothing to unwind — we are still on whatever scene we were on, and the next
+    // message will work. Logging it *is* the handling.
+    FString Reason;
+    Msg->TryGetStringField(TEXT("reason"), Reason);
+    FString Message;
+    Msg->TryGetStringField(TEXT("message"), Message);
+    // `sceneId` is nullable on this frame — a blank `openScene` is refused carrying the
+    // id it did not have — so the miss is expected rather than malformed.
+    FString SceneId;
+    Msg->TryGetStringField(TEXT("sceneId"), SceneId);
+    // Logged, never switched on. The `reason` vocabulary is backend/app/scenes.py's and
+    // is open by design (`not_found` and `read_only` are simply the ones seen so far),
+    // so a client branching on a closed set would silently mishandle the next one the
+    // backend adds, in the one place it most needs to say something. Every sender today
+    // is a person at a console or a Blueprint call, and the useful answer to both is the
+    // backend's own sentence.
+    UE_LOG(LogLoomaSync, Warning, TEXT("Scene request refused (%s) for scene %s: %s"),
+        Reason.IsEmpty() ? TEXT("<no reason>") : *Reason,
+        SceneId.IsEmpty() ? TEXT("<none>") : *SceneId,
+        Message.IsEmpty() ? TEXT("<no message>") : *Message);
 }
 
 void ULoomaSceneSyncSubsystem::HandleSpawn(const TSharedPtr<FJsonObject>& Msg)

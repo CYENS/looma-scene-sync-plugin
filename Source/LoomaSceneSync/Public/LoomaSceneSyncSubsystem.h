@@ -175,6 +175,83 @@ public:
     UFUNCTION(BlueprintPure, Category = "Looma")
     bool IsSyncConnected() const;
 
+    // --- Which scene this client is on (outbound `openScene`) -----------------
+    //
+    // Which SCENE this client watches is a live, per-client choice made over the
+    // socket, and changing it moves nobody else in the room. That is the asymmetry
+    // worth holding on to: changing PERFORMANCE is still a reconnect, changing scene
+    // is a message (docs/scene-format.md, "Choosing a scene (HAM-185)").
+
+    /**
+     * Subscribe this client to a saved scene: `{"type":"openScene","sceneId":...}`.
+     * Console: `Looma.Scene <sceneId>`.
+     *
+     * Fire-and-forget, with no return value and nothing recorded as pending, because
+     * the reply is a whole `scene` frame — the same frame that arrives on connect,
+     * applied by the same HandleScene. There is nothing here for a caller to
+     * correlate, and ActiveSceneId is deliberately not written optimistically: the hub
+     * decides what we are on and HandleScene stays its single writer, so a refusal has
+     * nothing to unwind.
+     *
+     * A refusal — an id the backend does not have, or a scene this client may not read
+     * — comes back as a `sceneError` **frame and not a close**: the socket stays up and
+     * stays usable, and we simply remain on the scene we were already on. That is the
+     * opposite of the handshake's 4400/4403/4404 closes, which all mean start over.
+     * HandleSceneError logs it.
+     *
+     * The id is not validated here. This client holds no catalogue to check it
+     * against — a `scene` frame carries one id and its nodes, never its siblings — and
+     * the hub is the authority on which ids exist and who may have them, so a local
+     * guess could only ever disagree with it. Even an empty id goes as-is: the hub
+     * answers that with the same `sceneError` as any other miss, so a second opinion
+     * would buy one narrower message and one more thing to keep in step.
+     *
+     * **A send on a closed socket is dropped** — SendJson returns silently, and the
+     * contract says the same ("a send before the socket is open is dropped",
+     * docs/scene-format.md). Unlike a pose diff, which the next tick sends again, a
+     * dropped `openScene` never happens again, so this one send says so rather than
+     * inheriting that silence. A caller that can ask first should: `Looma.Scene` tests
+     * IsSyncConnected() and prints its own line instead of reaching here.
+     */
+    UFUNCTION(BlueprintCallable, Category = "Looma")
+    void OpenScene(const FString& SceneId);
+
+    /**
+     * Which saved scene the hub has us on. **Empty is an answer, not a failure**: it is
+     * what an unsaved working scene reports, since that document has no row behind it
+     * and the frame carries `sceneId: null`. It is also what we hold before the first
+     * frame lands, and nothing in the string tells those two apart — which is why
+     * LogActiveScene consults the socket and this getter cannot.
+     */
+    UFUNCTION(BlueprintPure, Category = "Looma")
+    FString GetActiveSceneId() const;
+
+    /**
+     * Log the active scene's id and name. Console: `Looma.Scene` with no arguments.
+     *
+     * TWO LINES, deliberately. The id is local and immediate; the name costs a round
+     * trip, because the `scene` frame carries `sceneId`, `performance`, `access`,
+     * `version` and `nodes` and no name at all (`sync.scene_message`). Waiting to print
+     * one resolved line would mean a backend that is down answers a question about
+     * local state with silence, which is the wrong failure for a diagnostic — so the id
+     * goes out at once and the name follows on its own line, naming the id it belongs
+     * to so two quick invocations cannot be read crosswise.
+     *
+     * FETCHED ON DEMAND, never when a `scene` frame arrives. Scene arrival is the exact
+     * instant every node starts pulling its GLB and all 16 of UE's per-host connection
+     * slots are taken, so a request issued there queues behind the downloads and times
+     * out against a backend answering in a tenth of a second — the same reason
+     * Connect's OnConnected carries no auth probe.
+     *
+     * NOTHING IS CACHED. A rename through `PUT /scenes/{id}` puts nothing on the wire,
+     * so no inbound message could invalidate a remembered name and the only honest rule
+     * would be "invalidate always", which is not a cache. A console diagnostic that
+     * confidently prints a stale name is worse than one that costs a small metadata GET
+     * at human typing speed.
+     */
+    UFUNCTION(BlueprintCallable, Category = "Looma")
+    void LogActiveScene();
+
     // --- Local selection (outbound `selection`) -------------------------------
     //
     // What this client has selected, reported to the hub so every other client can
@@ -653,6 +730,11 @@ private:
     void HandleReparent(const TSharedPtr<FJsonObject>& Msg);
     void HandlePatch(const TSharedPtr<FJsonObject>& Msg);
     void HandleGeneration(const TSharedPtr<FJsonObject>& Msg);
+    /**
+     * A refused `openScene` or a refused edit, sent to this client alone. A frame and
+     * not a close, so there is nothing to tear down here.
+     */
+    void HandleSceneError(const TSharedPtr<FJsonObject>& Msg);
 
     /** Spawn-or-update from one whole wire node (used by `scene` and `spawn`). */
     void UpsertNode(const TSharedPtr<FJsonObject>& Node);
