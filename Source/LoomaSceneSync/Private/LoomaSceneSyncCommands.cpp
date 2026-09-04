@@ -15,7 +15,8 @@
  * which workspace it is looking at it in — the second of which is also the one command
  * that can move it, since a performance switch is a reconnect rather than a message —
  * with `Looma.Scenes` / `Looma.Performances` printing every id and name those two will
- * accept, so the console needs no browser tab beside it.
+ * accept, so the console needs no browser tab beside it — and `Looma.Cue` stepping along
+ * the running order, which is the one of these that moves a show rather than a client.
  *
  * The subsystem is per-GameInstance while a console command is global, so each command
  * resolves the subsystem when it runs: from the world the console handed us, else from
@@ -101,6 +102,33 @@ void LogNoSubsystem(const TCHAR* Command)
     UE_LOG(LogLoomaSync, Warning,
         TEXT("%s: Looma Scene Sync is not running (no game instance), so there is no session to act on."),
         Command);
+}
+
+/**
+ * A whole decimal number, or false — the strict parse `Looma.Cue` needs.
+ *
+ * FCString::Atoi is not usable here: it answers 0 for anything it cannot read, so a
+ * mistyped cue number would silently fire the opening cue. A leading '-' is accepted so
+ * that a negative reaches the range message, which names the valid cues, rather than
+ * being turned away as gibberish — "there is no cue -1, this one has 0 to 4" is the
+ * answer somebody wants, and "that is not a number" is not.
+ */
+bool ParseIndexArgument(const FString& Text, int32& OutIndex)
+{
+    const int32 First = (!Text.IsEmpty() && Text[0] == TEXT('-')) ? 1 : 0;
+    if (Text.Len() <= First)
+    {
+        return false;
+    }
+    for (int32 Index = First; Index < Text.Len(); ++Index)
+    {
+        if (!FChar::IsDigit(Text[Index]))
+        {
+            return false;
+        }
+    }
+    OutIndex = FCString::Atoi(*Text);
+    return true;
 }
 
 FAutoConsoleCommandWithWorldAndArgs GLoomaLoginCommand(
@@ -387,6 +415,69 @@ FAutoConsoleCommandWithWorldAndArgs GLoomaPerformancesCommand(
         // `Looma.Scenes` — and the second matters more here, since the reason to read
         // this list is often that a switch was refused and the socket is stopped.
         Subsystem->LogPerformances();
+    }));
+
+/**
+ * `Looma.Cue [index]` — step along the current performance's running order.
+ *
+ * The command this whole arc was for. A cue is a point on the chronology, so firing one
+ * is an `openScene` within the performance already connected — no reconnect, unlike
+ * `Looma.Performance <id>`, and that difference is why the two are not one command.
+ *
+ * The index is **0-based**, matching the backend's own `order_idx` numbering rather than
+ * the 1-based counting a paper cue sheet uses. One convention, chosen once: a console
+ * that renumbered would disagree with every other tool over the same rail.
+ *
+ * Arguments are not joined here, unlike `Looma.Scene`, and the asymmetry is the
+ * argument's shape rather than a change of mind: a scene name has spaces in it and an
+ * index cannot, so a second token is a typo with no reading that makes it one number.
+ */
+FAutoConsoleCommandWithWorldAndArgs GLoomaCueCommand(
+    TEXT("Looma.Cue"),
+    TEXT("Open the scene at a position on the current performance's running order: ")
+    TEXT("Looma.Cue <index>, 0-based. With no arguments, print the running order."),
+    FConsoleCommandWithWorldAndArgsDelegate::CreateStatic([](const TArray<FString>& Args, UWorld* World) {
+        if (Args.Num() > 1)
+        {
+            UE_LOG(LogLoomaSync, Display,
+                TEXT("Usage: Looma.Cue <index>  (0-based; with no arguments, prints the running ")
+                TEXT("order)"));
+            return;
+        }
+        ULoomaSceneSyncSubsystem* Subsystem = FindLoomaSubsystem(World);
+        if (!Subsystem)
+        {
+            LogNoSubsystem(TEXT("Looma.Cue"));
+            return;
+        }
+        if (Args.Num() == 0)
+        {
+            // No connectivity check: the running order is a catalogue read over HTTP,
+            // so it answers while the socket is down — and being unable to see the rail
+            // because the socket dropped would be a strange way to find out.
+            Subsystem->LogCues();
+            return;
+        }
+        int32 Index = 0;
+        if (!ParseIndexArgument(Args[0], Index))
+        {
+            // Refused rather than passed to Atoi, which reads "two" as 0 and would fire
+            // the opening cue on a typo. A cue number is the one argument in this file
+            // where a wrong-but-plausible reading has an audience.
+            UE_LOG(LogLoomaSync, Warning,
+                TEXT("Looma.Cue: '%s' is not a cue number. Usage: Looma.Cue <index>, 0-based."),
+                *Args[0]);
+            return;
+        }
+        if (!Subsystem->IsSyncConnected())
+        {
+            UE_LOG(LogLoomaSync, Warning,
+                TEXT("Looma.Cue: not fired — the scene-sync socket is not connected, and the ")
+                TEXT("`openScene` a cue resolves to would be dropped rather than queued. ")
+                TEXT("`Looma.Reconnect` first. `Looma.Cue` with no argument still reads the rail."));
+            return;
+        }
+        Subsystem->OpenCue(Index);
     }));
 
 /**

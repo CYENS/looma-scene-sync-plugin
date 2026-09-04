@@ -109,6 +109,34 @@ struct FLoomaPerformanceSummary
     FString Role;
 };
 
+/**
+ * One cue of a performance's running order — `GET /performances/{id}/cues`.
+ *
+ * THE POOL AND THE RUNNING ORDER ARE DIFFERENT LISTS, and this is the second one.
+ * `performance_scenes` is the set of scenes a performance is working on;
+ * `performance_cues` is the chronology, what happens and in what order. A scene can sit
+ * in the pool without being on the line — a draft, a cut scene, an alternate take — so
+ * an empty running order is an unarranged performance and not a broken one
+ * (backend/app/performances.py, "The pool and the running order are different lists").
+ *
+ * A SCENE MAY APPEAR TWICE. That is a reprise, and it is why a cue carries its own
+ * `cue_id`: keying cues on (performance, scene) would have quietly forbidden it. The
+ * consequence here is that scene id -> cue is one-to-many, so "which cue are we on"
+ * cannot be answered by matching the active scene against this list — see LogCues.
+ */
+struct FLoomaCue
+{
+    /**
+     * The scene this cue fires. A cue's identity on the wire is its `cue_id`, which is
+     * deliberately not parsed: nothing in this console addresses a cue by id — the
+     * index is the handle a person types — and `cue_id` is what a caller that REORDERS
+     * or relabels the rail needs. It goes here on the day something does.
+     */
+    FString SceneId;
+    /** Optional and often absent: `add_cue` stores `clean_label or None`. */
+    FString Label;
+};
+
 /** Per-node bookkeeping for the outbound motion diff. */
 struct FLoomaTrackedActor
 {
@@ -495,6 +523,58 @@ public:
      */
     UFUNCTION(BlueprintCallable, Category = "Looma")
     void LogPerformances();
+
+    // --- The running order (cues) ---------------------------------------------
+    //
+    // Moving along the line is an `openScene` and nothing more: a cue names a scene in
+    // the performance this socket is ALREADY in, so there is no reconnect here. That is
+    // the whole difference from switching performance, and the reason these two live in
+    // different steps.
+
+    /**
+     * Open the scene at a position on the current performance's running order.
+     * Console: `Looma.Cue <index>`.
+     *
+     * **0-based, and the index is a POSITION IN THE LIST, not an `order_idx`.** The
+     * route sorts by `order_idx, rowid` but nothing makes that column dense or
+     * zero-based — `add_cue` takes an optional `order_idx` and `reorder_cues` rewrites
+     * them by list position — so matching the argument against the column would work
+     * perfectly on freshly-reordered data and mis-fire on anything hand-inserted.
+     *
+     * Out of range reports the range rather than clamping. Clamping a cue number is how
+     * a performance ends up showing the wrong scene to a room full of people, and the
+     * off-by-one it hides is exactly the thing a console is being used to find.
+     *
+     * REFUSED WHILE A PERFORMANCE SWITCH IS IN FLIGHT. The running order we could read
+     * belongs to the room being left, and the socket that would receive the `openScene`
+     * may be in a different one by the time the answer lands — so firing it is a race
+     * whose two halves each look correct. LogCues is allowed in that window and this is
+     * not, which is the whole distinction: reading a stale list you have been TOLD is
+     * stale is fine, acting on one is not.
+     */
+    UFUNCTION(BlueprintCallable, Category = "Looma")
+    void OpenCue(int32 CueIndex);
+
+    /**
+     * Log the current performance's running order — index, scene id and label — marking
+     * the cues whose scene is the active one. Console: `Looma.Cue` with no arguments.
+     *
+     * CUES, PLURAL, MAY BE MARKED. A scene can be on the line more than once (a
+     * reprise), and the wire moves by scene id rather than by cue position — `openScene`
+     * carries a `sceneId` and the `scene` frame answers with one — so this client
+     * genuinely does not know which of two identical cues is live. Marking both and
+     * saying so is the honest answer; marking the first would be a guess dressed as a
+     * fact.
+     *
+     * Scene NAMES are deliberately not fetched. `FetchScenes` has them and a second
+     * request would pair them up, but it would double the failure surface of a
+     * read-only command for a cosmetic field and need a policy for "the cues came back
+     * and the scenes did not" — a half-rendered listing. The scene id is the string
+     * every other command here accepts, so this hands back something directly usable,
+     * and `Looma.Scenes` pairs ids with names one command away.
+     */
+    UFUNCTION(BlueprintCallable, Category = "Looma")
+    void LogCues();
 
     // --- Local selection (outbound `selection`) -------------------------------
     //
@@ -1008,6 +1088,26 @@ private:
      */
     void FetchPerformances(
         TFunction<void(bool bOk, const TArray<FLoomaPerformanceSummary>& Performances)> OnDone);
+
+    /**
+     * `GET /performances/{id}/cues` once, handing the rows to OnDone in running order.
+     *
+     * The third catalogue fetch, and the one that tested step 7's decision to extract
+     * the REQUEST rather than a generic fetch: it needed no change to MakeCatalogueRequest
+     * and shares no parsing with either sibling, because this envelope is `cues` and the
+     * rows are a third shape. A generic fetch would have had to grow a third case here.
+     *
+     * Parameterised by a path segment, unlike the other two, and the segment is not
+     * escaped: it comes from the hub's own `scene` frame, never from a caller — this
+     * takes an INDEX, not an id. A command that accepts a performance id from a person
+     * and builds a path from it is where escaping starts to earn its place.
+     *
+     * Read access, not edit: the route gates on `get_visible`, so a VIEWER may read the
+     * running order (backend/app/performances.py). That is the common case rather than
+     * the edge one, and it is right — stepping a timeline is watching, not editing.
+     */
+    void FetchCues(const FString& PerformanceId,
+        TFunction<void(bool bOk, const TArray<FLoomaCue>& Cues)> OnDone);
 
     /**
      * A GET against the backend, configured the one way a catalogue read has to be.
