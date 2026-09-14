@@ -424,10 +424,9 @@ consults the suggestion when one resolves, so this renames a *guest* and never a
 plugin sends it either way rather than branching on the token — the hub already ignores it, and a
 branch would be more code for the same outcome.
 
-This is not merely cosmetic: it is the only way this plugin can know its own guest name at all.
-Inbound `clients` (the roster message) is deliberately not handled here, and `GET /auth/me` mints a
-fresh random `Guest-xxxxxx` on every call, so there is nothing to read the name *back* from.
-Proposing it is how it becomes knowable.
+The accepted name can be read back from `Get Client(Get Own Client Id)`, which uses the inbound
+roster's self entry. `GET /auth/me` mints a fresh random `Guest-xxxxxx` on every unauthenticated
+request, so that REST response is not the guest name the room knows.
 
 **Attribution for what a guest creates.** `POST /generate` carries `X-Client-Id` with the same
 `clientId` the `hello` sends, so a guest's generations are credited to the one stable
@@ -505,11 +504,18 @@ shared scene reads as shared. The normative contract is `docs/scene-format.md`, 
 room — the `clients` message"* and *"What each client has selected"*; this is how it lands in
 Unreal.
 
-Two messages feed it. `clients` is the whole room, re-sent on every join and every leave, carrying
-each client's colour, name, kind and current selection. `selection` is one client's whole set,
-changing hands between rosters. Neither is scene state: **none of it is merged into the document,
-sent in a `scene`, or saved, and all of it dies with the socket** — there is no teardown message, so
-dropping a client that has left the roster is the only thing that clears its borders.
+Two messages feed it. `clients` replaces room membership, order and metadata on each join or leave.
+Its selection snapshot hydrates newly encountered clients; known clients retain their latest
+selection and claim order. `selection` replaces one client's whole set between rosters, and its
+server-stamped colour updates even when the selected ids stay the same. A selection arriving before
+its sender's first roster creates a provisional client, including when its ids array is empty.
+
+Presence is transient: **none of it is merged into the scene document or saved**. A departing
+client releases its claims; a disconnected socket clears the room. Changing the active
+`(performance.id, sceneId)` clears both remote presence and local selection before the new roster
+hydrates, so a reused node id cannot inherit a previous scene's claim. A snapshot of the same
+identity preserves live selections, and the first scene frame preserves presence that arrived
+ahead of it. Empty `sceneId` is a valid unsaved-scene identity, not a missing initialization flag.
 
 | Blueprint node (`Looma\|Presence`) | What it does |
 | --- | --- |
@@ -520,20 +526,21 @@ dropping a client that has left the roster is the only thing that clears its bor
 | `Get Client Border Nodes` | The nodes one client both selected *and* won — one outline group's worth |
 | `Get Remote Border Groups` | The whole draw list: per client, its colour, stencil slot, own nodes and descendants |
 | `Get Undrawn Clients` | Clients holding a border that no stencil slot was left for |
-| `On Clients Changed` | The room moved — a join, a leave, or somebody's selection. Fires only on a real change, and fires with an empty array when the socket drops |
+| `On Clients Changed` | Immediate notification of changed client data, including colour-only updates; an empty array clears the room on disconnect or scene switch |
+| `On Remote Borders Refreshed` | Fires after the next dirty tick has updated draw-list getters, stencils and the configured colour collection; bind this to drive a custom outline renderer |
 
 `Get Own Client Id` closes a gap worth naming: **this is the only way the plugin can learn its own
 room name.** `GET /auth/me` mints a fresh random `Guest-xxxxxx` on every call when no session is
 held, so that name matches nothing anyone else sees; the roster's self entry is the real one. Set
 `GuestDisplayName` to have something readable there — see *Being named in the room*.
 
-Five rules govern what is drawn, and each is a rule from the contract rather than a choice:
+The drawing rules are:
 
 - **First claim wins, and nothing is locked.** Two people can select one node and both can still
   edit it; this is a drawing rule only, so that one node has one border. The claim ledger is
-  `nodeId → claimants, oldest first`, and the head draws. Every client receives hub messages in the
-  same order, so each maintains that order locally and they all agree with no arbitration. A real
-  per-selection lock is planned and will replace it.
+  `nodeId → claimants, oldest first`, and the head draws. Live messages advance this ledger in
+  arrival order; roster order seeds the claims of clients first encountered in a snapshot. An
+  unrelated roster refresh never moves an existing claimant. There is no edit lock.
 - **Your own selection always wins on your own screen.** Our ids are subtracted from every remote
   border first, thick and thin alike, so a remote claim can never make us lose track of what we
   hold. Our own colour is what *other* people see for us; it is never drawn here.
@@ -555,9 +562,10 @@ Five rules govern what is drawn, and each is a rule from the contract rather tha
 - **An unknown node id is kept, not filtered.** A `selection` legitimately races the `spawn` that
   created its node, and nothing re-sends a dropped claim, so the claim is held and the border simply
   appears if the node arrives.
-- **An unknown `clientId` is drawn in a neutral grey (`#bbbbbb`), never guessed and never dropped.**
-  The roster and a `selection` are fanned out independently, so a selection can land just before the
-  roster that introduces its sender. The next roster corrects it.
+- **A colour is learned from the server, never guessed.** A selection message's valid colour wins,
+  then the sender's known roster colour, then neutral grey (`#bbbbbb`). This also lets a client
+  draw a provisional sender before its first roster arrives; that roster supplies its metadata
+  and authoritative colour while retaining the selection already observed.
 
 Two limits are deliberate and visible rather than silent:
 
@@ -614,8 +622,8 @@ leave a departed client's colour sitting in the collection for a material to dra
 plugin logs once that stencil values are being written with no colours published, because "not
 configured" and "broken" otherwise produce the identical symptom.
 
-**3. Decode the stencil in a post-process material** (blendable location *Before Tonemapping*), from
-`SceneTexture:CustomStencil`:
+**3. Decode the stencil in a post-process material**, using blendable location **Scene Color After
+DOF** (`BL_SceneColorAfterDOF`) in UE 5.8, from `SceneTexture:CustomStencil`:
 
 | Value | Meaning |
 | --- | --- |
@@ -633,9 +641,11 @@ Match the web client's weighting so the two viewers agree: thick edges at streng
 differently, so a claim on something behind another object still reads as that client's.
 
 **4. Or skip 2 and 3 entirely.** `Get Remote Border Groups` hands you the same decision — client,
-colour, slot, own nodes, descendants — as plain Blueprint data, recomputed whenever the room, the
-local selection or the scene moves. Drive your own materials from it if the collection route does
-not suit; the stencil is written either way.
+colour, slot, own nodes, descendants — as plain Blueprint data. Bind **On Remote Borders Refreshed**
+and re-read it after the dirty tick. Inside that callback the getters and primitive stencils already
+agree, and the configured collection has been updated. `On Clients Changed` stays immediate and
+does not promise a fresh border cache. The refresh event also covers local selection and scene or
+component edits, which may leave client data unchanged; it stays quiet on unchanged frames.
 
 The plugin deliberately does **not** drive a stencil for your own local selection. That is your
 project's business and it must not change when the room does — which is the point of the
@@ -643,17 +653,19 @@ your-selection-always-wins rule above.
 
 ## Automation tests
 
-After building the host's Editor target, run `Looma.Presence.SceneRefresh` through Unreal's
+After building the host's Editor target, run `Looma.Presence` through Unreal's
 Automation window, or from the command line:
 
 ```text
-UnrealEditor-Cmd.exe <host-project.uproject> -unattended -nop4 -nullrhi -nosound -ExecCmds="Automation RunTests Looma.Presence.SceneRefresh" -TestExit="Automation Test Queue Empty" -ReportExportPath=<report-directory>
+UnrealEditor-Cmd.exe <host-project.uproject> -unattended -nop4 -nullrhi -nosound -ExecCmds="Automation RunTests Looma.Presence" -TestExit="Automation Test Queue Empty" -ReportExportPath=<report-directory>
 ```
 
-The four tests use a transient world and feed real wire frames without initializing the subsystem,
-restoring a session or connecting to a backend. They check primitive stencil values and the published
-descendant list after remote/local reparenting, component replacement and an existing-node upsert.
-Check the exported `index.json` for **four successes and zero failures**: the editor process can exit
+The eight tests use a transient world and feed real wire frames without initializing the subsystem,
+restoring a session or connecting to a backend. They check primitive stencils and descendant lists
+after remote/local reparenting, component replacement and existing-node upserts; colour-only and
+provisional-client notifications; real delegate callbacks reading the refreshed cache and stencil;
+and scene identity changes with reused node ids versus same-scene resyncs.
+Check the exported `index.json` for **eight successes and zero failures**: the editor process can exit
 with code 0 even when an automation assertion fails. These checks verify ownership and stencil
 assignment; the host's outline material still needs a rendering acceptance pass.
 

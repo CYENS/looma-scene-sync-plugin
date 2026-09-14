@@ -362,6 +362,7 @@ void ULoomaSceneSyncSubsystem::Deinitialize()
     PendingHandleReplays.Empty();
     SuggestedTransforms.Empty();
     ActiveSceneId.Reset();
+    bHasSceneIdentity = false;
     ActivePerformance = FLoomaPerformance();
     RequestedPerformanceId.Reset();
     SentPerformanceId.Reset();
@@ -2635,6 +2636,8 @@ void ULoomaSceneSyncSubsystem::HandleScene(const TSharedPtr<FJsonObject>& Msg)
         // (backend/app/sync.py), so this catches a truncated or foreign frame.
         return;
     }
+    const FString PreviousSceneId = ActiveSceneId;
+    const FString PreviousPerformanceId = ActivePerformance.Id;
     // `sceneId` is null for an unsaved working scene, and TryGet leaves the old value
     // in place on a null — so clear it first.
     ActiveSceneId.Reset();
@@ -2662,6 +2665,17 @@ void ULoomaSceneSyncSubsystem::HandleScene(const TSharedPtr<FJsonObject>& Msg)
         (*Performance)->TryGetStringField(TEXT("name"), ActivePerformance.Name);
         (*Performance)->TryGetStringField(TEXT("visibility"), ActivePerformance.Visibility);
     }
+    if (bHasSceneIdentity &&
+        (PreviousSceneId != ActiveSceneId || PreviousPerformanceId != ActivePerformance.Id))
+    {
+        // Node ids may be reused in another scene, and UpsertNodes may even reuse the
+        // actor. Neither its old remote claims nor our local selection belongs to the
+        // new scene. A resync of this SAME identity keeps both; the first scene also
+        // keeps presence that raced ahead of it rather than inventing a scene switch.
+        ClearPresence();
+        ClearSelection();
+    }
+    bHasSceneIdentity = true;
     // Now that the confirmed value is in hand, settle what this socket asked for against
     // it. Here rather than at the end of the function because it is about the frame's
     // header and not its document: whether the nodes apply cleanly has no bearing on
@@ -3710,10 +3724,10 @@ void ULoomaSceneSyncSubsystem::HandleClients(const TSharedPtr<FJsonObject>& Msg)
             *You, *ClientId);
     }
 
-    // Rebuilt wholesale, never merged. The roster is the whole room every time: a
+    // Membership is replaced wholesale. The roster is the whole room every time: a
     // client that has left is simply absent, and dropping it here is the only thing
     // that will ever clear its borders, because there is no teardown message.
-    // Roster order is join order and is the claim tiebreak, so nothing below sorts.
+    // Join order seeds new clients' claims; known selections keep their live order.
     TArray<FLoomaClient> NextClients;
     NextClients.Reserve(Entries->Num());
     FLoomaClient NextSelf;
@@ -3888,7 +3902,8 @@ void ULoomaSceneSyncSubsystem::HandleSelection(const TSharedPtr<FJsonObject>& Ms
 
     int32 Index = RemoteClients.IndexOfByPredicate(
         [&SenderId](const FLoomaClient& Candidate) { return Candidate.Id == SenderId; });
-    if (Index == INDEX_NONE)
+    const bool bNewSender = Index == INDEX_NONE;
+    if (bNewSender)
     {
         // A sender the roster has not introduced yet. Appended rather than ignored:
         // the roster and a `selection` are fanned out independently — the hub awaits
@@ -3907,6 +3922,7 @@ void ULoomaSceneSyncSubsystem::HandleSelection(const TSharedPtr<FJsonObject>& Ms
     }
 
     FLoomaClient& Sender = RemoteClients[Index];
+    const FString PreviousColorHex = Sender.ColorHex;
     // Colour precedence: this message, then whatever the last roster gave this client,
     // then the neutral fallback. The message's copy is the same value as the roster's,
     // so the first two can only differ when the hub has recoloured someone — and a
@@ -3920,18 +3936,21 @@ void ULoomaSceneSyncSubsystem::HandleSelection(const TSharedPtr<FJsonObject>& Ms
         LoomaParseClientColor(FString(), Sender.ColorHex, Sender.Color);
     }
 
-    if (Sender.Selection == Ids)
+    const bool bSelectionChanged = Sender.Selection != Ids;
+    if (!bNewSender && !bSelectionChanged && Sender.ColorHex == PreviousColorHex)
     {
-        // Nothing moved. The ledger would be unchanged too — MoveClaims would compute
-        // an empty diff — so returning here only skips an event, which is the rule
-        // OnClientsChanged states.
+        // Only an identical client is quiet. A new sender with ids:[] still joined,
+        // and a colour-only update must reach both roster consumers and the material.
         return;
     }
     // The whole set, replacing what it held; the wire never sends a delta. The ledger
     // gets the difference, which is why the old set has to be read before the new one
     // is stored.
-    MoveClaims(SenderId, Sender.Selection, Ids);
-    Sender.Selection = MoveTemp(Ids);
+    if (bSelectionChanged)
+    {
+        MoveClaims(SenderId, Sender.Selection, Ids);
+        Sender.Selection = MoveTemp(Ids);
+    }
 
     MarkBordersDirty();
     OnClientsChanged.Broadcast(RemoteClients);
@@ -4261,6 +4280,9 @@ void ULoomaSceneSyncSubsystem::RefreshRemoteBorders()
     }
 
     PublishBorderColors();
+    // The immediate roster event cannot promise this state: scene/component edits
+    // and local selection also dirty it. Notify once the cache and render data agree.
+    OnRemoteBordersRefreshed.Broadcast();
 }
 
 void ULoomaSceneSyncSubsystem::ApplyStencilToNode(
@@ -4379,8 +4401,8 @@ void ULoomaSceneSyncSubsystem::ClearPresence()
     SelfClient = FLoomaClient();
     OwnClientId.Reset();
     // The ledger goes with the room it describes. It is derived entirely from the
-    // roster and the `selection` messages of the socket that just died, and nothing
-    // will retract a claim made over a connection that no longer exists.
+    // roster and the `selection` messages for this socket and scene. A new scene may
+    // reuse node ids, but that never transfers the old scene's claims to them.
     Claims.Reset();
     if (bHadRoom)
     {
