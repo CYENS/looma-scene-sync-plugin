@@ -233,23 +233,23 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FLoomaIdentityEvent, const FLoomaIde
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FLoomaSelectionEvent, const TArray<FString>&, NodeIds);
 
 /**
- * The room moved: a client joined, left, or arrived holding a different selection.
+ * The room moved: a client's membership, metadata, colour or selection changed.
  * Carries the **remote** clients in roster order — never our own entry, for the
  * reason GetClients() gives.
  *
- * Fires only when the roster actually differs from the one we held, the same rule
- * OnAuthStateChanged and OnIdentityChanged follow: binding is then enough and nothing
- * has to poll or diff defensively. The hub re-sends the whole roster on every join
- * and every leave, so the traffic is low enough that firing unconditionally would
- * have been affordable — the objection is not cost. It is that a delegate which fires
- * when nothing moved teaches every consumer to diff before acting, and step 3's
- * consumer rebuilds border geometry, which is exactly the work not worth doing twice.
+ * Fires immediately, only when the client data actually differs. GetClients and the
+ * claim getters are current inside the callback; the border draw list is coalesced
+ * until Tick. Material consumers bind OnRemoteBordersRefreshed instead, because a
+ * local selection or a scene edit can change borders without changing the room.
  *
  * It DOES fire with an empty array when the socket drops, and that is not a
- * formality: presence dies with the socket, and this event is the only thing that
- * will ever tell a consumer to take those borders down. There is no teardown message.
+ * formality: presence dies with the socket. It also clears when the active scene
+ * identity changes, before the new scene's roster can hydrate its clients.
  */
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FLoomaClientsEvent, const TArray<FLoomaClient>&, Clients);
+
+/** A dirty border refresh finished; the draw-list getters and stencil now agree. */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE(FLoomaBordersRefreshedEvent);
 
 /**
  * Client of the LoomaXR scene-sync hub (backend /ws/scene), speaking **scene format
@@ -827,12 +827,24 @@ public:
      * What to draw, one entry per remote client that holds a border, in roster order.
      *
      * For a consumer driving its own material instead of the parameter collection.
-     * Recomputed when the room, the local selection or the scene moves — bind
-     * `On Clients Changed` and re-read, or just read it each frame; it is a cached
-     * array, not a computation.
+     * Recomputed on the next dirty tick after the room, local selection or scene
+     * moves. Bind OnRemoteBordersRefreshed and re-read; OnClientsChanged is immediate
+     * and does not promise a refreshed draw list. This getter only copies the cache.
      */
     UFUNCTION(BlueprintPure, Category = "Looma|Presence")
     TArray<FLoomaBorderGroup> GetRemoteBorderGroups() const;
+
+    /**
+     * A coalesced border refresh finished: GetRemoteBorderGroups, GetUndrawnClients,
+     * primitive stencils and the configured colour collection have been updated.
+     *
+     * "Refreshed" rather than "changed": replacing a primitive can require a redraw
+     * with the same group ids and colours. Fires once per dirty tick, including the
+     * empty result on disconnect, scene switch or local-selection suppression, and
+     * never merely because another unchanged frame passed.
+     */
+    UPROPERTY(BlueprintAssignable, Category = "Looma|Presence")
+    FLoomaBordersRefreshedEvent OnRemoteBordersRefreshed;
 
     /**
      * Clients holding a border that there was no stencil slot left to draw.
@@ -1292,7 +1304,7 @@ private:
      */
     void HandleSceneError(const TSharedPtr<FJsonObject>& Msg);
 
-    /** The room roster: rebuild RemoteClients / SelfClient wholesale. See the Presence block. */
+    /** Replace roster membership/metadata, retaining known clients' live selections. */
     void HandleClients(const TSharedPtr<FJsonObject>& Msg);
     /** One client's whole selection, replacing what it held. See the claim-ledger block. */
     void HandleSelection(const TSharedPtr<FJsonObject>& Msg);
@@ -1339,15 +1351,16 @@ private:
     void PublishBorderColors();
 
     /**
-     * Forget the room, because presence dies with the socket.
+     * Forget the room when its socket ends or the active scene identity changes.
      *
      * Called from every one of the three ways a socket ends — CloseSocket for a
      * deliberate teardown, and the OnClosed / OnConnectionError handlers for a drop,
      * which do NOT route through CloseSocket. Missing the last two is the bug worth
      * naming: the roster would then survive the disconnection that invalidated it, and
      * step 3 would leave a departed client's borders on screen until a reconnect that
-     * may never come. Broadcasts OnClientsChanged if the room was not already empty,
-     * which is what takes them down.
+     * may never come. HandleScene uses the same reset when changing scenes so a reused
+     * node id cannot inherit an old claim. Broadcasts OnClientsChanged immediately;
+     * the next dirty tick clears stencils and emits OnRemoteBordersRefreshed.
      */
     void ClearPresence();
 
@@ -1598,6 +1611,9 @@ private:
     /** Which saved scene the hub says is live (`sceneId`); empty for an unsaved one. */
     FString ActiveSceneId;
 
+    /** Empty scene ids are valid, so identity arrival cannot be inferred from the id. */
+    bool bHasSceneIdentity = false;
+
     /**
      * Which workspace the hub says this socket is in. Replaced whole by every `scene`
      * frame, never merged into — see HandleScene for why a null name must not be
@@ -1697,19 +1713,19 @@ private:
     bool bForceSelectionSend = false;
 
     /**
-     * The room, from the last `clients` roster: everyone but us, in join order.
+     * The room, from the last `clients` roster: everyone but us, in join order,
+     * followed by any provisional senders whose first roster has not arrived yet.
      *
      * A flat array rather than a map keyed by id, though GetClient() then has to scan
-     * it. Order is load-bearing — it is the claim tiebreak step 2 resolves conflicts
-     * with, and every client receives hub messages in the same order, so preserving it
-     * is what makes all of them agree without a byte of extra protocol. A TMap would
-     * have thrown it away for a lookup on a set whose size is a handful of people in a
-     * room.
+     * it. Order is load-bearing — it seeds claims when a client is first encountered
+     * and allocates border slots. Subsequent selections retain live claim order, even
+     * when it differs from join order. A TMap would have thrown that order away for
+     * a lookup on a set whose size is a handful of people in a room.
      *
      * Kept next to the selection state above rather than beside the scene state,
      * because its lifetime is the selection's, not the scene's: the scene document
      * survives a reconnect and is re-reconciled from the hub's `scene`, while this
-     * dies with the socket outright — see ClearPresence.
+     * dies with the socket outright, or on a scene identity change — see ClearPresence.
      */
     TArray<FLoomaClient> RemoteClients;
 

@@ -38,8 +38,8 @@ enum class ELoomaClientKind : uint8
  * One client in the room, from the hub's `clients` roster.
  *
  * **Presence, not scene state.** It is never merged into the scene document, never
- * saved, never sent in a `scene`, and it dies with the socket — see
- * ULoomaSceneSyncSubsystem::ClearPresence.
+ * saved, never sent in a `scene`, and it dies with the socket or on a scene identity
+ * change — see ULoomaSceneSyncSubsystem::ClearPresence.
  *
  * Nothing here is ours to invent. The colour is the server's to assign (a client
  * that picks its own is wrong), the display name is server-resolved, and `kind` is
