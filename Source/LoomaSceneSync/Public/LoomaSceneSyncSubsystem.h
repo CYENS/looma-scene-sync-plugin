@@ -1157,6 +1157,12 @@ public:
     // Looma Scene Sync — and is read live from there, so an edit needs no restart.
 
 private:
+#if WITH_DEV_AUTOMATION_TESTS
+    // The fixture seeds a transient scene and feeds wire frames without opening a
+    // socket or restoring a session. Production callers use the public scene API.
+    friend struct FLoomaBorderRefreshTestFixture;
+#endif
+
     void Connect();
     /** Clear the handlers and close the socket, so a dead one cannot fire a retry. */
     void CloseSocket();

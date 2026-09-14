@@ -641,6 +641,22 @@ The plugin deliberately does **not** drive a stencil for your own local selectio
 project's business and it must not change when the room does — which is the point of the
 your-selection-always-wins rule above.
 
+## Automation tests
+
+After building the host's Editor target, run `Looma.Presence.SceneRefresh` through Unreal's
+Automation window, or from the command line:
+
+```text
+UnrealEditor-Cmd.exe <host-project.uproject> -unattended -nop4 -nullrhi -nosound -ExecCmds="Automation RunTests Looma.Presence.SceneRefresh" -TestExit="Automation Test Queue Empty" -ReportExportPath=<report-directory>
+```
+
+The four tests use a transient world and feed real wire frames without initializing the subsystem,
+restoring a session or connecting to a backend. They check primitive stencil values and the published
+descendant list after remote/local reparenting, component replacement and an existing-node upsert.
+Check the exported `index.json` for **four successes and zero failures**: the editor process can exit
+with code 0 even when an automation assertion fails. These checks verify ownership and stencil
+assignment; the host's outline material still needs a rendering acceptance pass.
+
 ## Status
 
 Beta (`IsBetaVersion: true`), version 0.1.0.

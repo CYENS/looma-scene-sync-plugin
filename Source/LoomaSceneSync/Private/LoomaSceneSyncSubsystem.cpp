@@ -2809,10 +2809,6 @@ void ULoomaSceneSyncSubsystem::UpsertNode(const TSharedPtr<FJsonObject>& Node)
         FLoomaTrackedActor Entry;
         Entry.Actor = Actor;
         Tracked.Add(NodeId, Entry);
-        // A node arriving may be one a remote client already claims — a `selection`
-        // legitimately races the `spawn` that created its node — so the border has to be
-        // worked out again now that there is finally something to mark.
-        MarkBordersDirty();
     }
 
     Actor->DisplayName = Name.IsEmpty() ? NodeId : Name;
@@ -2821,6 +2817,10 @@ void ULoomaSceneSyncSubsystem::UpsertNode(const TSharedPtr<FJsonObject>& Node)
 #endif
     Actor->ApplyComponents(Components, MakeRenderContext(Components));
     ApplyParent(*Actor, ParentId, Local, /*bSnap=*/true);
+    // A claim may precede its node, and an upsert of an EXISTING node may replace its
+    // primitives. Both need a fresh marked set: dirtying only the spawn branch leaves
+    // a newly added mesh unoutlined until somebody happens to change their selection.
+    MarkBordersDirty();
 
     if (FLoomaTrackedActor* Entry = Tracked.Find(NodeId))
     {
@@ -2851,7 +2851,13 @@ void ULoomaSceneSyncSubsystem::ApplyParent(ALoomaSyncedActor& Actor, const FStri
     // and turns a spawn naming an unknown parent into a root, so this is belt and
     // braces — the node becomes a root now, and ResolvePendingParents picks it up if
     // the parent does turn up later.
-    Actor.ParentId = ParentId;
+    if (Actor.ParentId != ParentId)
+    {
+        Actor.ParentId = ParentId;
+        // Descendant hints follow this edge. A reparent is a scene change even when
+        // nobody's selection moved, and must clear the old subtree's stencil too.
+        MarkBordersDirty();
+    }
 
     ALoomaSyncedActor* Parent = ParentId.IsEmpty() ? nullptr : FindSyncedActor(ParentId);
     if (Parent && Parent != &Actor)
@@ -3083,6 +3089,9 @@ void ULoomaSceneSyncSubsystem::HandlePatch(const TSharedPtr<FJsonObject>& Msg)
         {
             const FLoomaNodeComponents Components = LoomaParseComponents(ComponentArray);
             Actor->ApplyComponents(Components, MakeRenderContext(Components));
+            // Components are replaced as a whole, so the primitives we marked last
+            // frame may be gone and new ones may now carry an existing claim.
+            MarkBordersDirty();
         }
     }
 }
@@ -3464,6 +3473,9 @@ void ULoomaSceneSyncSubsystem::TickOutbound(float DeltaTime)
             // relays verbatim under the node's *old* parent. That spurious message —
             // not the missing reparent — is what corrupts the stored scene.
             Actor->ParentId = WireParent ? WireParent->Id : FString();
+            // The hub may not echo a local attachment before the next draw. Keep the
+            // descendant hints in step with the edge we have just adopted ourselves.
+            MarkBordersDirty();
             Entry.LastSent = WirePose(*Actor);
             Entry.bMoving = false;
             Entry.StillFrames = 0;
@@ -3640,6 +3652,7 @@ ALoomaSyncedActor* ULoomaSceneSyncSubsystem::SpawnSyncedAsset(const FString& Ass
     Entry.Actor = Actor;
     Entry.LastSent = Transform;
     Tracked.Add(Actor->Id, Entry);
+    MarkBordersDirty();
 
     TSharedRef<FJsonObject> Node = MakeShared<FJsonObject>();
     Node->SetStringField(TEXT("id"), Actor->Id);
