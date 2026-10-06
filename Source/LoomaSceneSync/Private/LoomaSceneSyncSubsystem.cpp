@@ -589,15 +589,15 @@ void ULoomaSceneSyncSubsystem::LogActiveScene()
     if (ActiveSceneId.IsEmpty())
     {
         // Two different emptinesses, and they must not read alike. The hub sends
-        // `sceneId: null` for a working scene nobody has saved — a real scene, with a
-        // real document in it, that merely has no row to be named by. Before the first
-        // `scene` frame lands we hold the same empty string and know nothing at all.
-        // Only the socket separates them, which is why GetActiveSceneId cannot.
+        // `sceneId: null` when nothing is open: no scene, no document and nothing to
+        // save, so the level is empty. Before the first `scene` frame lands we hold the
+        // same empty string and know nothing at all. Only the socket separates them,
+        // which is why GetActiveSceneId cannot.
         if (IsSyncConnected())
         {
             UE_LOG(LogLoomaSync, Display,
-                TEXT("Active scene: <unsaved> — the hub has us on a working scene with no saved row ")
-                TEXT("behind it, so it has neither an id nor a name."));
+                TEXT("Active scene: No scene open — the hub has us on nothing, so the level is empty. ")
+                TEXT("`Looma.Scene <id>` opens one."));
         }
         else
         {
@@ -692,8 +692,8 @@ void ULoomaSceneSyncSubsystem::LogScenes()
         if (Active.IsEmpty())
         {
             // Nothing marked is a state, not an omission, and the two states behind it
-            // are not this command's to explain — `Looma.Scene` already separates "the
-            // working scene has never been saved" from "no frame has arrived", and
+            // are not this command's to explain — `Looma.Scene` already separates "no
+            // scene is open" from "no frame has arrived", and
             // saying it twice is how the two copies come to disagree.
             UE_LOG(LogLoomaSync, Display,
                 TEXT("None is marked active: no saved scene is open. `Looma.Scene` with no ")
@@ -1715,8 +1715,8 @@ FString ULoomaSceneSyncSubsystem::GetConnectionStatusText() const
     // key the hub, the REST paths and every other client agree on, and the name is the
     // one field of it that can legitimately be missing. `Looma.Performance` prints both.
     //
-    // The two placeholders differ on purpose. `<unsaved>` is a scene the hub really has
-    // us on that has never been saved; `<unknown>` is the absence of an answer, since
+    // The two placeholders differ on purpose. "No scene open" is the hub telling us
+    // nothing is open; `<unknown>` is the absence of an answer, since
     // there is no performance the hub can put us in without naming its id.
     FString Performance = ActivePerformance.Id.IsEmpty() ? TEXT("<unknown>") : ActivePerformance.Id;
     // A switch in flight is printed BESIDE the confirmed id rather than in place of it,
@@ -1737,7 +1737,7 @@ FString ULoomaSceneSyncSubsystem::GetConnectionStatusText() const
         AuthStateText(AuthState),
         Tracked.Num(),
         *Performance,
-        ActiveSceneId.IsEmpty() ? TEXT("<unsaved>") : *ActiveSceneId,
+        ActiveSceneId.IsEmpty() ? TEXT("No scene open") : *ActiveSceneId,
         Jobs.Num());
 }
 
@@ -2638,8 +2638,8 @@ void ULoomaSceneSyncSubsystem::HandleScene(const TSharedPtr<FJsonObject>& Msg)
     }
     const FString PreviousSceneId = ActiveSceneId;
     const FString PreviousPerformanceId = ActivePerformance.Id;
-    // `sceneId` is null for an unsaved working scene, and TryGet leaves the old value
-    // in place on a null — so clear it first.
+    // `sceneId` is null when no scene is open, and TryGet leaves the old value in place
+    // on a null — so clear it first.
     ActiveSceneId.Reset();
     Msg->TryGetStringField(TEXT("sceneId"), ActiveSceneId);
 
@@ -2713,7 +2713,7 @@ void ULoomaSceneSyncSubsystem::HandleScene(const TSharedPtr<FJsonObject>& Msg)
     UpsertNodes(*Nodes);
 
     UE_LOG(LogLoomaSync, Log, TEXT("Scene%s: %d node(s) applied, %d dropped"),
-        ActiveSceneId.IsEmpty() ? TEXT(" (unsaved)") : *FString::Printf(TEXT(" '%s'"), *ActiveSceneId),
+        ActiveSceneId.IsEmpty() ? TEXT(": No scene open") : *FString::Printf(TEXT(" '%s'"), *ActiveSceneId),
         Nodes->Num(), Stale.Num());
 }
 

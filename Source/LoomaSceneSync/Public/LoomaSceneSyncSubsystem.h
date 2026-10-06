@@ -408,9 +408,8 @@ public:
 
     /**
      * Which saved scene the hub has us on. **Empty is an answer, not a failure**: it is
-     * what an unsaved working scene reports, since that document has no row behind it
-     * and the frame carries `sceneId: null`. It is also what we hold before the first
-     * frame lands, and nothing in the string tells those two apart — which is why
+     * what "No scene open" reports, since the frame then carries `sceneId: null`. It is
+     * also what we hold before the first frame lands, and nothing in the string tells those two apart — which is why
      * LogActiveScene consults the socket and this getter cannot.
      */
     UFUNCTION(BlueprintPure, Category = "Looma")
@@ -1608,7 +1607,7 @@ private:
     TMap<FString, FLoomaTrackedActor> Tracked; // node id -> actor + last-sent cache
     TMap<FString, FLoomaGenerationJob> Jobs;   // jobId -> latest job snapshot
 
-    /** Which saved scene the hub says is live (`sceneId`); empty for an unsaved one. */
+    /** Which saved scene the hub says is live (`sceneId`); empty when no scene is open. */
     FString ActiveSceneId;
 
     /** Empty scene ids are valid, so identity arrival cannot be inferred from the id. */
