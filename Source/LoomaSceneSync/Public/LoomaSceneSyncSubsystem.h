@@ -1168,6 +1168,27 @@ public:
     // Every knob lives on ULoomaSceneSyncSettings — Project Settings > Plugins >
     // Looma Scene Sync — and is read live from there, so an edit needs no restart.
 
+    // --- GLB downloads ---------------------------------------------------------
+
+    /**
+     * Fetch a `model` GLB for `Actor`, through a small queue: at most a few downloads
+     * in flight, each with a generous timeout, retried with backoff. The bytes (or
+     * null, once every retry has failed) arrive on ALoomaSyncedActor::OnGlbDownloaded.
+     *
+     * A newer request from the same actor replaces its queued one. The queue exists
+     * because the GLBs and the REST API share one host and therefore one 16-connection
+     * HTTP pool: firing a whole scene's downloads at once starved both, and through a
+     * slow tunnel the queued downloads died on the HTTP layer's timeout and were never
+     * asked for again. See the constants beside the implementation for the numbers.
+     */
+    void RequestGlb(ALoomaSyncedActor& Actor, const FString& Url);
+
+    /** GLB downloads waiting for a slot (including ones backing off before a retry). */
+    int32 GetGlbQueueDepth() const { return GlbQueue.Num(); }
+
+    /** GLB downloads currently on the wire. */
+    int32 GetGlbDownloadsInFlight() const { return GlbInFlight.Num(); }
+
 private:
 #if WITH_DEV_AUTOMATION_TESTS
     // The fixture seeds a transient scene and feeds wire frames without opening a
@@ -1474,8 +1495,33 @@ private:
     void ResolvePendingParents();
     /** Destroy an actor and forget it, without echoing a despawn back to the hub. */
     void DropNode(const FString& NodeId);
-    /** What ApplyComponents needs from outside the node: the GLB url and the config. */
-    FLoomaNodeRenderContext MakeRenderContext(const FLoomaNodeComponents& Components) const;
+    /**
+     * What ApplyComponents needs from outside the node: the GLB url, the config, and
+     * this subsystem as the GLB loader — which is why it is not const.
+     */
+    FLoomaNodeRenderContext MakeRenderContext(const FLoomaNodeComponents& Components);
+
+    /** One GLB download, queued or in flight. */
+    struct FGlbFetch
+    {
+        TWeakObjectPtr<ALoomaSyncedActor> Actor;
+        FString Url;
+        /** Retries already spent on this url. */
+        int32 Retries = 0;
+        /** FPlatformTime::Seconds() before which a retry waits out its backoff. */
+        double NotBefore = 0.0;
+        /** When the current attempt went on the wire, for the completion log line. */
+        double Started = 0.0;
+    };
+    /** Start queued downloads while there are free slots and due entries. */
+    void PumpGlbQueue();
+    void StartGlbFetch(FGlbFetch Fetch);
+    /** One attempt finished: deliver, re-queue with backoff, or give up. */
+    void FinishGlbFetch(const FGlbFetch& Fetch, bool bConnected, int32 Code, const TArray<uint8>* Content);
+    /** True while `Fetch`'s actor still exists and still wants `Fetch.Url`. */
+    static bool IsGlbFetchWanted(const FGlbFetch& Fetch);
+    /** Unbind and cancel every in-flight download, and forget the queue. */
+    void CancelGlbDownloads();
     /** The backend-relative GLB path a *web* peer loads, for a `model` we put on the wire. */
     FString MakeWebAssetUrl(const FString& AssetId) const;
 
@@ -1827,4 +1873,9 @@ private:
      */
     int32 TerminalCloseCode = 0;
     float SinceLastTransientSend = 1.0f;
+
+    /** GLB downloads waiting for a slot, in request order. */
+    TArray<FGlbFetch> GlbQueue;
+    /** GLB requests on the wire; held so Deinitialize can cancel them. */
+    TArray<TSharedRef<IHttpRequest, ESPMode::ThreadSafe>> GlbInFlight;
 };

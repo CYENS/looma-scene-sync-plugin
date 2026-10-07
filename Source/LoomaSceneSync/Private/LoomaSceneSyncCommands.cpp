@@ -96,6 +96,10 @@ FAutoConsoleCommandWithWorld GLoomaStatusCommand(
         if (ULoomaSceneSyncSubsystem* Subsystem = FindLoomaSubsystem(World))
         {
             Subsystem->LogConnectionStatus();
+            // The GLB queue shares the host's HTTP pool with every REST call above, so
+            // a slow probe reads differently when this says the pool is busy.
+            UE_LOG(LogLoomaSync, Display, TEXT("GLB downloads: %d in flight, %d waiting"),
+                Subsystem->GetGlbDownloadsInFlight(), Subsystem->GetGlbQueueDepth());
             return;
         }
         UE_LOG(LogLoomaSync, Display,

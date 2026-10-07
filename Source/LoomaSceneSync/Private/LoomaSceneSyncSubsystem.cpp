@@ -70,6 +70,25 @@ constexpr float HealthRetryMinDelay = 5.0f;
 constexpr float HealthRetryMaxDelay = 60.0f;
 
 /**
+ * GLB download queue (RequestGlb). Measured failure it answers: 25 downloads fired at
+ * once against the 16-connection pool, through a tunnel doing about 2 MB/s; the ones
+ * that queued inside the HTTP layer died on its timeout before they ever started.
+ *
+ * Four at a time keeps the tunnel saturated — it is bandwidth that bounds a scene
+ * load there, not request count — while leaving most of the pool to REST calls
+ * (/health, /auth/me, generation) on the same host. Because nothing then waits inside
+ * the HTTP layer, the timeout only has to cover one transfer: the largest catalog GLB
+ * is ~64 MB, about two minutes at a quarter of 2 MB/s, so five minutes is generous.
+ * The activity timeout is what catches a stalled connection without waiting that out.
+ */
+constexpr int32 MaxConcurrentGlbDownloads = 4;
+constexpr float GlbDownloadTimeout = 300.0f;
+constexpr float GlbActivityTimeout = 60.0f;
+/** Retries after the first attempt, at 2 s, 4 s, 8 s. */
+constexpr int32 MaxGlbRetries = 3;
+constexpr double GlbRetryBaseDelay = 2.0;
+
+/**
  * The one spelling of the bearer header. Three places set it — the two ApplyAuthHeader
  * overloads and Logout, which cannot use them because it has deliberately already
  * forgotten the token — so the *format* is pulled out here rather than typed three
@@ -347,6 +366,7 @@ void ULoomaSceneSyncSubsystem::Deinitialize()
     ULoomaSceneSyncSettings::OnSettingsChanged().Remove(SettingsChangedHandle);
     SettingsChangedHandle.Reset();
     CloseSocket();
+    CancelGlbDownloads();
     // Drop the in-memory copy only. The saved session on disk is deliberately left
     // alone: outliving the game instance is the entire point of it, and closing the
     // editor is not a logout — ClearSession is the one thing that deletes the file.
@@ -2929,10 +2949,11 @@ void ULoomaSceneSyncSubsystem::DropNode(const FString& NodeId)
     }
 }
 
-FLoomaNodeRenderContext ULoomaSceneSyncSubsystem::MakeRenderContext(const FLoomaNodeComponents& Components) const
+FLoomaNodeRenderContext ULoomaSceneSyncSubsystem::MakeRenderContext(const FLoomaNodeComponents& Components)
 {
     const ULoomaSceneSyncSettings& Settings = ULoomaSceneSyncSettings::Get();
     FLoomaNodeRenderContext Context;
+    Context.GlbLoader = this;
     Context.LightIntensityScale = Settings.LightIntensityScale;
     Context.bBaseAlignModels = Settings.bBaseAlignModels;
     if (Components.bHasModel && !Components.Model.AssetId.IsEmpty())
@@ -2955,6 +2976,146 @@ FString ULoomaSceneSyncSubsystem::MakeWebAssetUrl(const FString& AssetId) const
         return FString();
     }
     return FString::Printf(TEXT("%s/static/%s.glb"), *WebAssetPrefix, *AssetId);
+}
+
+// --- GLB download queue -------------------------------------------------------
+
+void ULoomaSceneSyncSubsystem::RequestGlb(ALoomaSyncedActor& Actor, const FString& Url)
+{
+    // One queued download per node: a newer `model` supersedes the one still waiting.
+    // One already on the wire is left to finish and is dropped as stale on arrival.
+    GlbQueue.RemoveAll([&Actor](const FGlbFetch& Queued) { return Queued.Actor.Get() == &Actor; });
+
+    FGlbFetch Fetch;
+    Fetch.Actor = &Actor;
+    Fetch.Url = Url;
+    GlbQueue.Add(MoveTemp(Fetch));
+    UE_LOG(LogLoomaSync, Log, TEXT("GLB queued for '%s': %s (%d waiting, %d/%d downloading)"),
+        *Actor.Id, *Url, GlbQueue.Num(), GlbInFlight.Num(), MaxConcurrentGlbDownloads);
+    PumpGlbQueue();
+}
+
+bool ULoomaSceneSyncSubsystem::IsGlbFetchWanted(const FGlbFetch& Fetch)
+{
+    const ALoomaSyncedActor* Actor = Fetch.Actor.Get();
+    return IsValid(Actor) && Actor->GetWantedModelUrl() == Fetch.Url;
+}
+
+void ULoomaSceneSyncSubsystem::PumpGlbQueue()
+{
+    if (GlbQueue.IsEmpty())
+    {
+        return;
+    }
+    const double Now = FPlatformTime::Seconds();
+    for (int32 Index = 0; Index < GlbQueue.Num() && GlbInFlight.Num() < MaxConcurrentGlbDownloads;)
+    {
+        if (!IsGlbFetchWanted(GlbQueue[Index]))
+        {
+            // The node is gone, or wants another GLB now: nobody would read this one.
+            GlbQueue.RemoveAt(Index);
+            continue;
+        }
+        if (GlbQueue[Index].NotBefore > Now)
+        {
+            ++Index; // still backing off; a later entry may be due
+            continue;
+        }
+        FGlbFetch Fetch = GlbQueue[Index];
+        GlbQueue.RemoveAt(Index);
+        StartGlbFetch(MoveTemp(Fetch));
+    }
+}
+
+void ULoomaSceneSyncSubsystem::StartGlbFetch(FGlbFetch Fetch)
+{
+    Fetch.Started = FPlatformTime::Seconds();
+    const TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Request = FHttpModule::Get().CreateRequest();
+    Request->SetURL(Fetch.Url);
+    Request->SetVerb(TEXT("GET"));
+    // No auth header, deliberately: `/static` is a plain StaticFiles mount
+    // (backend/app/main.py) with no app-wide dependencies and no auth middleware, so
+    // a bearer here would be a token sent somewhere it is not read. If `/static` is
+    // ever gated, this is the seam, and ApplyAuthHeader is the one spelling of it.
+    Request->SetTimeout(GlbDownloadTimeout);
+    Request->SetActivityTimeout(GlbActivityTimeout);
+    Request->OnProcessRequestComplete().BindWeakLambda(this,
+        [this, Fetch](FHttpRequestPtr Req, FHttpResponsePtr Resp, bool bConnected) {
+            GlbInFlight.RemoveAll([&Req](const TSharedRef<IHttpRequest, ESPMode::ThreadSafe>& InFlight) {
+                return &InFlight.Get() == Req.Get();
+            });
+            const bool bHasResponse = bConnected && Resp.IsValid();
+            FinishGlbFetch(Fetch, bHasResponse, bHasResponse ? Resp->GetResponseCode() : 0,
+                bHasResponse ? &Resp->GetContent() : nullptr);
+            PumpGlbQueue(); // a slot just freed
+        });
+    GlbInFlight.Add(Request);
+    UE_LOG(LogLoomaSync, Verbose, TEXT("GLB download started: %s (attempt %d, %d waiting, %d/%d downloading)"),
+        *Fetch.Url, Fetch.Retries + 1, GlbQueue.Num(), GlbInFlight.Num(), MaxConcurrentGlbDownloads);
+    Request->ProcessRequest();
+}
+
+void ULoomaSceneSyncSubsystem::FinishGlbFetch(const FGlbFetch& Fetch, bool bConnected, int32 Code,
+    const TArray<uint8>* Content)
+{
+    ALoomaSyncedActor* Actor = Fetch.Actor.Get();
+    if (!IsGlbFetchWanted(Fetch))
+    {
+        UE_LOG(LogLoomaSync, Verbose, TEXT("GLB %s finished for a node that no longer wants it — dropped"), *Fetch.Url);
+        return;
+    }
+    const double Seconds = FPlatformTime::Seconds() - Fetch.Started;
+
+    // A 2xx with a body. glTFLoadAssetFromUrl never looked at the status, so a 404's
+    // HTML went to the GLB parser; checking here also tells "not there" from "not now".
+    if (bConnected && EHttpResponseCodes::IsOk(Code) && Content && Content->Num() > 0)
+    {
+        UE_LOG(LogLoomaSync, Log, TEXT("GLB downloaded for '%s': %.1f MB in %.1f s (%d waiting, %d/%d downloading)"),
+            *Actor->Id, Content->Num() / (1024.0 * 1024.0), Seconds,
+            GlbQueue.Num(), GlbInFlight.Num(), MaxConcurrentGlbDownloads);
+        Actor->OnGlbDownloaded(Fetch.Url, Content);
+        // The mesh component may have just been created or swapped (a static slot
+        // replaced by a skeletal one), so a remote selection border has to be re-laid
+        // on whatever primitives the node now has.
+        MarkBordersDirty();
+        return;
+    }
+
+    const FString Why = bConnected
+        ? FString::Printf(TEXT("HTTP %d"), Code)
+        : FString::Printf(TEXT("no response after %.1f s"), Seconds);
+    // Retry what may succeed later: no answer at all (timeout, dropped tunnel), a
+    // server-side error, throttling. A 404 or 403 will say the same thing again.
+    const bool bRetryable = !bConnected || Code == 408 || Code == 429 || Code >= 500
+        || (EHttpResponseCodes::IsOk(Code) && (!Content || Content->Num() == 0));
+    if (bRetryable && Fetch.Retries < MaxGlbRetries)
+    {
+        FGlbFetch Retry = Fetch;
+        ++Retry.Retries;
+        const double Delay = GlbRetryBaseDelay * FMath::Pow(2.0, static_cast<double>(Retry.Retries - 1));
+        Retry.NotBefore = FPlatformTime::Seconds() + Delay;
+        GlbQueue.Add(MoveTemp(Retry));
+        UE_LOG(LogLoomaSync, Warning, TEXT("GLB for '%s' failed (%s): %s — retry %d/%d in %.0f s (%d waiting)"),
+            *Actor->Id, *Why, *Fetch.Url, Fetch.Retries + 1, MaxGlbRetries, Delay, GlbQueue.Num());
+        return;
+    }
+
+    UE_LOG(LogLoomaSync, Warning, TEXT("GLB for '%s' failed (%s): %s — giving up after %d attempt(s)"),
+        *Actor->Id, *Why, *Fetch.Url, Fetch.Retries + 1);
+    Actor->OnGlbDownloaded(Fetch.Url, nullptr);
+}
+
+void ULoomaSceneSyncSubsystem::CancelGlbDownloads()
+{
+    // Unbind first: CancelRequest may complete the request synchronously, and its
+    // handler would then queue a retry into a subsystem that is shutting down.
+    for (const TSharedRef<IHttpRequest, ESPMode::ThreadSafe>& Request : GlbInFlight)
+    {
+        Request->OnProcessRequestComplete().Unbind();
+        Request->CancelRequest();
+    }
+    GlbInFlight.Empty();
+    GlbQueue.Empty();
 }
 
 void ULoomaSceneSyncSubsystem::HandleDespawn(const TSharedPtr<FJsonObject>& Msg)
@@ -3155,6 +3316,9 @@ void ULoomaSceneSyncSubsystem::Tick(float DeltaTime)
     // ReconnectCooldown is permanently armed — counting the probe down after that
     // `return` would mean never counting it down at all.
     TickHealthRetry(DeltaTime);
+    // Same reasoning: a GLB backing off before a retry is due whether or not the
+    // socket is up — the scene it belongs to is already on screen.
+    PumpGlbQueue();
 
     // Also ahead of the reconnect early-out, and for the same kind of reason: half of
     // this is about the local selection rather than the socket, and a reconnect backoff
