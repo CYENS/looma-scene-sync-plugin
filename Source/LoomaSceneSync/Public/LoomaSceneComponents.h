@@ -168,6 +168,41 @@ struct FLoomaLightSpec
     bool operator!=(const FLoomaLightSpec& Other) const { return !(*this == Other); }
 };
 
+/**
+ * `animation`: which clip embedded in the sibling `model`'s GLB the node plays.
+ *
+ * Wire shape `{"type": "animation", "clip": "Walk" | null, "playing": true | false}`.
+ * Clip names are the glTF animation names a rigged GLB carries (`Idle`, `Walk`,
+ * `Wave`, `Dance` — looma-xr-asset-demo/docs/rig-format.md), matched exactly. It
+ * only means something beside a `model` whose GLB is skinned; on anything else it is
+ * carried and ignored, the same way a `material` beside a `model` is.
+ */
+USTRUCT(BlueprintType)
+struct FLoomaAnimationSpec
+{
+    GENERATED_BODY()
+
+    /** Clip name; empty for a wire `null`, which means "no clip — stand at rest". */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    FString Clip;
+
+    /**
+     * False stops the clip and stands the character at rest. Absent reads as true:
+     * naming a clip is asking for it to play.
+     */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    bool bPlaying = true;
+
+    /** The clip that should be on screen right now; empty means the rest pose. */
+    FString ActiveClip() const { return bPlaying ? Clip : FString(); }
+
+    bool operator==(const FLoomaAnimationSpec& Other) const
+    {
+        return Clip == Other.Clip && bPlaying == Other.bPlaying;
+    }
+    bool operator!=(const FLoomaAnimationSpec& Other) const { return !(*this == Other); }
+};
+
 /** Every component on one node, keyed by type. */
 USTRUCT(BlueprintType)
 struct FLoomaNodeComponents
@@ -198,6 +233,12 @@ struct FLoomaNodeComponents
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
     FLoomaLightSpec Light;
 
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    bool bHasAnimation = false;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    FLoomaAnimationSpec Animation;
+
     /** Types this build does not understand. Logged once each; never rendered, never dropped. */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
     TArray<FString> UnknownTypes;
@@ -210,7 +251,8 @@ struct FLoomaNodeComponents
         return bHasModel == Other.bHasModel && (!bHasModel || Model == Other.Model)
             && bHasMesh == Other.bHasMesh && (!bHasMesh || Mesh == Other.Mesh)
             && bHasMaterial == Other.bHasMaterial && (!bHasMaterial || Material == Other.Material)
-            && bHasLight == Other.bHasLight && (!bHasLight || Light == Other.Light);
+            && bHasLight == Other.bHasLight && (!bHasLight || Light == Other.Light)
+            && bHasAnimation == Other.bHasAnimation && (!bHasAnimation || Animation == Other.Animation);
     }
     bool operator!=(const FLoomaNodeComponents& Other) const { return !(*this == Other); }
 };

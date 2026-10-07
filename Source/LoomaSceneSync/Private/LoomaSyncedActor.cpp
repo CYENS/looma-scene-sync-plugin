@@ -1,14 +1,18 @@
 #include "LoomaSyncedActor.h"
 
+#include "Animation/AnimSequence.h"
 #include "Components/DirectionalLightComponent.h"
 #include "Components/LocalLightComponent.h"
 #include "Components/PointLightComponent.h"
 #include "Components/SceneComponent.h"
+#include "Components/SkeletalMeshComponent.h"
 #include "Components/SpotLightComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "Engine/Scene.h"
+#include "Engine/SkeletalMesh.h"
 #include "Engine/StaticMesh.h"
 #include "LoomaSceneSyncLog.h"
+#include "LoomaSceneSyncSubsystem.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Materials/MaterialInterface.h"
 #include "glTFRuntimeAsset.h"
@@ -135,6 +139,10 @@ void ALoomaSyncedActor::ApplyComponents(const FLoomaNodeComponents& Next, const 
     ApplyMesh(Next);
     ApplyMaterial(Next);
     ApplyLight(Next, Context);
+    // After ApplyModel. If the character is not built yet this is a no-op, and
+    // BuildCharacter applies the clip itself once it is — so a clip chosen before the
+    // GLB arrives still plays when it does.
+    ApplyAnimation(Next);
 
     AssetId = Next.bHasModel ? Next.Model.AssetId : FString();
     if (Next.bHasModel && !Next.Model.JobId.IsEmpty())
@@ -169,16 +177,25 @@ void ALoomaSyncedActor::ApplyModel(const FLoomaNodeComponents& Next, const FLoom
         // http://<host>/static/.glb for the ones with no asset, logging an error each
         // time — which is exactly what an empty object used to look like.
         DestroySlot(ModelComponent);
+        DestroySlot(CharacterComponent);
+        ResetCharacter();
         LoadedModelUrl.Reset();
         return;
     }
 
-    if (!EnsureMeshComponent(ModelComponent))
+    GlbLoader = Context.GlbLoader;
+
+    // Whether a GLB is skinned is only known once it has loaded, so until then the
+    // node gets the static slot it always got — unless it is already showing a
+    // character, which stays up until its replacement is built.
+    if (!CharacterComponent && !EnsureMeshComponent(ModelComponent))
     {
         return;
     }
     if (Context.ModelUrl != LoadedModelUrl)
     {
+        // Set before the download completes, so a re-apply while it is in flight does
+        // not queue it twice. OnGlbDownloaded clears it again if the fetch gives up.
         LoadedModelUrl = Context.ModelUrl;
         LoadMeshFromUrl(Context.ModelUrl);
     }
@@ -234,7 +251,7 @@ void ALoomaSyncedActor::ApplyMesh(const FLoomaNodeComponents& Next)
     Component->SetRelativeScale3D(Scale);
     // **Pivot is the node origin, not the base** — the same rule the web states
     // outright: a box created at y = 0 sits half in the floor, because a procedural
-    // box's pivot *is* its centre. GLBs differ (see OnGlbLoaded) only because their
+    // box's pivot *is* its centre. GLBs differ (see BuildStaticModel) only because their
     // own pivots are arbitrary. Engine primitives are already centred, so this line
     // only corrects an asset that isn't.
     Component->SetRelativeLocation(-Box.GetCenter() * Scale);
@@ -389,38 +406,109 @@ UStaticMeshComponent* ALoomaSyncedActor::EnsureMeshComponent(TObjectPtr<UStaticM
 
 // --- The `model` component's GLB ----------------------------------------------
 
-void ALoomaSyncedActor::LoadMeshFromUrl(const FString& Url)
+USkeletalMeshComponent* ALoomaSyncedActor::EnsureCharacterComponent()
 {
-    if (!EnsureMeshComponent(ModelComponent))
+    if (USkeletalMeshComponent* Existing = CharacterComponent.Get())
     {
-        return;
+        return Existing;
     }
-    // Default LoaderConfig: glTFRuntime's default SceneBasis/SceneScale is the same
-    // Y-up-meters -> Z-up-centimeters conversion the sync layer uses for transforms,
-    // so geometry and poses stay consistent. Do not override it.
-    FglTFRuntimeConfig LoaderConfig;
-    FglTFRuntimeHttpResponse Completed;
-    Completed.BindDynamic(this, &ALoomaSyncedActor::OnGlbLoaded);
-    // The empty header map is deliberate, and this is the obvious place to be tempted
-    // to fill it with the session bearer. Do not: `/static` is a plain StaticFiles
-    // mount (backend/app/main.py) and the FastAPI app carries no app-wide
-    // `dependencies=` and no auth middleware — only individual routes have
-    // `require_admin` — so the GLB fetch is anonymous by design and a bearer here would
-    // be a token sent somewhere it is not read. glTFRuntime does take headers (this
-    // parameter), so if `/static` is ever gated the seam is right here; it would want
-    // ULoomaSceneSyncSubsystem::ApplyAuthHeader's map overload rather than a second
-    // spelling of the header.
-    UglTFRuntimeFunctionLibrary::glTFLoadAssetFromUrl(Url, TMap<FString, FString>(), Completed, LoaderConfig);
+    USkeletalMeshComponent* Component = NewObject<USkeletalMeshComponent>(this);
+    if (!Component)
+    {
+        return nullptr;
+    }
+    Component->SetMobility(EComponentMobility::Movable);
+    Component->SetupAttachment(SceneRoot);
+    Component->RegisterComponent();
+    AddInstanceComponent(Component); // so it shows in the Details panel while running
+    CharacterComponent = Component;
+    return Component;
 }
 
-void ALoomaSyncedActor::OnGlbLoaded(UglTFRuntimeAsset* Asset)
+void ALoomaSyncedActor::LoadMeshFromUrl(const FString& Url)
 {
-    UStaticMeshComponent* Component = ModelComponent.Get();
-    if (!IsValid(this) || !Component || !Asset)
+    // Through the subsystem's queue, never straight to glTFLoadAssetFromUrl. That call
+    // sets no timeout and has no concurrency limit, so a scene of a few dozen models
+    // fired every download at once into UE's 16-connection pool; behind a ~2 MB/s
+    // tunnel the queued ones then died on the HTTP layer's own timeout, and since a
+    // failure was only logged, those nodes stayed empty for the rest of the session.
+    //
+    // The empty header map that used to be passed here was deliberate, and still is:
+    // `/static` is a plain StaticFiles mount (backend/app/main.py) with no auth, so the
+    // GLB fetch is anonymous by design — see RequestGlb, the seam if that ever changes.
+    if (ULoomaSceneSyncSubsystem* Loader = GlbLoader.Get())
     {
-        UE_LOG(LogLoomaSync, Warning, TEXT("Failed to load GLB for asset '%s'"), *AssetId);
+        Loader->RequestGlb(*this, Url);
         return;
     }
+    UE_LOG(LogLoomaSync, Warning, TEXT("Node '%s': no GLB loader to fetch %s — model left unbuilt"), *Id, *Url);
+    LoadedModelUrl.Reset();
+}
+
+void ALoomaSyncedActor::OnGlbDownloaded(const FString& Url, const TArray<uint8>* Bytes)
+{
+    if (!IsValid(this))
+    {
+        return;
+    }
+    // Stale: the node's `model` changed (or went away) while this was in flight. The
+    // newer request is already queued; building this one would flash the old asset
+    // up and leave it there if the newer one then failed.
+    if (Url != LoadedModelUrl)
+    {
+        UE_LOG(LogLoomaSync, Verbose, TEXT("Node '%s': dropping stale GLB %s (now wants %s)"),
+            *Id, *Url, LoadedModelUrl.IsEmpty() ? TEXT("no model") : *LoadedModelUrl);
+        return;
+    }
+
+    UglTFRuntimeAsset* Asset = nullptr;
+    if (Bytes)
+    {
+        // Default LoaderConfig: glTFRuntime's default SceneBasis/SceneScale is the same
+        // Y-up-meters -> Z-up-centimeters conversion the sync layer uses for transforms,
+        // so geometry and poses stay consistent. Do not override it.
+        Asset = UglTFRuntimeFunctionLibrary::glTFLoadAssetFromData(*Bytes, FglTFRuntimeConfig());
+    }
+    if (!Asset || !BuildModel(Asset))
+    {
+        // Forget the url, so the next apply of this node — a patch, or the `scene` a
+        // reconnect re-sends — asks for it again instead of trusting a mesh that was
+        // never built. The queue has already spent its retries on this attempt.
+        UE_LOG(LogLoomaSync, Warning, TEXT("Failed to load GLB for asset '%s' (%s)%s"), *AssetId, *Url,
+            Bytes ? TEXT(" — downloaded but did not parse/build") : TEXT(" — download gave up"));
+        LoadedModelUrl.Reset();
+    }
+}
+
+bool ALoomaSyncedActor::BuildModel(UglTFRuntimeAsset* Asset)
+{
+    // "Has a skin" is read off the nodes, not the `skins` array: what matters is a
+    // mesh node bound to one. rig-format.md's canonical template carries a skin with
+    // no mesh at all, and that has nothing to render as a character.
+    bool bSkinned = false;
+    for (const FglTFRuntimeNode& Node : Asset->GetNodes())
+    {
+        if (Node.MeshIndex > INDEX_NONE && Node.SkinIndex > INDEX_NONE)
+        {
+            bSkinned = true;
+            break;
+        }
+    }
+    if (bSkinned)
+    {
+        if (BuildCharacter(Asset))
+        {
+            return true;
+        }
+        // A broken skin still has geometry. Showing it frozen beats showing nothing.
+        UE_LOG(LogLoomaSync, Warning, TEXT("GLB for '%s' is skinned but built no skeletal mesh — falling back to static"),
+            *AssetId);
+    }
+    return BuildStaticModel(Asset);
+}
+
+bool ALoomaSyncedActor::BuildStaticModel(UglTFRuntimeAsset* Asset)
+{
     // A `model` is an opaque whole sub-scene — a GLB is a node hierarchy with its own
     // meshes and materials, and every client treats it as one unit. Merging the whole
     // node tree into a single static mesh is exactly that.
@@ -429,8 +517,17 @@ void ALoomaSyncedActor::OnGlbLoaded(UglTFRuntimeAsset* Asset)
     if (!Mesh)
     {
         UE_LOG(LogLoomaSync, Warning, TEXT("GLB for '%s' produced no static mesh"), *AssetId);
-        return;
+        return false;
     }
+    UStaticMeshComponent* Component = EnsureMeshComponent(ModelComponent);
+    if (!Component)
+    {
+        return false;
+    }
+    // This node was a character until now: its replacement is static, so the old
+    // skeleton, its clips and its component all go.
+    DestroySlot(CharacterComponent);
+    ResetCharacter();
     Component->SetStaticMesh(Mesh);
 
     // GLBs are placed by their base, not their middle: the catalog normalises them to
@@ -446,6 +543,180 @@ void ALoomaSyncedActor::OnGlbLoaded(UglTFRuntimeAsset* Asset)
     // size so a scale/basis regression is visible in the log.
     UE_LOG(LogLoomaSync, Log, TEXT("Mesh for '%s' built, bbox size %s (cm), center %s"),
         *AssetId, *Box.GetSize().ToString(), *Box.GetCenter().ToString());
+    return true;
+}
+
+bool ALoomaSyncedActor::BuildCharacter(UglTFRuntimeAsset* Asset)
+{
+    // Default config on purpose. Its SkeletonConfig has no Skeleton set, so
+    // glTFRuntime builds the skeleton from the file's one skin — reference pose from
+    // the inverse bind matrices, which rig-format.md ("glTF layout" rule 4) requires
+    // to be exactly the rest pose, so the character stands in the same A-pose here as
+    // on the web. Bone names arrive unchanged (`mixamorig:Hips`), the runtime spelling
+    // the contract's "Bone names per runtime" table names for LoomaSceneSync.
+    // OverrideSkinIndex -1 lets it find that skin from the mesh node; NodeName "" walks
+    // the whole scene, which per the contract is Hips plus the skinned mesh nodes.
+    FglTFRuntimeSkeletalMeshConfig MeshConfig;
+    USkeletalMesh* Mesh = Asset->LoadSkeletalMeshRecursive(TEXT(""), TArray<FString>(), MeshConfig);
+    if (!Mesh)
+    {
+        return false;
+    }
+    USkeletalMeshComponent* Component = EnsureCharacterComponent();
+    if (!Component)
+    {
+        return false;
+    }
+    // Static and skinned never sit side by side: one `model`, one mesh.
+    DestroySlot(ModelComponent);
+    ResetCharacter();
+    CharacterAsset = Asset;
+    // A component reused across GLBs (one rig swapped for another) is still playing a
+    // clip bound to the old skeleton. Clear it before the mesh changes under it; the
+    // clip the node wants is re-applied below, loaded from the new file.
+    if (Component->GetSingleNodeInstance())
+    {
+        Component->Stop();
+        Component->SetAnimation(nullptr);
+    }
+    Component->SetSkeletalMesh(Mesh, /*bReinitPose=*/true);
+
+    // **Facing.** No yaw is added here, and none is needed. The rig faces glTF +Z
+    // (rig-format.md, "glTF layout" rule 7). glTFRuntime's default SceneBasis maps
+    // glTF (x, y, z) to UE (-z, x, y) — for the vertices, for every bone's reference
+    // transform (conjugated by the basis in TraverseJoints) and for every animation
+    // key — so the character comes out facing UE -X, its left (+X) on UE +Y, up on
+    // UE +Z. The wire is the same right-handed Y-up frame as glTF, and
+    // LoomaWireToUe applies the identical map, so the web's world +Z *is* UE -X: a
+    // node with identity rotation faces the same way in both clients, and the node's
+    // yaw turns both alike. UE's own "actors face +X" convention plays no part —
+    // turning the mesh 180° to honour it would make the character face away from
+    // where the browser shows it.
+    //
+    // **Base.** Same rule as a static GLB. A conforming rig already has its lowest
+    // vertex at y = 0 with the origin under the hips (rule 7), so the lift comes out
+    // at ~0 and the node origin is the floor the web stands the rig on
+    // (frontend/src/scene/rig/rigPlacement.js). Logged, so a rig that is not on its
+    // floor is visible as a non-zero lift.
+    const FBox Box = Mesh->GetImportedBounds().GetBox();
+    const double Lift = bBaseAlignModel ? -Box.Min.Z : 0.0;
+    Component->SetRelativeLocation(FVector(0.0, 0.0, Lift));
+
+    const TArray<FString> Clips = Asset->GetAnimationsNames(/*bIncludeUnnameds=*/false);
+    UE_LOG(LogLoomaSync, Log,
+        TEXT("Character for '%s' built: skeletal mesh, %d bones, bbox size %s (cm), lift %.1f cm, clips [%s]"),
+        *AssetId, Mesh->GetRefSkeleton().GetNum(), *Box.GetSize().ToString(), Lift,
+        *FString::Join(Clips, TEXT(", ")));
+
+    // The `animation` component may well have arrived first — it rides on the same
+    // node, and the GLB takes seconds to download. Components holds the latest.
+    ApplyAnimation(Components);
+    return true;
+}
+
+void ALoomaSyncedActor::ResetCharacter()
+{
+    CharacterAsset = nullptr;
+    ClipCache.Empty();
+    MissingClips.Empty();
+    PlayingClip.Reset();
+}
+
+// --- The `animation` component ------------------------------------------------
+
+void ALoomaSyncedActor::ApplyAnimation(const FLoomaNodeComponents& Next)
+{
+    USkeletalMeshComponent* Component = CharacterComponent.Get();
+    if (!Component || !Component->GetSkeletalMeshAsset() || !CharacterAsset)
+    {
+        // Not a character, or not one yet. BuildCharacter calls back in once it is.
+        return;
+    }
+
+    const FString Wanted = Next.bHasAnimation ? Next.Animation.ActiveClip() : FString();
+    if (Wanted == PlayingClip)
+    {
+        return; // idempotent: every patch re-sends the whole component array
+    }
+    const FString Previous = PlayingClip;
+    PlayingClip = Wanted;
+
+    UAnimSequence* Clip = Wanted.IsEmpty() ? nullptr : FindOrLoadClip(Wanted);
+    if (!Clip)
+    {
+        // `clip: null`, `playing: false`, or a clip the GLB does not have: the rest
+        // pose, which is the bind pose (rig-format.md rule 4). SetAnimation(nullptr)
+        // leaves the single-node instance with no asset, which evaluates to the
+        // reference pose; with no instance at all the mesh is already at rest.
+        if (Component->GetSingleNodeInstance())
+        {
+            Component->Stop();
+            Component->SetAnimation(nullptr);
+        }
+        if (!Previous.IsEmpty())
+        {
+            UE_LOG(LogLoomaSync, Log, TEXT("Character '%s' (%s): stopped '%s', at rest"), *Id, *AssetId, *Previous);
+        }
+        return;
+    }
+
+    // Single-node mode, looping: the clips are cycles (Idle, Walk, Wave, Dance), and a
+    // node plays one until it is told otherwise.
+    Component->PlayAnimation(Clip, /*bLooping=*/true);
+    UE_LOG(LogLoomaSync, Log, TEXT("Character '%s' (%s): playing '%s' (%.2f s, looping)%s"),
+        *Id, *AssetId, *Wanted, Clip->GetPlayLength(),
+        Previous.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(", was '%s'"), *Previous));
+}
+
+UAnimSequence* ALoomaSyncedActor::FindOrLoadClip(const FString& Clip)
+{
+    if (const TObjectPtr<UAnimSequence>* Cached = ClipCache.Find(Clip))
+    {
+        return Cached->Get();
+    }
+    if (MissingClips.Contains(Clip))
+    {
+        return nullptr;
+    }
+    USkeletalMeshComponent* Component = CharacterComponent.Get();
+    USkeletalMesh* Mesh = Component ? Component->GetSkeletalMeshAsset() : nullptr;
+    if (!CharacterAsset || !Mesh)
+    {
+        return nullptr;
+    }
+
+    if (CharacterAsset->GetNumAnimations() == 0)
+    {
+        // A rig baked before clips were embedded. Said once per character — the set is
+        // emptied whenever a new GLB is built — and the node stands at rest.
+        if (MissingClips.IsEmpty())
+        {
+            UE_LOG(LogLoomaSync, Log,
+                TEXT("Character '%s' (%s) has no embedded animations — '%s' cannot play, staying at rest"),
+                *Id, *AssetId, *Clip);
+        }
+        MissingClips.Add(Clip);
+        return nullptr;
+    }
+
+    // Bound to this mesh's own skeleton, the one glTFRuntime built from the same file,
+    // so the tracks (keyed by node name) find their bones without any retargeting.
+    // Matched case-sensitively: the contract names the clips exactly. Default config —
+    // no root motion — so the Hips translation plays on the bone, as three.js's mixer
+    // plays it on the web.
+    FglTFRuntimeSkeletalAnimationConfig AnimConfig;
+    UAnimSequence* Sequence = CharacterAsset->LoadSkeletalAnimationByName(Mesh, Clip, AnimConfig, /*bCaseSensitive=*/true);
+    if (!Sequence)
+    {
+        UE_LOG(LogLoomaSync, Warning, TEXT("Character '%s' (%s) has no clip '%s' (it has [%s]) — staying at rest"),
+            *Id, *AssetId, *Clip,
+            *FString::Join(CharacterAsset->GetAnimationsNames(/*bIncludeUnnameds=*/false), TEXT(", ")));
+        MissingClips.Add(Clip);
+        return nullptr;
+    }
+    ClipCache.Add(Clip, Sequence);
+    UE_LOG(LogLoomaSync, Verbose, TEXT("Character '%s': loaded clip '%s'"), *Id, *Clip);
+    return Sequence;
 }
 
 // --- Pose ---------------------------------------------------------------------

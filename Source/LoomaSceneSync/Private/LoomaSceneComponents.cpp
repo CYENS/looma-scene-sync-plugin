@@ -94,6 +94,15 @@ void ParseLight(const TSharedPtr<FJsonObject>& C, FLoomaNodeComponents& Out)
     ReadFloat(C, TEXT("penumbra"), Out.Light.Penumbra);
     C->TryGetBoolField(TEXT("castShadow"), Out.Light.bCastShadow);
 }
+
+void ParseAnimation(const TSharedPtr<FJsonObject>& C, FLoomaNodeComponents& Out)
+{
+    Out.bHasAnimation = true;
+    // `clip: null` fails TryGetStringField and leaves Clip empty, which is exactly
+    // what null means here: no clip, stand at rest.
+    C->TryGetStringField(TEXT("clip"), Out.Animation.Clip);
+    C->TryGetBoolField(TEXT("playing"), Out.Animation.bPlaying);
+}
 } // namespace
 
 FLoomaNodeComponents LoomaParseComponents(const TArray<TSharedPtr<FJsonValue>>* Components)
@@ -117,6 +126,7 @@ FLoomaNodeComponents LoomaParseComponents(const TArray<TSharedPtr<FJsonValue>>* 
         else if (Type == TEXT("mesh"))     { ParseMesh(C, Out); }
         else if (Type == TEXT("material")) { ParseMaterial(C, Out); }
         else if (Type == TEXT("light"))    { ParseLight(C, Out); }
+        else if (Type == TEXT("animation")) { ParseAnimation(C, Out); }
         else
         {
             // Skipped, but the node lives on. This is what makes a new component

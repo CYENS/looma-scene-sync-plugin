@@ -5,9 +5,12 @@
 #include "LoomaSceneComponents.h"
 #include "LoomaSyncedActor.generated.h"
 
+class UAnimSequence;
 class UglTFRuntimeAsset;
 class ULightComponent;
+class ULoomaSceneSyncSubsystem;
 class UMaterialInstanceDynamic;
+class USkeletalMeshComponent;
 class UStaticMeshComponent;
 
 /**
@@ -18,6 +21,13 @@ struct FLoomaNodeRenderContext
 {
     /** Absolute GLB url for the `model` component, rebuilt from its assetId. */
     FString ModelUrl;
+
+    /**
+     * Who downloads that GLB: the subsystem's throttled queue (RequestGlb). Left
+     * null, a `model` is logged and left unbuilt rather than fetched unthrottled —
+     * bypassing the queue is exactly what starved the HTTP pool.
+     */
+    ULoomaSceneSyncSubsystem* GlbLoader = nullptr;
 
     /** Multiplier on a light's wire intensity — see ApplyLight for the unit reasoning. */
     float LightIntensityScale = 1.0f;
@@ -40,6 +50,8 @@ struct FLoomaNodeRenderContext
  *
  *   SceneRoot (USceneComponent)     the node's transform — always present
  *     ├─ ModelComponent             `model`    — a datalake GLB via glTFRuntime
+ *     ├─ CharacterComponent         `model`    — the same, when the GLB is skinned;
+ *     │                                          `animation` picks its clip
  *     ├─ MeshComponent              `mesh`     — an engine primitive, `material` on it
  *     └─ LightComponent             `light`    — point / spot / directional
  *
@@ -87,9 +99,20 @@ public:
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
     TObjectPtr<USceneComponent> SceneRoot;
 
-    /** The `model` component's mesh — built from the GLB. Null unless the node has one. */
+    /**
+     * The `model` component's mesh — built from the GLB. Null unless the node has a
+     * `model` whose GLB is static; a skinned one renders on CharacterComponent instead.
+     */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
     TObjectPtr<UStaticMeshComponent> ModelComponent;
+
+    /**
+     * The `model` component's mesh when its GLB carries a skin (a rigged character,
+     * looma-xr-asset-demo/docs/rig-format.md). Never present beside ModelComponent:
+     * which of the two exists is decided by the GLB, once it has loaded.
+     */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    TObjectPtr<USkeletalMeshComponent> CharacterComponent;
 
     /** The `mesh` component's primitive. Null unless the node has one. */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
@@ -113,8 +136,21 @@ public:
      */
     void ApplyComponents(const FLoomaNodeComponents& Next, const FLoomaNodeRenderContext& Context);
 
-    /** Kick off the async GLB download + mesh build for the `model` component. */
+    /**
+     * Ask for the `model` component's GLB. The download goes through the subsystem's
+     * queue (ULoomaSceneSyncSubsystem::RequestGlb), which calls OnGlbDownloaded.
+     */
     void LoadMeshFromUrl(const FString& Url);
+
+    /**
+     * The queue's answer for `Url`: the GLB's bytes, or null once every retry has
+     * failed. An answer for any url but the one this node currently wants is stale
+     * and is dropped — the node changed its `model` while the download was in flight.
+     */
+    void OnGlbDownloaded(const FString& Url, const TArray<uint8>* Bytes);
+
+    /** The GLB url this node wants (built or in flight); empty if none. */
+    const FString& GetWantedModelUrl() const { return LoadedModelUrl; }
 
     /** Parent-local pose — what the wire carries. Equals the world pose for a root. */
     FTransform GetLocalTransform() const;
@@ -133,17 +169,50 @@ private:
     void ApplyMesh(const FLoomaNodeComponents& Next);
     void ApplyMaterial(const FLoomaNodeComponents& Next);
     void ApplyLight(const FLoomaNodeComponents& Next, const FLoomaNodeRenderContext& Context);
+    /** Play, switch or stop the character's clip to match `Next`'s `animation`. */
+    void ApplyAnimation(const FLoomaNodeComponents& Next);
 
     /** Create a mesh component in `Slot` on first use, attached to SceneRoot. */
     UStaticMeshComponent* EnsureMeshComponent(TObjectPtr<UStaticMeshComponent>& Slot);
+    USkeletalMeshComponent* EnsureCharacterComponent();
 
-    UFUNCTION()
-    void OnGlbLoaded(UglTFRuntimeAsset* Asset);
+    /** Build whichever mesh the parsed GLB calls for; false if neither could be built. */
+    bool BuildModel(UglTFRuntimeAsset* Asset);
+    bool BuildStaticModel(UglTFRuntimeAsset* Asset);
+    bool BuildCharacter(UglTFRuntimeAsset* Asset);
+    /** Forget everything tied to the current character: asset, clips, playback state. */
+    void ResetCharacter();
+    /** A cached clip, loading it from the character's GLB on first use; null if absent. */
+    UAnimSequence* FindOrLoadClip(const FString& Clip);
 
     FLoomaNodeComponents Components;
 
-    /** The url ModelComponent's mesh was built from, so an unchanged model isn't refetched. */
+    /**
+     * The url this node's model was built from **or is being fetched from**, so an
+     * unchanged model isn't refetched. Cleared when the fetch finally fails, so the
+     * next time the node is applied (a patch, a reconnect's `scene`) asks again.
+     */
     FString LoadedModelUrl;
+
+    /** The download queue, captured from the last ApplyComponents. */
+    TWeakObjectPtr<ULoomaSceneSyncSubsystem> GlbLoader;
+
+    /**
+     * The skinned GLB the character was built from, kept because its clips are loaded
+     * from it lazily — a clip is only parsed once a node actually asks for it.
+     */
+    UPROPERTY(Transient)
+    TObjectPtr<UglTFRuntimeAsset> CharacterAsset;
+
+    /** Clip name -> sequence bound to CharacterComponent's skeleton. Per character. */
+    UPROPERTY(Transient)
+    TMap<FString, TObjectPtr<UAnimSequence>> ClipCache;
+
+    /** Clips asked for and not in the GLB, so each is reported once, not per patch. */
+    TSet<FString> MissingClips;
+
+    /** The clip on screen; empty means the rest pose. */
+    FString PlayingClip;
 
     /** Captured from the last ApplyComponents, for the async GLB completion. */
     bool bBaseAlignModel = true;
