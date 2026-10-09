@@ -594,6 +594,23 @@ void ULoomaSceneSyncSubsystem::PublishPose(const FString& NodeId, const FVector&
     Socket->Send(Text);
 }
 
+void ULoomaSceneSyncSubsystem::PublishLiveSubjects(const TArray<FName>& Subjects)
+{
+    if (!IsSyncConnected())
+    {
+        return;
+    }
+    TArray<TSharedPtr<FJsonValue>> Names;
+    for (const FName& Subject : Subjects)
+    {
+        Names.Add(MakeShared<FJsonValueString>(Subject.ToString()));
+    }
+    TSharedRef<FJsonObject> Msg = MakeShared<FJsonObject>();
+    Msg->SetStringField(TEXT("type"), TEXT("liveSubjects"));
+    Msg->SetArrayField(TEXT("subjects"), Names);
+    SendJson(Msg);
+}
+
 bool ULoomaSceneSyncSubsystem::IsSyncConnected() const
 {
     return Socket.IsValid() && Socket->IsConnected();

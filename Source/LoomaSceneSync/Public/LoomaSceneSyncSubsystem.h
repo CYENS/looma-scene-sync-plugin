@@ -680,6 +680,14 @@ public:
      */
     void PublishPose(const FString& NodeId, const FVector& Hips, const TArray<FQuat>& Rotations);
 
+    /**
+     * Tell the other clients on this scene which Live Link subjects this client
+     * can see (HAM-316): the wire's `liveSubjects`. It is what their pickers
+     * offer. The hub keeps nothing, so call it every couple of seconds for as
+     * long as the subjects are there.
+     */
+    void PublishLiveSubjects(const TArray<FName>& Subjects);
+
     /** Remove one node from the local selection. No-op if it was not in it. */
     UFUNCTION(BlueprintCallable, Category = "Looma|Selection")
     void DeselectNode(ALoomaSyncedActor* Actor);

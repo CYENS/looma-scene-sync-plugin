@@ -624,6 +624,12 @@ void ALoomaSyncedActor::ResetCharacter()
 
 // --- The `animation` component ------------------------------------------------
 
+void ALoomaSyncedActor::ReplayAnimation()
+{
+    PlayingClip.Reset();
+    ApplyAnimation(Components);
+}
+
 void ALoomaSyncedActor::ApplyAnimation(const FLoomaNodeComponents& Next)
 {
     USkeletalMeshComponent* Component = CharacterComponent.Get();
