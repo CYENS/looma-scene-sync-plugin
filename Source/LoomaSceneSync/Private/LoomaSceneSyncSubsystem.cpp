@@ -573,26 +573,25 @@ void ULoomaSceneSyncSubsystem::PublishPose(const FString& NodeId, const FVector&
     {
         return;
     }
-    auto Numbers = [](std::initializer_list<double> Values) {
-        TArray<TSharedPtr<FJsonValue>> Out;
-        for (const double Value : Values)
-        {
-            Out.Add(MakeShared<FJsonValueNumber>(Value));
-        }
-        return Out;
-    };
-    TArray<TSharedPtr<FJsonValue>> Rot;
-    Rot.Reserve(Rotations.Num());
-    for (const FQuat& Q : Rotations)
+    // Written by hand, four decimals a number, rather than through FJsonObject:
+    // the JSON writer prints a double in full, which made a frame 1.8 kB where
+    // this makes it about 650 bytes, and a frame is sent many times a second.
+    // The first end-to-end run (29 characters at 30 Hz) lost its sockets to
+    // keepalive timeouts on exactly that.
+    FString Text;
+    Text.Reserve(768);
+    Text += TEXT("{\"type\":\"pose\",\"origin\":\"");
+    Text += ClientId.ReplaceCharWithEscapedChar();
+    Text += TEXT("\",\"node\":\"");
+    Text += NodeId.ReplaceCharWithEscapedChar();
+    Text += FString::Printf(TEXT("\",\"hips\":[%.4f,%.4f,%.4f],\"rot\":["), Hips.X, Hips.Y, Hips.Z);
+    for (int32 Index = 0; Index < Rotations.Num(); ++Index)
     {
-        Rot.Add(MakeShared<FJsonValueArray>(Numbers({Q.X, Q.Y, Q.Z, Q.W})));
+        const FQuat& Q = Rotations[Index];
+        Text += FString::Printf(TEXT("%s[%.4f,%.4f,%.4f,%.4f]"), Index > 0 ? TEXT(",") : TEXT(""), Q.X, Q.Y, Q.Z, Q.W);
     }
-    TSharedRef<FJsonObject> Msg = MakeShared<FJsonObject>();
-    Msg->SetStringField(TEXT("type"), TEXT("pose"));
-    Msg->SetStringField(TEXT("node"), NodeId);
-    Msg->SetArrayField(TEXT("hips"), Numbers({Hips.X, Hips.Y, Hips.Z}));
-    Msg->SetArrayField(TEXT("rot"), Rot);
-    SendJson(Msg);
+    Text += TEXT("]}");
+    Socket->Send(Text);
 }
 
 bool ULoomaSceneSyncSubsystem::IsSyncConnected() const
