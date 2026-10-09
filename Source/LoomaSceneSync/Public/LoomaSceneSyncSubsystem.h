@@ -663,6 +663,23 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Looma|Selection")
     void SelectNode(ALoomaSyncedActor* Actor);
 
+    /**
+     * Send one live pose frame for a rigged character (HAM-316): the wire's `pose`
+     * message, docs/rig-format.md "Live pose" in looma-xr-asset-demo.
+     *
+     * `Rotations` is the 22 body bones' local rotations in the rig format's order
+     * and in the rig FILE's axes (X left, Y up, Z forward), measured from the
+     * T-pose; `Hips` is in the same axes, in leg lengths. Neither is an Unreal
+     * transform: whoever calls this has already written the pose in the wire's
+     * terms, which is what lets every other client apply it without retargeting.
+     *
+     * The hub relays it to the other clients on this scene and stores nothing. It
+     * is dropped silently, here on a closed socket and at the hub if the node is
+     * not in the scene or this client may not edit it, because a refusal thirty
+     * times a second is not a message anyone wants.
+     */
+    void PublishPose(const FString& NodeId, const FVector& Hips, const TArray<FQuat>& Rotations);
+
     /** Remove one node from the local selection. No-op if it was not in it. */
     UFUNCTION(BlueprintCallable, Category = "Looma|Selection")
     void DeselectNode(ALoomaSyncedActor* Actor);

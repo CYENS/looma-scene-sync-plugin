@@ -567,6 +567,34 @@ void ULoomaSceneSyncSubsystem::SendJson(const TSharedRef<FJsonObject>& Msg)
     Socket->Send(Text);
 }
 
+void ULoomaSceneSyncSubsystem::PublishPose(const FString& NodeId, const FVector& Hips, const TArray<FQuat>& Rotations)
+{
+    if (NodeId.IsEmpty() || !IsSyncConnected())
+    {
+        return;
+    }
+    auto Numbers = [](std::initializer_list<double> Values) {
+        TArray<TSharedPtr<FJsonValue>> Out;
+        for (const double Value : Values)
+        {
+            Out.Add(MakeShared<FJsonValueNumber>(Value));
+        }
+        return Out;
+    };
+    TArray<TSharedPtr<FJsonValue>> Rot;
+    Rot.Reserve(Rotations.Num());
+    for (const FQuat& Q : Rotations)
+    {
+        Rot.Add(MakeShared<FJsonValueArray>(Numbers({Q.X, Q.Y, Q.Z, Q.W})));
+    }
+    TSharedRef<FJsonObject> Msg = MakeShared<FJsonObject>();
+    Msg->SetStringField(TEXT("type"), TEXT("pose"));
+    Msg->SetStringField(TEXT("node"), NodeId);
+    Msg->SetArrayField(TEXT("hips"), Numbers({Hips.X, Hips.Y, Hips.Z}));
+    Msg->SetArrayField(TEXT("rot"), Rot);
+    SendJson(Msg);
+}
+
 bool ULoomaSceneSyncSubsystem::IsSyncConnected() const
 {
     return Socket.IsValid() && Socket->IsConnected();
