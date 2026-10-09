@@ -127,6 +127,7 @@ FLoomaNodeComponents LoomaParseComponents(const TArray<TSharedPtr<FJsonValue>>* 
         else if (Type == TEXT("material")) { ParseMaterial(C, Out); }
         else if (Type == TEXT("light"))    { ParseLight(C, Out); }
         else if (Type == TEXT("animation")) { ParseAnimation(C, Out); }
+        else if (Type == TEXT("livelink")) { C->TryGetStringField(TEXT("subject"), Out.LiveLinkSubject); }
         else
         {
             // Skipped, but the node lives on. This is what makes a new component

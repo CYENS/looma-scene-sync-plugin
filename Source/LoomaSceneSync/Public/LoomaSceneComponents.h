@@ -239,6 +239,15 @@ struct FLoomaNodeComponents
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
     FLoomaAnimationSpec Animation;
 
+    /**
+     * The `livelink` component's subject: the Live Link subject that drives this
+     * node, or empty for nobody (HAM-316; docs/rig-format.md, "Who drives a
+     * character", in looma-xr-asset-demo). This plugin only carries it. Whoever
+     * has Live Link reads it and poses the character.
+     */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    FString LiveLinkSubject;
+
     /** Types this build does not understand. Logged once each; never rendered, never dropped. */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
     TArray<FString> UnknownTypes;
@@ -252,7 +261,8 @@ struct FLoomaNodeComponents
             && bHasMesh == Other.bHasMesh && (!bHasMesh || Mesh == Other.Mesh)
             && bHasMaterial == Other.bHasMaterial && (!bHasMaterial || Material == Other.Material)
             && bHasLight == Other.bHasLight && (!bHasLight || Light == Other.Light)
-            && bHasAnimation == Other.bHasAnimation && (!bHasAnimation || Animation == Other.Animation);
+            && bHasAnimation == Other.bHasAnimation && (!bHasAnimation || Animation == Other.Animation)
+            && LiveLinkSubject == Other.LiveLinkSubject;
     }
     bool operator!=(const FLoomaNodeComponents& Other) const { return !(*this == Other); }
 };
