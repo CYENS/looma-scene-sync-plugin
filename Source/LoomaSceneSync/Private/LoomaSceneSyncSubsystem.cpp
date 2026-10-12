@@ -611,6 +611,56 @@ void ULoomaSceneSyncSubsystem::PublishLiveSubjects(const TArray<FName>& Subjects
     SendJson(Msg);
 }
 
+void ULoomaSceneSyncSubsystem::HandlePose(const TSharedPtr<FJsonObject>& Msg)
+{
+    // Anything not shaped like the wire is ignored, as the hub and the web do.
+    FString NodeId;
+    const TArray<TSharedPtr<FJsonValue>>* Hips = nullptr;
+    const TArray<TSharedPtr<FJsonValue>>* Rot = nullptr;
+    if (!Msg->TryGetStringField(TEXT("node"), NodeId) || NodeId.IsEmpty()
+        || !Msg->TryGetArrayField(TEXT("hips"), Hips) || Hips->Num() != 3
+        || !Msg->TryGetArrayField(TEXT("rot"), Rot) || Rot->Num() == 0)
+    {
+        return;
+    }
+    FLoomaLivePose Pose;
+    Pose.Hips = FVector((*Hips)[0]->AsNumber(), (*Hips)[1]->AsNumber(), (*Hips)[2]->AsNumber());
+    Pose.Rotations.Reserve(Rot->Num());
+    for (const TSharedPtr<FJsonValue>& Value : *Rot)
+    {
+        const TArray<TSharedPtr<FJsonValue>>* Q = nullptr;
+        if (!Value.IsValid() || !Value->TryGetArray(Q) || Q->Num() != 4)
+        {
+            return;
+        }
+        Pose.Rotations.Emplace((*Q)[0]->AsNumber(), (*Q)[1]->AsNumber(), (*Q)[2]->AsNumber(), (*Q)[3]->AsNumber());
+    }
+    Pose.ReceivedAt = FPlatformTime::Seconds();
+    if (const FLoomaLivePose* Last = LivePoses.Find(NodeId))
+    {
+        // A running average, so one late frame does not change how the character
+        // moves. A gap as long as the stale time is a new performance, not a rate.
+        const double Since = Pose.ReceivedAt - Last->ReceivedAt;
+        Pose.Gap = Last->Gap;
+        if (Since > 0.0 && Since < LivePoseStaleSeconds)
+        {
+            Pose.Gap = Last->Gap > 0.0 ? Last->Gap + 0.2 * (Since - Last->Gap) : Since;
+        }
+    }
+    LivePoses.Add(NodeId, MoveTemp(Pose));
+}
+
+bool ULoomaSceneSyncSubsystem::GetLivePose(const FString& NodeId, FLoomaLivePose& Out) const
+{
+    const FLoomaLivePose* Pose = LivePoses.Find(NodeId);
+    if (!Pose || FPlatformTime::Seconds() - Pose->ReceivedAt > LivePoseStaleSeconds)
+    {
+        return false;
+    }
+    Out = *Pose;
+    return true;
+}
+
 bool ULoomaSceneSyncSubsystem::SetLiveLinkSubject(ALoomaSyncedActor* Actor, const FString& Subject)
 {
     if (!IsValid(Actor) || Actor->Id.IsEmpty() || !IsSyncConnected())
@@ -2682,6 +2732,10 @@ void ULoomaSceneSyncSubsystem::OnRawMessage(const FString& Text)
     else if (Type == TEXT("patch"))
     {
         HandlePatch(Msg);
+    }
+    else if (Type == TEXT("pose"))
+    {
+        HandlePose(Msg);
     }
     else if (Type == TEXT("generation"))
     {
