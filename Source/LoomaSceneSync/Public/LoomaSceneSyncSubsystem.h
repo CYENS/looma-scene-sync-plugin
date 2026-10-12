@@ -7,6 +7,7 @@
 #include "LoomaSyncedActor.h"
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "Tickable.h"
+#include "LoomaLivePoseBuffer.h"
 #include "LoomaSceneSyncSubsystem.generated.h"
 
 class IWebSocket;
@@ -138,24 +139,6 @@ struct FLoomaCue
     FString SceneId;
     /** Optional and often absent: `add_cue` stores `clean_label or None`. */
     FString Label;
-};
-
-/**
- * A live pose another client published for a rigged character (HAM-316): the
- * wire's `pose`, docs/rig-format.md "Live pose" in looma-xr-asset-demo. Still in
- * the wire's terms, which are not Unreal's: whoever poses a mesh from it does
- * the last step, into that mesh's own bones.
- */
-struct FLoomaLivePose
-{
-    /** Left, up, forward, in units of the character's leg length. */
-    FVector Hips = FVector::ZeroVector;
-    /** The 22 body bones' local rotations in the rig format's order and the rig FILE's axes, from the T-pose. */
-    TArray<FQuat> Rotations;
-    /** FPlatformTime::Seconds() when it arrived. */
-    double ReceivedAt = 0.0;
-    /** The usual time between this node's frames, in seconds; 0 until two have come. */
-    double Gap = 0.0;
 };
 
 /** Per-node bookkeeping for the outbound motion diff. */
@@ -707,7 +690,7 @@ public:
     void PublishLiveSubjects(const TArray<FName>& Subjects);
 
     /** How long a node holds its last received pose before it is let go, in seconds. */
-    static constexpr double LivePoseStaleSeconds = 1.0;
+    static constexpr double LivePoseStaleSeconds = FLoomaLivePoseBuffer::StaleSeconds;
 
     /**
      * The newest pose another client published for a node (HAM-316), or false if
@@ -720,6 +703,22 @@ public:
      * the host project's business, as publishing one is.
      */
     bool GetLivePose(const FString& NodeId, FLoomaLivePose& Out) const;
+
+    /**
+     * The pose to SHOW for a node now (HAM-325): where the character was a short
+     * time ago, between two received poses, so that poses arriving unevenly do
+     * not make it speed up and slow down. False as GetLivePose. Prefer this to
+     * GetLivePose for anything a person watches; FLoomaLivePoseBuffer says how
+     * the delay is chosen.
+     */
+    bool SampleLivePose(const FString& NodeId, FLoomaLivePose& Out) const;
+
+    /**
+     * How far in the past SampleLivePose is showing a node, and how far its
+     * poses' arrivals stray from a steady clock, both in seconds. False if no
+     * pose is being received for it.
+     */
+    bool GetLivePoseTiming(const FString& NodeId, double& OutDelay, double& OutJitter) const;
 
     /**
      * Say in the scene which Live Link subject drives a node (HAM-316), or that
@@ -1725,8 +1724,8 @@ private:
     FDelegateHandle SettingsChangedHandle;
     FString ClientId;
     TMap<FString, FLoomaTrackedActor> Tracked; // node id -> actor + last-sent cache
-    /** node id -> the newest `pose` another client sent for it. Never stored anywhere else. */
-    TMap<FString, FLoomaLivePose> LivePoses;
+    /** node id -> the last few `pose` frames another client sent for it. Never stored anywhere else. */
+    TMap<FString, FLoomaLivePoseBuffer> LivePoses;
     TMap<FString, FLoomaGenerationJob> Jobs;   // jobId -> latest job snapshot
 
     /** Which saved scene the hub says is live (`sceneId`); empty for an unsaved one. */

@@ -635,29 +635,31 @@ void ULoomaSceneSyncSubsystem::HandlePose(const TSharedPtr<FJsonObject>& Msg)
         }
         Pose.Rotations.Emplace((*Q)[0]->AsNumber(), (*Q)[1]->AsNumber(), (*Q)[2]->AsNumber(), (*Q)[3]->AsNumber());
     }
-    Pose.ReceivedAt = FPlatformTime::Seconds();
-    if (const FLoomaLivePose* Last = LivePoses.Find(NodeId))
-    {
-        // A running average, so one late frame does not change how the character
-        // moves. A gap as long as the stale time is a new performance, not a rate.
-        const double Since = Pose.ReceivedAt - Last->ReceivedAt;
-        Pose.Gap = Last->Gap;
-        if (Since > 0.0 && Since < LivePoseStaleSeconds)
-        {
-            Pose.Gap = Last->Gap > 0.0 ? Last->Gap + 0.2 * (Since - Last->Gap) : Since;
-        }
-    }
-    LivePoses.Add(NodeId, MoveTemp(Pose));
+    LivePoses.FindOrAdd(NodeId).Push(Pose, FPlatformTime::Seconds());
 }
 
 bool ULoomaSceneSyncSubsystem::GetLivePose(const FString& NodeId, FLoomaLivePose& Out) const
 {
-    const FLoomaLivePose* Pose = LivePoses.Find(NodeId);
-    if (!Pose || FPlatformTime::Seconds() - Pose->ReceivedAt > LivePoseStaleSeconds)
+    const FLoomaLivePoseBuffer* Buffer = LivePoses.Find(NodeId);
+    return Buffer && Buffer->Newest(FPlatformTime::Seconds(), Out);
+}
+
+bool ULoomaSceneSyncSubsystem::SampleLivePose(const FString& NodeId, FLoomaLivePose& Out) const
+{
+    const FLoomaLivePoseBuffer* Buffer = LivePoses.Find(NodeId);
+    return Buffer && Buffer->Sample(FPlatformTime::Seconds(), Out);
+}
+
+bool ULoomaSceneSyncSubsystem::GetLivePoseTiming(const FString& NodeId, double& OutDelay, double& OutJitter) const
+{
+    const FLoomaLivePoseBuffer* Buffer = LivePoses.Find(NodeId);
+    FLoomaLivePose Unused;
+    if (!Buffer || !Buffer->Newest(FPlatformTime::Seconds(), Unused))
     {
         return false;
     }
-    Out = *Pose;
+    OutDelay = Buffer->GetDelay();
+    OutJitter = Buffer->GetJitter();
     return true;
 }
 
