@@ -1,12 +1,15 @@
 #include "LoomaSceneComponents.h"
+#include "LoomaSceneSyncSubsystem.h"
 
 #if WITH_DEV_AUTOMATION_TESTS
 
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
+#include "Engine/GameInstance.h"
 #include "Misc/AutomationTest.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
+#include "UObject/StrongObjectPtr.h"
 
 namespace
 {
@@ -50,6 +53,46 @@ bool FLoomaLiveLinkComponentEditTest::RunTest(const FString& Parameters)
     const TArray<TSharedPtr<FJsonValue>> Removed = LoomaWithLiveLinkSubject(Changed, FString());
     TestEqual(TEXT("an empty subject removes the component"), Removed.Num(), 2);
     TestEqual(TEXT("and leaves the others in order"), TypeOf(Removed[1]), FString(TEXT("mystery")));
+    return true;
+}
+
+/** Feeds wire frames to a subsystem that never opened a socket. */
+struct FLoomaLivePoseTestAccess
+{
+    TStrongObjectPtr<UGameInstance> GameInstance{NewObject<UGameInstance>()};
+    TStrongObjectPtr<ULoomaSceneSyncSubsystem> Sync{NewObject<ULoomaSceneSyncSubsystem>(GameInstance.Get())};
+
+    void Receive(const FString& Json) { Sync->OnRawMessage(Json); }
+    void Age(const TCHAR* Node, double Seconds) { Sync->LivePoses.FindChecked(Node).ReceivedAt -= Seconds; }
+};
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoomaLivePoseReceiveTest,
+    "Looma.LiveLink.ReceivePose",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoomaLivePoseReceiveTest::RunTest(const FString& Parameters)
+{
+    FLoomaLivePoseTestAccess Access;
+    FLoomaLivePose Pose;
+    TestFalse(TEXT("nothing before a frame arrives"), Access.Sync->GetLivePose(TEXT("n1"), Pose));
+
+    FString Rot;
+    for (int32 Bone = 0; Bone < 22; ++Bone)
+    {
+        Rot += FString::Printf(TEXT("%s[0,0,%s]"), Bone > 0 ? TEXT(",") : TEXT(""), Bone == 1 ? TEXT("1,0") : TEXT("0,1"));
+    }
+    Access.Receive(FString::Printf(TEXT("{\"type\":\"pose\",\"node\":\"n1\",\"hips\":[0.1,1.0,-0.4],\"rot\":[%s]}"), *Rot));
+    TestTrue(TEXT("a frame is kept"), Access.Sync->GetLivePose(TEXT("n1"), Pose));
+    TestEqual(TEXT("with all its rotations"), Pose.Rotations.Num(), 22);
+    TestEqual(TEXT("hips as sent: left, up, forward"), Pose.Hips, FVector(0.1, 1.0, -0.4));
+    TestEqual(TEXT("a quaternion as x, y, z, w"), Pose.Rotations[1], FQuat(0, 0, 1, 0));
+    TestFalse(TEXT("and only for its own node"), Access.Sync->GetLivePose(TEXT("n2"), Pose));
+
+    Access.Receive(TEXT(R"({"type":"pose","node":"n3","hips":[0,1],"rot":[[0,0,0,1]]})"));
+    TestFalse(TEXT("a malformed frame is dropped"), Access.Sync->GetLivePose(TEXT("n3"), Pose));
+
+    Access.Age(TEXT("n1"), ULoomaSceneSyncSubsystem::LivePoseStaleSeconds + 0.5);
+    TestFalse(TEXT("a frame goes stale"), Access.Sync->GetLivePose(TEXT("n1"), Pose));
     return true;
 }
 
