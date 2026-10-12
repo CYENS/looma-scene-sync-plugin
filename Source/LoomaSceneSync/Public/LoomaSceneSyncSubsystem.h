@@ -688,6 +688,19 @@ public:
      */
     void PublishLiveSubjects(const TArray<FName>& Subjects);
 
+    /**
+     * Say in the scene which Live Link subject drives a node (HAM-316), or that
+     * nobody does when `Subject` is empty: the node's `livelink` component, set
+     * or removed with a `patch`, exactly as the web inspector does it. Every
+     * client then sees the same choice, and it is saved with the scene.
+     *
+     * Returns false when nothing was sent (no such node, or no connection). True
+     * does not mean the hub accepted it: the node changes when the hub's own
+     * `patch` comes back, here as everywhere else.
+     */
+    UFUNCTION(BlueprintCallable, Category = "Looma|LiveLink")
+    bool SetLiveLinkSubject(ALoomaSyncedActor* Actor, const FString& Subject);
+
     /** Remove one node from the local selection. No-op if it was not in it. */
     UFUNCTION(BlueprintCallable, Category = "Looma|Selection")
     void DeselectNode(ALoomaSyncedActor* Actor);

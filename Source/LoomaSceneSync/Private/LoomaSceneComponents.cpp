@@ -180,3 +180,27 @@ TSharedRef<FJsonObject> LoomaMakeModelComponent(const FString& AssetId, const FS
     }
     return Out;
 }
+
+TArray<TSharedPtr<FJsonValue>> LoomaWithLiveLinkSubject(
+    const TArray<TSharedPtr<FJsonValue>>& Components, const FString& Subject)
+{
+    TArray<TSharedPtr<FJsonValue>> Out;
+    for (const TSharedPtr<FJsonValue>& Value : Components)
+    {
+        const TSharedPtr<FJsonObject> Component = Value.IsValid() ? Value->AsObject() : nullptr;
+        FString Type;
+        if (Component.IsValid() && Component->TryGetStringField(TEXT("type"), Type) && Type == TEXT("livelink"))
+        {
+            continue; // a type occurs once per node: the old one goes, whatever it named
+        }
+        Out.Add(Value);
+    }
+    if (!Subject.IsEmpty())
+    {
+        TSharedRef<FJsonObject> LiveLink = MakeShared<FJsonObject>();
+        LiveLink->SetStringField(TEXT("type"), TEXT("livelink"));
+        LiveLink->SetStringField(TEXT("subject"), Subject);
+        Out.Add(MakeShared<FJsonValueObject>(LiveLink));
+    }
+    return Out;
+}
