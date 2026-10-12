@@ -291,3 +291,12 @@ LOOMASCENESYNC_API FLinearColor LoomaParseColor(const FString& Hex, const FLinea
  */
 LOOMASCENESYNC_API TSharedRef<FJsonObject> LoomaMakeModelComponent(const FString& AssetId, const FString& JobId,
     const FString& WebUrl);
+
+/**
+ * A node's components with its `livelink` component set to `Subject`, or removed
+ * when `Subject` is empty (HAM-316). Everything else is carried over as it came,
+ * including components this client does not understand: a component edit is the
+ * node's WHOLE array, so whatever is left out of it is deleted for everybody.
+ */
+LOOMASCENESYNC_API TArray<TSharedPtr<FJsonValue>> LoomaWithLiveLinkSubject(
+    const TArray<TSharedPtr<FJsonValue>>& Components, const FString& Subject);

@@ -611,6 +611,31 @@ void ULoomaSceneSyncSubsystem::PublishLiveSubjects(const TArray<FName>& Subjects
     SendJson(Msg);
 }
 
+bool ULoomaSceneSyncSubsystem::SetLiveLinkSubject(ALoomaSyncedActor* Actor, const FString& Subject)
+{
+    if (!IsValid(Actor) || Actor->Id.IsEmpty() || !IsSyncConnected())
+    {
+        return false;
+    }
+    if (Actor->GetComponents().LiveLinkSubject == Subject)
+    {
+        return true; // already so; an edit that changes nothing is not worth an undo step
+    }
+    TSharedRef<FJsonObject> Node = MakeShared<FJsonObject>();
+    Node->SetStringField(TEXT("id"), Actor->Id);
+    Node->SetArrayField(TEXT("components"), LoomaWithLiveLinkSubject(Actor->WireComponents, Subject));
+    TSharedRef<FJsonObject> Msg = MakeShared<FJsonObject>();
+    Msg->SetStringField(TEXT("type"), TEXT("patch"));
+    TArray<TSharedPtr<FJsonValue>> Nodes;
+    Nodes.Add(MakeShared<FJsonValueObject>(Node));
+    Msg->SetArrayField(TEXT("nodes"), Nodes);
+    // Not applied here. The hub sends a patch back to whoever made it, and that
+    // echo is what changes the node, so a refused edit changes nothing on this
+    // client either.
+    SendJson(Msg);
+    return true;
+}
+
 bool ULoomaSceneSyncSubsystem::IsSyncConnected() const
 {
     return Socket.IsValid() && Socket->IsConnected();
@@ -2893,6 +2918,7 @@ void ULoomaSceneSyncSubsystem::UpsertNode(const TSharedPtr<FJsonObject>& Node)
 #if WITH_EDITOR
     Actor->SetActorLabel(Actor->DisplayName);
 #endif
+    Actor->WireComponents = ComponentArray ? *ComponentArray : TArray<TSharedPtr<FJsonValue>>();
     Actor->ApplyComponents(Components, MakeRenderContext(Components));
     ApplyParent(*Actor, ParentId, Local, /*bSnap=*/true);
     // A claim may precede its node, and an upsert of an EXISTING node may replace its
@@ -3307,6 +3333,7 @@ void ULoomaSceneSyncSubsystem::HandlePatch(const TSharedPtr<FJsonObject>& Msg)
         if (Node->TryGetArrayField(TEXT("components"), ComponentArray))
         {
             const FLoomaNodeComponents Components = LoomaParseComponents(ComponentArray);
+            Actor->WireComponents = *ComponentArray;
             Actor->ApplyComponents(Components, MakeRenderContext(Components));
             // Components are replaced as a whole, so the primitives we marked last
             // frame may be gone and new ones may now carry an existing claim.
@@ -3888,6 +3915,7 @@ ALoomaSyncedActor* ULoomaSceneSyncSubsystem::SpawnSyncedAsset(const FString& Ass
     ComponentValues.Add(MakeShared<FJsonValueObject>(
         LoomaMakeModelComponent(AssetId, JobId, MakeWebAssetUrl(AssetId))));
     Node->SetArrayField(TEXT("components"), ComponentValues);
+    Actor->WireComponents = ComponentValues;
 
     TSharedRef<FJsonObject> Msg = MakeShared<FJsonObject>();
     Msg->SetStringField(TEXT("type"), TEXT("spawn"));

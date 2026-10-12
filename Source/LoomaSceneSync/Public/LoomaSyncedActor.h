@@ -130,6 +130,13 @@ public:
     const FLoomaNodeComponents& GetComponents() const { return Components; }
 
     /**
+     * This node's `components` array as the hub last sent it, unparsed. Kept
+     * because a component edit made here has to send the whole array back, and
+     * `Components` has already dropped what this client does not render.
+     */
+    TArray<TSharedPtr<FJsonValue>> WireComponents;
+
+    /**
      * Play this node's `animation` component again from the start, as if it had
      * just arrived. For whoever took the character's pose over (a Live Link
      * driver, HAM-316) and is now giving it back: the clip the node names was
