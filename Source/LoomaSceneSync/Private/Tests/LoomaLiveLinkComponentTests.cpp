@@ -63,7 +63,6 @@ struct FLoomaLivePoseTestAccess
     TStrongObjectPtr<ULoomaSceneSyncSubsystem> Sync{NewObject<ULoomaSceneSyncSubsystem>(GameInstance.Get())};
 
     void Receive(const FString& Json) { Sync->OnRawMessage(Json); }
-    void Age(const TCHAR* Node, double Seconds) { Sync->LivePoses.FindChecked(Node).ReceivedAt -= Seconds; }
 };
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoomaLivePoseReceiveTest,
@@ -91,8 +90,140 @@ bool FLoomaLivePoseReceiveTest::RunTest(const FString& Parameters)
     Access.Receive(TEXT(R"({"type":"pose","node":"n3","hips":[0,1],"rot":[[0,0,0,1]]})"));
     TestFalse(TEXT("a malformed frame is dropped"), Access.Sync->GetLivePose(TEXT("n3"), Pose));
 
-    Access.Age(TEXT("n1"), ULoomaSceneSyncSubsystem::LivePoseStaleSeconds + 0.5);
-    TestFalse(TEXT("a frame goes stale"), Access.Sync->GetLivePose(TEXT("n1"), Pose));
+    TestTrue(TEXT("the pose to show is there too"), Access.Sync->SampleLivePose(TEXT("n1"), Pose));
+    TestEqual(TEXT("and with one frame received it is that frame"), Pose.Hips, FVector(0.1, 1.0, -0.4));
+    double Delay = 0.0, Jitter = 0.0;
+    TestTrue(TEXT("its timing can be asked for"), Access.Sync->GetLivePoseTiming(TEXT("n1"), Delay, Jitter));
+    TestFalse(TEXT("but not that of a node that receives nothing"), Access.Sync->GetLivePoseTiming(TEXT("n2"), Delay, Jitter));
+    return true;
+}
+
+namespace
+{
+    /** A wire pose whose every bone is turned `Angle` radians about up, with the hips that far forward. */
+    FLoomaLivePose Turned(double Angle)
+    {
+        FLoomaLivePose Pose;
+        Pose.Hips = FVector(0, 1, Angle);
+        Pose.Rotations.Init(FQuat(FVector(0, 1, 0), Angle), 22);
+        return Pose;
+    }
+
+    /** How far a sampled pose has turned, read back from a bone. */
+    double AngleOf(const FLoomaLivePose& Pose)
+    {
+        return Pose.Rotations[5].AngularDistance(FQuat::Identity);
+    }
+
+    struct FPlayback
+    {
+        /** The biggest and smallest step between rendered frames, as a share of the step a steady movement makes. */
+        double Fastest = 0.0;
+        double Slowest = TNumericLimits<double>::Max();
+        double Delay = 0.0;
+    };
+
+    /**
+     * A bone turning steadily, sent `Rate` times a second, each pose arriving up
+     * to `Late` seconds after it was sent; watched at 60 frames a second, either
+     * through the buffer or by taking the newest pose.
+     */
+    FPlayback Watch(double Rate, double Late, bool bBuffered, int32 Seed)
+    {
+        const double Speed = 1.0; // radians a second
+        const double Seconds = 6.0;
+        const double Frame = 1.0 / 60.0;
+        FRandomStream Random(Seed);
+        TArray<TPair<double, double>> Arrivals; // when it arrives, the angle it carries
+        double LastArrival = 0.0;
+        for (double Sent = 0.0; Sent < Seconds; Sent += 1.0 / Rate)
+        {
+            // A socket delays poses but keeps their order.
+            LastArrival = FMath::Max(LastArrival, Sent + Random.FRand() * Late);
+            Arrivals.Emplace(LastArrival, Sent * Speed);
+        }
+        FLoomaLivePoseBuffer Buffer;
+        FPlayback Out;
+        int32 Next = 0;
+        double Last = 0.0;
+        for (double Now = 0.0; Now < Seconds; Now += Frame)
+        {
+            // A client reads its socket once a rendered frame.
+            for (; Next < Arrivals.Num() && Arrivals[Next].Key <= Now; ++Next)
+            {
+                Buffer.Push(Turned(Arrivals[Next].Value), Now);
+            }
+            FLoomaLivePose Shown;
+            if (!(bBuffered ? Buffer.Sample(Now, Shown) : Buffer.Newest(Now, Shown)))
+            {
+                continue;
+            }
+            const double Angle = Shown.Hips.Z; // travels with the bones, and does not wrap as an angle does
+            if (Now > 3.0) // once the buffer has the measure of the arrivals
+            {
+                const double Step = (Angle - Last) / (Speed * Frame);
+                Out.Fastest = FMath::Max(Out.Fastest, Step);
+                Out.Slowest = FMath::Min(Out.Slowest, Step);
+            }
+            Last = Angle;
+        }
+        Out.Delay = Buffer.GetDelay();
+        return Out;
+    }
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoomaLivePoseBufferTest,
+    "Looma.LiveLink.PoseBuffer",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoomaLivePoseBufferTest::RunTest(const FString& Parameters)
+{
+    FLoomaLivePose Pose;
+    FLoomaLivePoseBuffer Empty;
+    TestFalse(TEXT("nothing before a pose arrives"), Empty.Sample(0.0, Pose));
+
+    // Between two poses: the character is shown part of the way from one to the next.
+    FLoomaLivePoseBuffer Two;
+    Two.Push(Turned(0.0), 10.0);
+    TestTrue(TEXT("one pose is shown as it is"), Two.Sample(10.0, Pose) && FMath::IsNearlyZero(AngleOf(Pose), 1e-6));
+    Two.Push(Turned(0.4), 10.1);
+    TestTrue(TEXT("with two poses the delay is the gap between them"), FMath::IsNearlyEqual(Two.GetDelay(), 0.1, 1e-6));
+    Two.Sample(10.15, Pose);
+    TestTrue(TEXT("half a gap on, the bone is half way"), FMath::IsNearlyEqual(AngleOf(Pose), 0.2, 1e-4));
+    TestTrue(TEXT("and so are the hips"), FMath::IsNearlyEqual(Pose.Hips.Z, 0.2, 1e-4));
+    Two.Sample(10.5, Pose);
+    TestTrue(TEXT("with nothing newer, the newest is held"), FMath::IsNearlyEqual(AngleOf(Pose), 0.4, 1e-6));
+    TestTrue(TEXT("the newest pose is still to be had as it came"), Two.Newest(10.15, Pose) && FMath::IsNearlyEqual(AngleOf(Pose), 0.4, 1e-6));
+    TestFalse(TEXT("a node goes stale"), Two.Sample(10.1 + FLoomaLivePoseBuffer::StaleSeconds + 0.5, Pose));
+    Two.Push(Turned(2.0), 20.0);
+    TestTrue(TEXT("after a silence the next pose is a new start"),
+             Two.Sample(20.0, Pose) && FMath::IsNearlyEqual(AngleOf(Pose), 2.0, 1e-6) && Two.GetDelay() == 0.0);
+
+    // Steady arrivals: an even movement, about one gap behind.
+    const FPlayback Steady = Watch(30.0, 0.0, true, 1);
+    AddInfo(FString::Printf(TEXT("steady: step %.2f to %.2f, delay %.0f ms"), Steady.Slowest, Steady.Fastest, Steady.Delay * 1000));
+    TestTrue(TEXT("steady poses play back evenly"), Steady.Slowest > 0.9 && Steady.Fastest < 1.1);
+    TestTrue(TEXT("about two rendered frames behind"), Steady.Delay > 0.03 && Steady.Delay < 0.06);
+
+    // Uneven arrivals, each pose up to 40 ms late: taking the newest pose stops
+    // and lurches, the buffer does not.
+    for (int32 Seed = 1; Seed <= 5; ++Seed)
+    {
+        const FPlayback Chasing = Watch(30.0, 0.04, false, Seed);
+        const FPlayback Buffered = Watch(30.0, 0.04, true, Seed);
+        AddInfo(FString::Printf(TEXT("uneven %d: newest %.2f to %.2f; buffered %.2f to %.2f, delay %.0f ms"), Seed,
+                                Chasing.Slowest, Chasing.Fastest, Buffered.Slowest, Buffered.Fastest, Buffered.Delay * 1000));
+        TestTrue(TEXT("the newest pose stands still on some frames and jumps on others"), Chasing.Slowest < 0.1 && Chasing.Fastest > 2.5);
+        TestTrue(TEXT("the buffer never stands still"), Buffered.Slowest > 0.5);
+        TestTrue(TEXT("and never lurches"), Buffered.Fastest < 1.6);
+        TestTrue(TEXT("for a delay under a tenth of a second"), Buffered.Delay < 0.1);
+    }
+
+    // A crowd sharing the budget of the hub: a few poses a second each.
+    const FPlayback Sparse = Watch(6.0, 0.02, true, 3);
+    AddInfo(FString::Printf(TEXT("sparse: step %.2f to %.2f, delay %.0f ms"), Sparse.Slowest, Sparse.Fastest, Sparse.Delay * 1000));
+    TestTrue(TEXT("a few poses a second still play back evenly"), Sparse.Slowest > 0.7 && Sparse.Fastest < 1.3);
+    TestTrue(TEXT("no further behind than the longest delay"), Sparse.Delay <= FLoomaLivePoseBuffer::LongestDelay);
     return true;
 }
 
