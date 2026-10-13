@@ -729,9 +729,35 @@ public:
      * Returns false when nothing was sent (no such node, or no connection). True
      * does not mean the hub accepted it: the node changes when the hub's own
      * `patch` comes back, here as everywhere else.
+     *
+     * This is a CLIENT's subject, such as one this client's own Live Link has:
+     * a `source` and `stream` the component had are taken off (HAM-329).
      */
     UFUNCTION(BlueprintCallable, Category = "Looma|LiveLink")
     bool SetLiveLinkSubject(ALoomaSyncedActor* Actor, const FString& Subject);
+
+    /**
+     * Say in the scene that the backend's own Live Link drives a node (HAM-329):
+     * its `livelink` component names `Subject` in the hub's stream `Stream` and
+     * says the hub has it. The hub then drives the node and drops any client's
+     * poses for it, this client's included. An empty `Stream` is whichever of
+     * the hub's streams has a subject of that name. As SetLiveLinkSubject
+     * otherwise, and an empty `Subject` removes the component.
+     */
+    UFUNCTION(BlueprintCallable, Category = "Looma|LiveLink")
+    bool SetHubLiveLinkSubject(ALoomaSyncedActor* Actor, const FString& Stream, const FString& Subject);
+
+    /** How long the hub's subjects stay on offer after it last announced them, in seconds (as the web's). */
+    static constexpr double HubLiveSubjectsTtlSeconds = 7.0;
+
+    /**
+     * The performers the backend's hub says it has, by stream (HAM-329): what it
+     * announced last, every couple of seconds, as `liveSubjects` from the
+     * reserved client id "hub". The stream is "" for a hub that names none.
+     * False, and `Out` empty, when nothing was heard from it in the last
+     * HubLiveSubjectsTtlSeconds: its Live Link is off, or no stream is sending.
+     */
+    bool GetHubLiveSubjects(TMap<FString, TArray<FString>>& Out) const;
 
     /** Remove one node from the local selection. No-op if it was not in it. */
     UFUNCTION(BlueprintCallable, Category = "Looma|Selection")
@@ -1390,6 +1416,11 @@ private:
     void HandleReparent(const TSharedPtr<FJsonObject>& Msg);
     void HandlePatch(const TSharedPtr<FJsonObject>& Msg);
     void HandlePose(const TSharedPtr<FJsonObject>& Msg);
+    /** Another client's or the hub's Live Link subjects. Only the hub's are kept (HAM-329). */
+    void HandleLiveSubjects(const TSharedPtr<FJsonObject>& Msg);
+    /** The `livelink` component edit behind SetLiveLinkSubject and SetHubLiveLinkSubject. */
+    bool SendLiveLinkComponent(ALoomaSyncedActor* Actor, const FString& Subject, const FString& Source,
+                               const FString& Stream);
     void HandleGeneration(const TSharedPtr<FJsonObject>& Msg);
     /**
      * A refused `openScene` or a refused edit, sent to this client alone. A frame and
@@ -1726,6 +1757,9 @@ private:
     TMap<FString, FLoomaTrackedActor> Tracked; // node id -> actor + last-sent cache
     /** node id -> the last few `pose` frames another client sent for it. Never stored anywhere else. */
     TMap<FString, FLoomaLivePoseBuffer> LivePoses;
+    /** Stream -> the performers the hub last said it has there, and when it said so (HAM-329). */
+    TMap<FString, TArray<FString>> HubLiveSubjects;
+    double HubLiveSubjectsAt = -1.0;
     TMap<FString, FLoomaGenerationJob> Jobs;   // jobId -> latest job snapshot
 
     /** Which saved scene the hub says is live (`sceneId`); empty for an unsaved one. */

@@ -127,7 +127,12 @@ FLoomaNodeComponents LoomaParseComponents(const TArray<TSharedPtr<FJsonValue>>* 
         else if (Type == TEXT("material")) { ParseMaterial(C, Out); }
         else if (Type == TEXT("light"))    { ParseLight(C, Out); }
         else if (Type == TEXT("animation")) { ParseAnimation(C, Out); }
-        else if (Type == TEXT("livelink")) { C->TryGetStringField(TEXT("subject"), Out.LiveLinkSubject); }
+        else if (Type == TEXT("livelink"))
+        {
+            C->TryGetStringField(TEXT("subject"), Out.LiveLinkSubject);
+            C->TryGetStringField(TEXT("source"), Out.LiveLinkSource);
+            C->TryGetStringField(TEXT("stream"), Out.LiveLinkStream);
+        }
         else
         {
             // Skipped, but the node lives on. This is what makes a new component
@@ -182,7 +187,8 @@ TSharedRef<FJsonObject> LoomaMakeModelComponent(const FString& AssetId, const FS
 }
 
 TArray<TSharedPtr<FJsonValue>> LoomaWithLiveLinkSubject(
-    const TArray<TSharedPtr<FJsonValue>>& Components, const FString& Subject)
+    const TArray<TSharedPtr<FJsonValue>>& Components, const FString& Subject, const FString& Source,
+    const FString& Stream)
 {
     TArray<TSharedPtr<FJsonValue>> Out;
     for (const TSharedPtr<FJsonValue>& Value : Components)
@@ -200,6 +206,14 @@ TArray<TSharedPtr<FJsonValue>> LoomaWithLiveLinkSubject(
         TSharedRef<FJsonObject> LiveLink = MakeShared<FJsonObject>();
         LiveLink->SetStringField(TEXT("type"), TEXT("livelink"));
         LiveLink->SetStringField(TEXT("subject"), Subject);
+        if (!Source.IsEmpty())
+        {
+            LiveLink->SetStringField(TEXT("source"), Source);
+            if (!Stream.IsEmpty())
+            {
+                LiveLink->SetStringField(TEXT("stream"), Stream);
+            }
+        }
         Out.Add(MakeShared<FJsonValueObject>(LiveLink));
     }
     return Out;

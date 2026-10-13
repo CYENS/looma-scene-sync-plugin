@@ -56,6 +56,45 @@ bool FLoomaLiveLinkComponentEditTest::RunTest(const FString& Parameters)
     return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoomaLiveLinkComponentSourceTest,
+    "Looma.LiveLink.ComponentSource",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoomaLiveLinkComponentSourceTest::RunTest(const FString& Parameters)
+{
+    // Who has the subject (HAM-329): the backend's hub, in one of its streams.
+    const TArray<TSharedPtr<FJsonValue>> Before =
+        ParseArray(TEXT(R"([{"type":"model","assetId":"a"},{"type":"livelink","subject":"Actor0"}])"));
+    TestFalse(TEXT("a component with no source is a client's"), LoomaParseComponents(&Before).IsLiveLinkFromHub());
+
+    const TArray<TSharedPtr<FJsonValue>> Hubbed =
+        LoomaWithLiveLinkSubject(Before, TEXT("Actor0"), LoomaLiveLinkHubSource, TEXT("studio-b"));
+    const TSharedPtr<FJsonObject> Written = Hubbed.Last()->AsObject();
+    TestEqual(TEXT("it says the hub has it"), Written->GetStringField(TEXT("source")), FString(TEXT("hub")));
+    TestEqual(TEXT("and in which stream"), Written->GetStringField(TEXT("stream")), FString(TEXT("studio-b")));
+    const FLoomaNodeComponents Parsed = LoomaParseComponents(&Hubbed);
+    TestTrue(TEXT("and reads back as the hub's"), Parsed.IsLiveLinkFromHub());
+    TestEqual(TEXT("with its stream"), Parsed.LiveLinkStream, FString(TEXT("studio-b")));
+    TestTrue(TEXT("a different source is a different component"), Parsed != LoomaParseComponents(&Before));
+
+    // Choosing a client's subject writes the component whole: no source, no stream.
+    const TArray<TSharedPtr<FJsonValue>> Back = LoomaWithLiveLinkSubject(Hubbed, TEXT("Actor0"));
+    TestFalse(TEXT("a client's subject has no source"), Back.Last()->AsObject()->HasField(TEXT("source")));
+    TestFalse(TEXT("nor a stream"), Back.Last()->AsObject()->HasField(TEXT("stream")));
+    TestFalse(TEXT("and is no longer the hub's"), LoomaParseComponents(&Back).IsLiveLinkFromHub());
+
+    // A stream only means something with the hub as the source.
+    const TArray<TSharedPtr<FJsonValue>> Loose = LoomaWithLiveLinkSubject(Before, TEXT("Actor0"), FString(), TEXT("studio-b"));
+    TestFalse(TEXT("a stream with no source is not written"), Loose.Last()->AsObject()->HasField(TEXT("stream")));
+
+    const TArray<TSharedPtr<FJsonValue>> AnyStream = ParseArray(
+        TEXT(R"([{"type":"livelink","subject":"Actor0","source":"hub"}])"));
+    TestTrue(TEXT("the hub with no stream named is still the hub"), LoomaParseComponents(&AnyStream).IsLiveLinkFromHub());
+    const TArray<TSharedPtr<FJsonValue>> Nobody = ParseArray(TEXT(R"([{"type":"livelink","subject":"","source":"hub"}])"));
+    TestFalse(TEXT("an empty subject is nobody's, whatever the source"), LoomaParseComponents(&Nobody).IsLiveLinkFromHub());
+    return true;
+}
+
 /** Feeds wire frames to a subsystem that never opened a socket. */
 struct FLoomaLivePoseTestAccess
 {
@@ -90,11 +129,43 @@ bool FLoomaLivePoseReceiveTest::RunTest(const FString& Parameters)
     Access.Receive(TEXT(R"({"type":"pose","node":"n3","hips":[0,1],"rot":[[0,0,0,1]]})"));
     TestFalse(TEXT("a malformed frame is dropped"), Access.Sync->GetLivePose(TEXT("n3"), Pose));
 
+    // The hub's own poses carry when each stands for and its tick (HAM-328):
+    // additive fields, read past.
+    Access.Receive(FString::Printf(
+        TEXT("{\"type\":\"pose\",\"node\":\"n4\",\"hips\":[0,1,0],\"rot\":[%s],\"t\":8812.4518,\"seq\":2291}"), *Rot));
+    TestTrue(TEXT("a pose from the hub, with t and seq, is kept too"), Access.Sync->GetLivePose(TEXT("n4"), Pose));
+
     TestTrue(TEXT("the pose to show is there too"), Access.Sync->SampleLivePose(TEXT("n1"), Pose));
     TestEqual(TEXT("and with one frame received it is that frame"), Pose.Hips, FVector(0.1, 1.0, -0.4));
     double Delay = 0.0, Jitter = 0.0;
     TestTrue(TEXT("its timing can be asked for"), Access.Sync->GetLivePoseTiming(TEXT("n1"), Delay, Jitter));
     TestFalse(TEXT("but not that of a node that receives nothing"), Access.Sync->GetLivePoseTiming(TEXT("n2"), Delay, Jitter));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoomaHubLiveSubjectsTest,
+    "Looma.LiveLink.HubSubjects",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoomaHubLiveSubjectsTest::RunTest(const FString& Parameters)
+{
+    FLoomaLivePoseTestAccess Access;
+    TMap<FString, TArray<FString>> Streams;
+    TestFalse(TEXT("nothing before the hub says anything"), Access.Sync->GetHubLiveSubjects(Streams));
+
+    Access.Receive(TEXT(R"({"type":"liveSubjects","clientId":"ue-2","subjects":["Actor0"]})"));
+    TestFalse(TEXT("another client's subjects are not the hub's"), Access.Sync->GetHubLiveSubjects(Streams));
+
+    Access.Receive(TEXT(R"({"type":"liveSubjects","clientId":"hub","subjects":["Actor0","Actor1"],"streams":{"moverse":["Actor0","Actor1"],"studio-b":["Actor0",""]}})"));
+    TestTrue(TEXT("the hub's are kept"), Access.Sync->GetHubLiveSubjects(Streams));
+    TestEqual(TEXT("by stream"), Streams.Num(), 2);
+    TestEqual(TEXT("each with its performers"), Streams.FindRef(TEXT("moverse")).Num(), 2);
+    TestEqual(TEXT("and no empty names"), Streams.FindRef(TEXT("studio-b")), TArray<FString>{TEXT("Actor0")});
+
+    Access.Receive(TEXT(R"({"type":"liveSubjects","clientId":"hub","subjects":["Actor2"]})"));
+    TestTrue(TEXT("a hub that names no streams"), Access.Sync->GetHubLiveSubjects(Streams));
+    TestEqual(TEXT("reads as one with no name"), Streams.FindRef(FString()), TArray<FString>{TEXT("Actor2")});
+    TestEqual(TEXT("replacing what it said before"), Streams.Num(), 1);
     return true;
 }
 
