@@ -638,6 +638,60 @@ void ULoomaSceneSyncSubsystem::HandlePose(const TSharedPtr<FJsonObject>& Msg)
     LivePoses.FindOrAdd(NodeId).Push(Pose, FPlatformTime::Seconds());
 }
 
+void ULoomaSceneSyncSubsystem::HandleLiveSubjects(const TSharedPtr<FJsonObject>& Msg)
+{
+    // Only the hub's are kept. Another client's subjects are that client's to
+    // drive, and nothing here acts on them; a picker in this client would.
+    FString From;
+    const TArray<TSharedPtr<FJsonValue>>* Subjects = nullptr;
+    if (!Msg->TryGetStringField(TEXT("clientId"), From) || From != LoomaLiveLinkHubSource
+        || !Msg->TryGetArrayField(TEXT("subjects"), Subjects))
+    {
+        return;
+    }
+    auto Names = [](const TArray<TSharedPtr<FJsonValue>>& Values) {
+        TArray<FString> Out;
+        for (const TSharedPtr<FJsonValue>& Value : Values)
+        {
+            FString Name;
+            if (Value.IsValid() && Value->TryGetString(Name) && !Name.IsEmpty())
+            {
+                Out.AddUnique(Name);
+            }
+        }
+        return Out;
+    };
+    HubLiveSubjects.Reset();
+    const TSharedPtr<FJsonObject>* Streams = nullptr;
+    if (Msg->TryGetObjectField(TEXT("streams"), Streams))
+    {
+        for (const TPair<FString, TSharedPtr<FJsonValue>>& Stream : (*Streams)->Values)
+        {
+            const TArray<TSharedPtr<FJsonValue>>* InStream = nullptr;
+            if (Stream.Value.IsValid() && Stream.Value->TryGetArray(InStream))
+            {
+                HubLiveSubjects.Add(Stream.Key, Names(*InStream));
+            }
+        }
+    }
+    else
+    {
+        HubLiveSubjects.Add(FString(), Names(*Subjects)); // a hub that names no streams
+    }
+    HubLiveSubjectsAt = FPlatformTime::Seconds();
+}
+
+bool ULoomaSceneSyncSubsystem::GetHubLiveSubjects(TMap<FString, TArray<FString>>& Out) const
+{
+    Out.Reset();
+    if (HubLiveSubjectsAt < 0.0 || FPlatformTime::Seconds() - HubLiveSubjectsAt > HubLiveSubjectsTtlSeconds)
+    {
+        return false;
+    }
+    Out = HubLiveSubjects;
+    return Out.Num() > 0;
+}
+
 bool ULoomaSceneSyncSubsystem::GetLivePose(const FString& NodeId, FLoomaLivePose& Out) const
 {
     const FLoomaLivePoseBuffer* Buffer = LivePoses.Find(NodeId);
@@ -665,17 +719,36 @@ bool ULoomaSceneSyncSubsystem::GetLivePoseTiming(const FString& NodeId, double& 
 
 bool ULoomaSceneSyncSubsystem::SetLiveLinkSubject(ALoomaSyncedActor* Actor, const FString& Subject)
 {
+    return SendLiveLinkComponent(Actor, Subject, FString(), FString());
+}
+
+bool ULoomaSceneSyncSubsystem::SetHubLiveLinkSubject(ALoomaSyncedActor* Actor, const FString& Stream,
+                                                     const FString& Subject)
+{
+    return SendLiveLinkComponent(Actor, Subject, LoomaLiveLinkHubSource, Stream);
+}
+
+bool ULoomaSceneSyncSubsystem::SendLiveLinkComponent(ALoomaSyncedActor* Actor, const FString& Subject,
+                                                     const FString& Source, const FString& Stream)
+{
     if (!IsValid(Actor) || Actor->Id.IsEmpty() || !IsSyncConnected())
     {
         return false;
     }
-    if (Actor->GetComponents().LiveLinkSubject == Subject)
+    // Already so: an edit that changes nothing is not worth an undo step. The
+    // same subject from somebody else is a change, though: Unreal's own Actor0
+    // and the hub's are two performers (HAM-329).
+    const FLoomaNodeComponents& Now = Actor->GetComponents();
+    const FString WantedStream = Source.IsEmpty() ? FString() : Stream;
+    if (Now.LiveLinkSubject == Subject
+        && (Subject.IsEmpty() || (Now.LiveLinkSource == Source && Now.LiveLinkStream == WantedStream)))
     {
-        return true; // already so; an edit that changes nothing is not worth an undo step
+        return true;
     }
     TSharedRef<FJsonObject> Node = MakeShared<FJsonObject>();
     Node->SetStringField(TEXT("id"), Actor->Id);
-    Node->SetArrayField(TEXT("components"), LoomaWithLiveLinkSubject(Actor->WireComponents, Subject));
+    Node->SetArrayField(TEXT("components"),
+                        LoomaWithLiveLinkSubject(Actor->WireComponents, Subject, Source, WantedStream));
     TSharedRef<FJsonObject> Msg = MakeShared<FJsonObject>();
     Msg->SetStringField(TEXT("type"), TEXT("patch"));
     TArray<TSharedPtr<FJsonValue>> Nodes;
@@ -2738,6 +2811,10 @@ void ULoomaSceneSyncSubsystem::OnRawMessage(const FString& Text)
     else if (Type == TEXT("pose"))
     {
         HandlePose(Msg);
+    }
+    else if (Type == TEXT("liveSubjects"))
+    {
+        HandleLiveSubjects(Msg);
     }
     else if (Type == TEXT("generation"))
     {

@@ -204,6 +204,9 @@ struct FLoomaAnimationSpec
 };
 
 /** Every component on one node, keyed by type. */
+/** The `source` of a `livelink` component the backend's own Live Link drives (HAM-328, HAM-329). */
+inline constexpr const TCHAR* LoomaLiveLinkHubSource = TEXT("hub");
+
 USTRUCT(BlueprintType)
 struct FLoomaNodeComponents
 {
@@ -248,6 +251,27 @@ struct FLoomaNodeComponents
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
     FString LiveLinkSubject;
 
+    /**
+     * Who has LiveLinkSubject (HAM-329): empty for a client, as before, or
+     * LoomaLiveLinkHubSource for the backend's own Live Link, which then drives
+     * the node itself and drops any client's poses for it. A client must not
+     * drive a hub node from its own Live Link even if it has a subject of that
+     * name, because that is another performer; it shows the hub's poses instead.
+     */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    FString LiveLinkSource;
+
+    /**
+     * Which of the hub's streams LiveLinkSubject is in, when the hub has it: one
+     * mocap service, named in the backend's /admin (HAM-328). Empty means
+     * whichever of the hub's streams has a subject of that name.
+     */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    FString LiveLinkStream;
+
+    /** Whether the backend's hub, not a client, drives this node. */
+    bool IsLiveLinkFromHub() const { return !LiveLinkSubject.IsEmpty() && LiveLinkSource == LoomaLiveLinkHubSource; }
+
     /** Types this build does not understand. Logged once each; never rendered, never dropped. */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
     TArray<FString> UnknownTypes;
@@ -262,7 +286,8 @@ struct FLoomaNodeComponents
             && bHasMaterial == Other.bHasMaterial && (!bHasMaterial || Material == Other.Material)
             && bHasLight == Other.bHasLight && (!bHasLight || Light == Other.Light)
             && bHasAnimation == Other.bHasAnimation && (!bHasAnimation || Animation == Other.Animation)
-            && LiveLinkSubject == Other.LiveLinkSubject;
+            && LiveLinkSubject == Other.LiveLinkSubject && LiveLinkSource == Other.LiveLinkSource
+            && LiveLinkStream == Other.LiveLinkStream;
     }
     bool operator!=(const FLoomaNodeComponents& Other) const { return !(*this == Other); }
 };
@@ -297,6 +322,12 @@ LOOMASCENESYNC_API TSharedRef<FJsonObject> LoomaMakeModelComponent(const FString
  * when `Subject` is empty (HAM-316). Everything else is carried over as it came,
  * including components this client does not understand: a component edit is the
  * node's WHOLE array, so whatever is left out of it is deleted for everybody.
+ *
+ * `Source` and `Stream` (HAM-329) say who has the subject: empty for a client,
+ * which is what the component gets when they are left out, or the hub
+ * (LoomaLiveLinkHubSource) and one of its streams. The component is written
+ * whole, so choosing a client's subject takes a previous source and stream off.
  */
 LOOMASCENESYNC_API TArray<TSharedPtr<FJsonValue>> LoomaWithLiveLinkSubject(
-    const TArray<TSharedPtr<FJsonValue>>& Components, const FString& Subject);
+    const TArray<TSharedPtr<FJsonValue>>& Components, const FString& Subject,
+    const FString& Source = FString(), const FString& Stream = FString());
