@@ -2,10 +2,12 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
+#include "LoomaSceneAudio.h"
 #include "LoomaSceneComponents.h"
 #include "LoomaSyncedActor.generated.h"
 
 class UAnimSequence;
+class UAudioComponent;
 class UglTFRuntimeAsset;
 class ULightComponent;
 class ULoomaSceneSyncSubsystem;
@@ -22,10 +24,14 @@ struct FLoomaNodeRenderContext
     /** Absolute GLB url for the `model` component, rebuilt from its assetId. */
     FString ModelUrl;
 
+    /** Absolute WAV url for the `audio` component, rebuilt from its assetId the same way. */
+    FString SoundUrl;
+
     /**
-     * Who downloads that GLB: the subsystem's throttled queue (RequestGlb). Left
-     * null, a `model` is logged and left unbuilt rather than fetched unthrottled —
-     * bypassing the queue is exactly what starved the HTTP pool.
+     * Who downloads that GLB, and that WAV: the subsystem's throttled queue
+     * (RequestGlb, RequestSound). Left null, a `model` or an `audio` is logged and
+     * left unbuilt rather than fetched unthrottled — bypassing the queue is exactly
+     * what starved the HTTP pool.
      */
     ULoomaSceneSyncSubsystem* GlbLoader = nullptr;
 
@@ -53,7 +59,8 @@ struct FLoomaNodeRenderContext
  *     ├─ CharacterComponent         `model`    — the same, when the GLB is skinned;
  *     │                                          `animation` picks its clip
  *     ├─ MeshComponent              `mesh`     — an engine primitive, `material` on it
- *     └─ LightComponent             `light`    — point / spot / directional
+ *     ├─ LightComponent             `light`    — point / spot / directional
+ *     └─ AudioComponent             `audio`    — a datalake sound, played from the node
  *
  * That is what makes an empty object (no components at all), a light-only node, and
  * a node carrying both a mesh and a light equally expressible. An empty node is not
@@ -122,6 +129,17 @@ public:
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
     TObjectPtr<ULightComponent> LightComponent;
 
+    /**
+     * The `audio` component's source. Null unless the node has one. It has no sound
+     * until the WAV has downloaded; SoundWave is that sound, once it has.
+     */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    TObjectPtr<UAudioComponent> AudioComponent;
+
+    /** The decoded sound AudioComponent plays: mono while the source is spatial. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    TObjectPtr<ULoomaSoundWave> SoundWave;
+
     /** Dynamic instance carrying the `material` component's colour. Primitives only. */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
     TObjectPtr<UMaterialInstanceDynamic> MeshMaterial;
@@ -167,6 +185,16 @@ public:
     /** The GLB url this node wants (built or in flight); empty if none. */
     const FString& GetWantedModelUrl() const { return LoadedModelUrl; }
 
+    /**
+     * The queue's answer for the `audio` component's WAV, as OnGlbDownloaded is for
+     * the model: the bytes, or null once every retry has failed. Stale answers are
+     * dropped the same way.
+     */
+    void OnSoundDownloaded(const FString& Url, const TArray<uint8>* Bytes);
+
+    /** The WAV url this node wants (playing or in flight); empty if none. */
+    const FString& GetWantedSoundUrl() const { return LoadedSoundUrl; }
+
     /** Parent-local pose — what the wire carries. Equals the world pose for a root. */
     FTransform GetLocalTransform() const;
     void SetLocalTransform(const FTransform& Local);
@@ -186,10 +214,17 @@ private:
     void ApplyLight(const FLoomaNodeComponents& Next, const FLoomaNodeRenderContext& Context);
     /** Play, switch or stop the character's clip to match `Next`'s `animation`. */
     void ApplyAnimation(const FLoomaNodeComponents& Next);
+    /** Create, fade, play or stop the `audio` component's source to match `Next`. */
+    void ApplyAudio(const FLoomaNodeComponents& Next, const FLoomaNodeRenderContext& Context);
+    /** Volume, pitch and fade: everything about `Spec` that changes a sound as it plays. */
+    void ApplyAudioSettings(const FLoomaAudioSpec& Spec);
+    /** Make SoundWave from DecodedSound, as `Spec` plays it, and hand it to AudioComponent. */
+    void BuildSoundWave(const FLoomaAudioSpec& Spec);
 
     /** Create a mesh component in `Slot` on first use, attached to SceneRoot. */
     UStaticMeshComponent* EnsureMeshComponent(TObjectPtr<UStaticMeshComponent>& Slot);
     USkeletalMeshComponent* EnsureCharacterComponent();
+    UAudioComponent* EnsureAudioComponent();
 
     /** Build whichever mesh the parsed GLB calls for; false if neither could be built. */
     bool BuildModel(UglTFRuntimeAsset* Asset);
@@ -208,6 +243,18 @@ private:
      * next time the node is applied (a patch, a reconnect's `scene`) asks again.
      */
     FString LoadedModelUrl;
+
+    /**
+     * The WAV url the `audio` component's sound came from or is being fetched from,
+     * kept and cleared as LoadedModelUrl is.
+     */
+    FString LoadedSoundUrl;
+
+    /**
+     * The sound as it was downloaded, kept so a change of `spatial` can remake the
+     * wave in mono or stereo without fetching it again.
+     */
+    FLoomaDecodedSound DecodedSound;
 
     /** The download queue, captured from the last ApplyComponents. */
     TWeakObjectPtr<ULoomaSceneSyncSubsystem> GlbLoader;

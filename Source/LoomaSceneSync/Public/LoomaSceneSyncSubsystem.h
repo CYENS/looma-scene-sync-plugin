@@ -1281,6 +1281,14 @@ public:
      */
     void RequestGlb(ALoomaSyncedActor& Actor, const FString& Url);
 
+    /**
+     * Fetch an `audio` component's WAV for `Actor`, through the same queue and on the
+     * same terms as a GLB: the same host, so the same pool. The bytes (or null) arrive
+     * on ALoomaSyncedActor::OnSoundDownloaded. A node's sound and its model are queued
+     * independently, so one never replaces the other.
+     */
+    void RequestSound(ALoomaSyncedActor& Actor, const FString& Url);
+
     /** GLB downloads waiting for a slot (including ones backing off before a retry). */
     int32 GetGlbQueueDepth() const { return GlbQueue.Num(); }
 
@@ -1299,6 +1307,7 @@ private:
     // socket or restoring a session. Production callers use the public scene API.
     friend struct FLoomaBorderRefreshTestFixture;
     friend struct FLoomaLivePoseTestAccess;
+    friend struct FLoomaAudioTestAccess;
 #endif
 
     void Connect();
@@ -1612,11 +1621,13 @@ private:
      */
     FLoomaNodeRenderContext MakeRenderContext(const FLoomaNodeComponents& Components);
 
-    /** One GLB download, queued or in flight. */
+    /** One GLB download, queued or in flight, or one WAV. */
     struct FGlbFetch
     {
         TWeakObjectPtr<ALoomaSyncedActor> Actor;
         FString Url;
+        /** An `audio` component's WAV rather than a `model`'s GLB. */
+        bool bSound = false;
         /** Retries already spent on this url. */
         int32 Retries = 0;
         /** FPlatformTime::Seconds() before which a retry waits out its backoff. */
@@ -1629,8 +1640,12 @@ private:
     void StartGlbFetch(FGlbFetch Fetch);
     /** One attempt finished: deliver, re-queue with backoff, or give up. */
     void FinishGlbFetch(const FGlbFetch& Fetch, const TSharedPtr<IHttpResponse, ESPMode::ThreadSafe>& Response);
+    /** Queue `Url` for `Actor`, replacing its queued request of the same kind. */
+    void EnqueueFetch(ALoomaSyncedActor& Actor, const FString& Url, bool bSound);
     /** True while `Fetch`'s actor still exists and still wants `Fetch.Url`. */
     static bool IsGlbFetchWanted(const FGlbFetch& Fetch);
+    /** The disk cache for `Fetch`'s kind of file: the model cache, or none for a sound. */
+    FLoomaGlbCache* GetCacheFor(const FGlbFetch& Fetch);
     /** Unbind and cancel every in-flight download, and forget the queue. */
     void CancelGlbDownloads();
     /** The backend-relative GLB path a *web* peer loads, for a `model` we put on the wire. */

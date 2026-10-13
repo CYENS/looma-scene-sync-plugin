@@ -1,6 +1,7 @@
 #include "LoomaSyncedActor.h"
 
 #include "Animation/AnimSequence.h"
+#include "Components/AudioComponent.h"
 #include "Components/DirectionalLightComponent.h"
 #include "Components/LocalLightComponent.h"
 #include "Components/PointLightComponent.h"
@@ -139,6 +140,7 @@ void ALoomaSyncedActor::ApplyComponents(const FLoomaNodeComponents& Next, const 
     ApplyMesh(Next);
     ApplyMaterial(Next);
     ApplyLight(Next, Context);
+    ApplyAudio(Next, Context);
     // After ApplyModel. If the character is not built yet this is a no-op, and
     // BuildCharacter applies the clip itself once it is — so a clip chosen before the
     // GLB arrives still plays when it does.
@@ -383,6 +385,182 @@ void ALoomaSyncedActor::ApplyLight(const FLoomaNodeComponents& Next, const FLoom
     // pitch of −90° turns +X into −Z. A point light is radial and needs no aim.
     const bool bAimed = Spec.LightType != ELoomaLightType::Point;
     Light->SetRelativeRotation(bAimed ? FRotator(-90.0f, 0.0f, 0.0f) : FRotator::ZeroRotator);
+}
+
+void ALoomaSyncedActor::ApplyAudio(const FLoomaNodeComponents& Next, const FLoomaNodeRenderContext& Context)
+{
+    if (!Next.bHasAudio || Next.Audio.AssetId.IsEmpty() || Context.SoundUrl.IsEmpty())
+    {
+        DestroySlot(AudioComponent); // which stops it
+        SoundWave = nullptr;
+        DecodedSound = FLoomaDecodedSound();
+        LoadedSoundUrl.Reset();
+        return;
+    }
+
+    GlbLoader = Context.GlbLoader;
+    if (!EnsureAudioComponent())
+    {
+        return;
+    }
+    const FLoomaAudioSpec& Spec = Next.Audio;
+
+    if (Context.SoundUrl != LoadedSoundUrl)
+    {
+        // A different sound. The old one stops now, rather than playing on until the
+        // new one arrives; OnSoundDownloaded starts the new one as the node then says.
+        AudioComponent->Stop();
+        AudioComponent->SetSound(nullptr);
+        SoundWave = nullptr;
+        DecodedSound = FLoomaDecodedSound();
+        LoadedSoundUrl = Context.SoundUrl;
+        if (ULoomaSceneSyncSubsystem* Loader = GlbLoader.Get())
+        {
+            Loader->RequestSound(*this, Context.SoundUrl);
+        }
+        else
+        {
+            UE_LOG(LogLoomaSync, Warning, TEXT("Node '%s': no loader to fetch %s — sound left silent"),
+                *Id, *Context.SoundUrl);
+            LoadedSoundUrl.Reset();
+        }
+        return;
+    }
+    if (!SoundWave)
+    {
+        return; // still downloading
+    }
+
+    const bool bHad = Components.bHasAudio;
+    const FLoomaAudioSpec& Was = Components.Audio;
+    // Spatial or not is how Unreal sets the voice up (3D or 2D, mono or as recorded),
+    // which takes effect from a start; the browser rebuilds its source for it too.
+    const bool bRebuild = bHad && Was.bSpatial != Spec.bSpatial;
+    if (bRebuild)
+    {
+        BuildSoundWave(Spec);
+    }
+    else
+    {
+        SoundWave->SetLooping(Spec.bLoop); // live: see ULoomaSoundWave
+        ApplyAudioSettings(Spec);
+    }
+
+    if (!Spec.bPlaying)
+    {
+        AudioComponent->Stop();
+    }
+    else if (bRebuild || !bHad || !Was.bPlaying)
+    {
+        // A sound starts when `playing` turns true, from the beginning. Any other edit
+        // (volume, a fade) leaves it where it is, and leaves a one-shot that has
+        // finished finished.
+        AudioComponent->Play();
+    }
+}
+
+void ALoomaSyncedActor::ApplyAudioSettings(const FLoomaAudioSpec& Spec)
+{
+    UAudioComponent* Audio = AudioComponent.Get();
+    if (!Audio)
+    {
+        return;
+    }
+    Audio->SetVolumeMultiplier(Spec.Volume);
+    Audio->SetPitchMultiplier(Spec.Pitch);
+    Audio->bAllowSpatialization = Spec.bSpatial;
+    if (Spec.bSpatial)
+    {
+        // Sets bOverrideAttenuation, and reaches a sound already playing.
+        Audio->AdjustAttenuation(LoomaMakeAttenuation(Spec));
+    }
+    else
+    {
+        // No attenuation at all: heard at `volume` wherever the listener is.
+        Audio->bOverrideAttenuation = false;
+        Audio->AttenuationSettings = nullptr;
+    }
+}
+
+void ALoomaSyncedActor::BuildSoundWave(const FLoomaAudioSpec& Spec)
+{
+    UAudioComponent* Audio = AudioComponent.Get();
+    if (!Audio || !DecodedSound.IsValid())
+    {
+        return;
+    }
+    // A wave per node, not one per sound: each node plays it with its own `loop`.
+    ULoomaSoundWave* Wave = NewObject<ULoomaSoundWave>(this);
+    Wave->SetSound(Spec.bSpatial ? LoomaDownmixToMono(DecodedSound) : DecodedSound);
+    Wave->SetLooping(Spec.bLoop);
+    Audio->Stop();
+    Audio->SetSound(Wave);
+    SoundWave = Wave;
+    ApplyAudioSettings(Spec);
+}
+
+void ALoomaSyncedActor::OnSoundDownloaded(const FString& Url, const TArray<uint8>* Bytes)
+{
+    if (!IsValid(this))
+    {
+        return;
+    }
+    if (Url != LoadedSoundUrl)
+    {
+        UE_LOG(LogLoomaSync, Verbose, TEXT("Node '%s': dropping stale sound %s (now wants %s)"),
+            *Id, *Url, LoadedSoundUrl.IsEmpty() ? TEXT("no sound") : *LoadedSoundUrl);
+        return;
+    }
+
+    FLoomaDecodedSound Decoded;
+    FString Why = TEXT("download gave up");
+    if (!Bytes || !LoomaDecodeWav(*Bytes, Decoded, &Why))
+    {
+        // Forgotten, so the next apply of this node asks again, as for a model.
+        UE_LOG(LogLoomaSync, Warning, TEXT("Node '%s': no sound from %s (%s)"), *Id, *Url, *Why);
+        LoadedSoundUrl.Reset();
+        return;
+    }
+    if (!Components.bHasAudio || !AudioComponent)
+    {
+        return;
+    }
+
+    DecodedSound = MoveTemp(Decoded);
+    const FLoomaAudioSpec& Spec = Components.Audio;
+    UE_LOG(LogLoomaSync, Log, TEXT("Node '%s': sound %s, %.1f s, %d channel(s) at %d Hz%s"),
+        *Id, *Spec.AssetId, DecodedSound.Duration(), DecodedSound.NumChannels, DecodedSound.SampleRate,
+        Spec.bPlaying ? TEXT(", playing") : TEXT(""));
+    BuildSoundWave(Spec);
+    if (Spec.bPlaying)
+    {
+        AudioComponent->Play();
+    }
+}
+
+UAudioComponent* ALoomaSyncedActor::EnsureAudioComponent()
+{
+    if (UAudioComponent* Existing = AudioComponent.Get())
+    {
+        return Existing;
+    }
+    // NAME_None for the same reason as a light: a removed component keeps its name
+    // until the next GC.
+    UAudioComponent* Component = NewObject<UAudioComponent>(this, NAME_None);
+    if (!Component)
+    {
+        return nullptr;
+    }
+    // Nothing to play until the sound arrives, and a one-shot that has finished keeps
+    // its component, to start again when `playing` next turns true.
+    Component->bAutoActivate = false;
+    Component->bAutoDestroy = false;
+    Component->SetMobility(EComponentMobility::Movable);
+    Component->SetupAttachment(SceneRoot);
+    Component->RegisterComponent();
+    AddInstanceComponent(Component);
+    AudioComponent = Component;
+    return Component;
 }
 
 UStaticMeshComponent* ALoomaSyncedActor::EnsureMeshComponent(TObjectPtr<UStaticMeshComponent>& Slot)
