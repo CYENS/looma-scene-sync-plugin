@@ -81,6 +81,25 @@ public:
     FString WebAssetPrefix = TEXT("/api");
 
     /**
+     * Keep downloaded models under `Saved/LoomaSceneSync/GlbCache`, so each is
+     * downloaded once rather than on every launch. The backend is still asked about
+     * every model and answers "unchanged" in a fraction of a second, so a model
+     * replaced on the backend is picked up; see FLoomaGlbCache. `Looma.ClearModelCache`
+     * empties it.
+     */
+    UPROPERTY(EditAnywhere, Config, Category = "Backend", meta = (DisplayName = "Cache Models on Disk"))
+    bool bCacheModels = true;
+
+    /**
+     * How much disk the model cache may use. Past it, the models used longest ago are
+     * deleted. 0 means no limit. Read when the cache is first used, so a change
+     * applies from the next launch.
+     */
+    UPROPERTY(EditAnywhere, Config, Category = "Backend",
+        meta = (DisplayName = "Model Cache Limit (MB)", ClampMin = "0", UIMin = "0", EditCondition = "bCacheModels"))
+    int32 ModelCacheLimitMB = 4096;
+
+    /**
      * The name to *suggest* for this client in the room roster, when it is connected
      * as a guest. Empty — the default — suggests nothing, and the hub falls back to
      * `Guest-xxxxxx` built from the first six characters of our clientId.

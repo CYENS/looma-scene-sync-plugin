@@ -12,6 +12,8 @@
 
 class IWebSocket;
 class IHttpRequest;
+class IHttpResponse;
+class FLoomaGlbCache;
 class FJsonObject;
 class FJsonValue;
 class ULoomaGenerationHandle;
@@ -1259,6 +1261,12 @@ public:
     /** GLB downloads currently on the wire. */
     int32 GetGlbDownloadsInFlight() const { return GlbInFlight.Num(); }
 
+    /**
+     * The on-disk model cache, or null while Project Settings has it switched off.
+     * Created on first use.
+     */
+    FLoomaGlbCache* GetGlbCache();
+
 private:
 #if WITH_DEV_AUTOMATION_TESTS
     // The fixture seeds a transient scene and feeds wire frames without opening a
@@ -1589,7 +1597,7 @@ private:
     void PumpGlbQueue();
     void StartGlbFetch(FGlbFetch Fetch);
     /** One attempt finished: deliver, re-queue with backoff, or give up. */
-    void FinishGlbFetch(const FGlbFetch& Fetch, bool bConnected, int32 Code, const TArray<uint8>* Content);
+    void FinishGlbFetch(const FGlbFetch& Fetch, const TSharedPtr<IHttpResponse, ESPMode::ThreadSafe>& Response);
     /** True while `Fetch`'s actor still exists and still wants `Fetch.Url`. */
     static bool IsGlbFetchWanted(const FGlbFetch& Fetch);
     /** Unbind and cancel every in-flight download, and forget the queue. */
@@ -1952,4 +1960,6 @@ private:
     TArray<FGlbFetch> GlbQueue;
     /** GLB requests on the wire; held so Deinitialize can cancel them. */
     TArray<TSharedRef<IHttpRequest, ESPMode::ThreadSafe>> GlbInFlight;
+    /** See GetGlbCache. Shared only because the type is incomplete here. */
+    TSharedPtr<FLoomaGlbCache> GlbCache;
 };

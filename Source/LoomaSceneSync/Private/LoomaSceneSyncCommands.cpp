@@ -2,6 +2,7 @@
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"
 #include "HAL/IConsoleManager.h"
+#include "LoomaGlbCache.h"
 #include "LoomaSceneSyncLog.h"
 #include "LoomaSceneSyncSettings.h"
 #include "LoomaSceneSyncSubsystem.h"
@@ -14,6 +15,7 @@
  * of style.
  *
  *   Looma.Status / Looma.Reconnect            what the socket is doing, and do it again
+ *   Looma.ClearModelCache                     forget the models kept on disk
  *   Looma.Login / Logout / Whoami             the auth surface
  *   Looma.Scene [id | "name"]                 where this client is looking; a MESSAGE
  *   Looma.Performance [id [cue]]              which workspace; a RECONNECT
@@ -100,11 +102,37 @@ FAutoConsoleCommandWithWorld GLoomaStatusCommand(
             // a slow probe reads differently when this says the pool is busy.
             UE_LOG(LogLoomaSync, Display, TEXT("GLB downloads: %d in flight, %d waiting"),
                 Subsystem->GetGlbDownloadsInFlight(), Subsystem->GetGlbQueueDepth());
+            if (const FLoomaGlbCache* Cache = Subsystem->GetGlbCache())
+            {
+                UE_LOG(LogLoomaSync, Display, TEXT("Model cache: %.0f MB in %s"),
+                    Cache->GetSizeOnDisk() / (1024.0 * 1024.0), *Cache->GetDirectory());
+            }
+            else
+            {
+                UE_LOG(LogLoomaSync, Display, TEXT("Model cache: off (Project Settings > Plugins > Looma Scene Sync)"));
+            }
             return;
         }
         UE_LOG(LogLoomaSync, Display,
             TEXT("Looma Scene Sync: NOT RUNNING (no game instance) | configured backend %s"),
             *ULoomaSceneSyncSettings::Get().BackendUrl);
+    }));
+
+FAutoConsoleCommandWithWorld GLoomaClearModelCacheCommand(
+    TEXT("Looma.ClearModelCache"),
+    TEXT("Delete every model the Looma plugin keeps on disk. Models already in the level stay; ")
+    TEXT("the next load downloads each one again."),
+    FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* World) {
+        ULoomaSceneSyncSubsystem* Subsystem = FindLoomaSubsystem(World);
+        FLoomaGlbCache* Cache = Subsystem ? Subsystem->GetGlbCache() : nullptr;
+        if (!Cache)
+        {
+            UE_LOG(LogLoomaSync, Warning,
+                TEXT("Looma.ClearModelCache: nothing to clear — the plugin is not running, or the cache is off."));
+            return;
+        }
+        UE_LOG(LogLoomaSync, Display, TEXT("Model cache cleared: %.0f MB freed from %s"),
+            Cache->Clear() / (1024.0 * 1024.0), *Cache->GetDirectory());
     }));
 
 /**

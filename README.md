@@ -166,6 +166,8 @@ the module name — then regenerate project files and rebuild.
 | `LightIntensityScale` | `1.0` | Trim for the exposure difference between UE and three.js — not a unit conversion, see above |
 | `bBaseAlignModels` | `true` | Stand a `model`'s GLB on the node origin, as the web client does |
 | `WebAssetPrefix` | `/api` | The proxy prefix a *web* peer needs in front of `/static/...`, used to fill in the `url` of a `model` we spawn |
+| `bCacheModels` | `true` | Keep downloaded GLBs under `Saved/LoomaSceneSync/GlbCache`, so a model is downloaded once and not on every launch. The backend is still asked about each one (`If-None-Match`) and answers 304 when it has not changed, so a GLB replaced on the backend is picked up |
+| `ModelCacheLimitMB` | `4096` | Disk the model cache may use; past it the models used longest ago are deleted. `0` is no limit. Read when the cache is first used |
 | `GuestDisplayName` | *(empty)* | The name to suggest for this client in the room roster while connected as a guest. Empty suggests nothing and the hub falls back to `Guest-xxxxxx`. Ignored while logged in — see *Being named in the room* |
 | `RemoteSelectionCollection` | *(empty)* | The Material Parameter Collection remote clients' border colours are written into. **It has to live in your project** — the plugin ships no assets — so this is a soft path. Empty publishes no colours; the stencil is still written. See *Wiring the outline* |
 
@@ -183,6 +185,7 @@ the new section, which then wins.
 | Command | What it does |
 | --- | --- |
 | `Looma.Reconnect` | Drops the socket and connects again immediately, re-reading the settings. `ULoomaSceneSyncSubsystem::Reconnect`, also Blueprint-callable |
+| `Looma.ClearModelCache` | Deletes every GLB kept on disk. Models already in the level stay; the next load downloads each again. `Looma.Status` reports the cache's size and folder |
 | `Looma.Status` | Logs state (`CONNECTED` / `CONNECTING` / `DISCONNECTED (retry in Ns)` / `NO SOCKET` / `REFUSED (code), not retrying`), the hub URL actually in use, the REST base, the backend's auth state, node/job counts, the performance id and the active scene id — then `GET /health` and logs whether the backend answered, which separates "the socket is down" from "nothing is listening". The `/health` answer is also what refreshes the auth state, so this doubles as "ask the backend again" |
 | `Looma.Login <username> <password>` | Logs in over `POST /auth/login`. **Testing only** — the console echoes the password into the log and keeps it in the command history before the plugin sees a character of it. The real login is the `Login` Blueprint node behind a field that does not echo |
 | `Looma.Logout` | Forgets the token, then asks the backend to revoke it |
