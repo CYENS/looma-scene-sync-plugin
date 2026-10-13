@@ -16,6 +16,7 @@
 #include "LoomaAuthTypes.h"
 #include "LoomaGenerationHandle.h"
 #include "LoomaGenerationTypes.h"
+#include "LoomaGlbCache.h"
 #include "LoomaSceneComponents.h"
 #include "LoomaSceneSyncLog.h"
 #include "LoomaSceneSyncSettings.h"
@@ -3242,14 +3243,27 @@ void ULoomaSceneSyncSubsystem::StartGlbFetch(FGlbFetch Fetch)
     // ever gated, this is the seam, and ApplyAuthHeader is the one spelling of it.
     Request->SetTimeout(GlbDownloadTimeout);
     Request->SetActivityTimeout(GlbActivityTimeout);
+    // A copy from an earlier session: ask only whether it is still the file the
+    // server has. Unchanged is a 304 with no body, a fraction of a second where the
+    // download was a quarter of a minute.
+    FString ETag, LastModified;
+    if (FLoomaGlbCache* Cache = GetGlbCache(); Cache && Cache->FindValidators(Fetch.Url, ETag, LastModified))
+    {
+        if (!ETag.IsEmpty())
+        {
+            Request->SetHeader(TEXT("If-None-Match"), ETag);
+        }
+        if (!LastModified.IsEmpty())
+        {
+            Request->SetHeader(TEXT("If-Modified-Since"), LastModified);
+        }
+    }
     Request->OnProcessRequestComplete().BindWeakLambda(this,
         [this, Fetch](FHttpRequestPtr Req, FHttpResponsePtr Resp, bool bConnected) {
             GlbInFlight.RemoveAll([&Req](const TSharedRef<IHttpRequest, ESPMode::ThreadSafe>& InFlight) {
                 return &InFlight.Get() == Req.Get();
             });
-            const bool bHasResponse = bConnected && Resp.IsValid();
-            FinishGlbFetch(Fetch, bHasResponse, bHasResponse ? Resp->GetResponseCode() : 0,
-                bHasResponse ? &Resp->GetContent() : nullptr);
+            FinishGlbFetch(Fetch, bConnected ? Resp : nullptr);
             PumpGlbQueue(); // a slot just freed
         });
     GlbInFlight.Add(Request);
@@ -3258,9 +3272,36 @@ void ULoomaSceneSyncSubsystem::StartGlbFetch(FGlbFetch Fetch)
     Request->ProcessRequest();
 }
 
-void ULoomaSceneSyncSubsystem::FinishGlbFetch(const FGlbFetch& Fetch, bool bConnected, int32 Code,
-    const TArray<uint8>* Content)
+void ULoomaSceneSyncSubsystem::FinishGlbFetch(const FGlbFetch& Fetch, const FHttpResponsePtr& Response)
 {
+    const bool bConnected = Response.IsValid();
+    const int32 Code = bConnected ? Response->GetResponseCode() : 0;
+    const TArray<uint8>* Content = bConnected ? &Response->GetContent() : nullptr;
+    FLoomaGlbCache* Cache = GetGlbCache();
+    TArray<uint8> Cached;
+    bool bFromCache = false;
+
+    if (Cache && Code == EHttpResponseCodes::NotModified)
+    {
+        bFromCache = Cache->Load(Fetch.Url, Cached);
+        if (!bFromCache)
+        {
+            // The entry went between asking and being answered (a second viewer
+            // pruning, a file deleted by hand). Without it the next request carries no
+            // validator and gets the whole file; not a failure, so no retry is spent.
+            Cache->Remove(Fetch.Url);
+            GlbQueue.Add(Fetch);
+            return;
+        }
+        Content = &Cached;
+    }
+    else if (Cache && bConnected && EHttpResponseCodes::IsOk(Code) && Content->Num() > 0)
+    {
+        // Before the check below: a node that stopped wanting this model while it was
+        // on the wire may want it again, and the bytes are already paid for.
+        Cache->Store(Fetch.Url, *Content, Response->GetHeader(TEXT("ETag")), Response->GetHeader(TEXT("Last-Modified")));
+    }
+
     ALoomaSyncedActor* Actor = Fetch.Actor.Get();
     if (!IsGlbFetchWanted(Fetch))
     {
@@ -3271,9 +3312,10 @@ void ULoomaSceneSyncSubsystem::FinishGlbFetch(const FGlbFetch& Fetch, bool bConn
 
     // A 2xx with a body. glTFLoadAssetFromUrl never looked at the status, so a 404's
     // HTML went to the GLB parser; checking here also tells "not there" from "not now".
-    if (bConnected && EHttpResponseCodes::IsOk(Code) && Content && Content->Num() > 0)
+    if (bFromCache || (bConnected && EHttpResponseCodes::IsOk(Code) && Content->Num() > 0))
     {
-        UE_LOG(LogLoomaSync, Log, TEXT("GLB downloaded for '%s': %.1f MB in %.1f s (%d waiting, %d/%d downloading)"),
+        UE_LOG(LogLoomaSync, Log, TEXT("GLB %s for '%s': %.1f MB in %.1f s (%d waiting, %d/%d downloading)"),
+            bFromCache ? TEXT("unchanged, read from cache") : TEXT("downloaded"),
             *Actor->Id, Content->Num() / (1024.0 * 1024.0), Seconds,
             GlbQueue.Num(), GlbInFlight.Num(), MaxConcurrentGlbDownloads);
         Actor->OnGlbDownloaded(Fetch.Url, Content);
@@ -3303,9 +3345,40 @@ void ULoomaSceneSyncSubsystem::FinishGlbFetch(const FGlbFetch& Fetch, bool bConn
         return;
     }
 
+    // The server could not be asked, but an earlier session's copy is on disk. It may
+    // be out of date; that is better than a node with nothing in it, and the next
+    // load asks again.
+    if (bRetryable && Cache && Cache->Load(Fetch.Url, Cached))
+    {
+        UE_LOG(LogLoomaSync, Warning, TEXT("GLB for '%s' failed (%s): %s — using the cached copy, unchecked"),
+            *Actor->Id, *Why, *Fetch.Url);
+        Actor->OnGlbDownloaded(Fetch.Url, &Cached);
+        MarkBordersDirty();
+        return;
+    }
+
     UE_LOG(LogLoomaSync, Warning, TEXT("GLB for '%s' failed (%s): %s — giving up after %d attempt(s)"),
         *Actor->Id, *Why, *Fetch.Url, Fetch.Retries + 1);
     Actor->OnGlbDownloaded(Fetch.Url, nullptr);
+}
+
+FLoomaGlbCache* ULoomaSceneSyncSubsystem::GetGlbCache()
+{
+    const ULoomaSceneSyncSettings& Settings = ULoomaSceneSyncSettings::Get();
+    if (!Settings.bCacheModels)
+    {
+        return nullptr;
+    }
+    if (!GlbCache.IsValid())
+    {
+        GlbCache = MakeShared<FLoomaGlbCache>(
+            FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir() / TEXT("LoomaSceneSync") / TEXT("GlbCache")),
+            static_cast<int64>(Settings.ModelCacheLimitMB) * 1024 * 1024);
+        GlbCache->Prune();
+        UE_LOG(LogLoomaSync, Log, TEXT("Model cache: %.0f MB in %s"),
+            GlbCache->GetSizeOnDisk() / (1024.0 * 1024.0), *GlbCache->GetDirectory());
+    }
+    return GlbCache.Get();
 }
 
 void ULoomaSceneSyncSubsystem::CancelGlbDownloads()
