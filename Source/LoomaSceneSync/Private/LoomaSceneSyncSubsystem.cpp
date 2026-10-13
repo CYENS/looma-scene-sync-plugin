@@ -3074,10 +3074,11 @@ void ULoomaSceneSyncSubsystem::UpsertNode(const TSharedPtr<FJsonObject>& Node)
         UE_LOG(LogLoomaSync, Log, TEXT("Node '%s' (%s)%s: %s at local %s"),
             *Actor->DisplayName, *NodeId,
             ParentId.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" under %s"), *ParentId),
-            Components.IsEmpty() ? TEXT("empty (transform only)") : *FString::Printf(TEXT("%s%s%s"),
+            Components.IsEmpty() ? TEXT("empty (transform only)") : *FString::Printf(TEXT("%s%s%s%s"),
                 Components.bHasModel ? TEXT("model ") : TEXT(""),
                 Components.bHasMesh ? TEXT("mesh ") : TEXT(""),
-                Components.bHasLight ? TEXT("light") : TEXT("")),
+                Components.bHasLight ? TEXT("light ") : TEXT(""),
+                Components.bHasAudio ? TEXT("audio") : TEXT("")),
             *Local.GetLocation().ToString());
     }
 }
@@ -3166,6 +3167,12 @@ FLoomaNodeRenderContext ULoomaSceneSyncSubsystem::MakeRenderContext(const FLooma
         // browser's /api-proxied relative path, which a native client cannot use.
         Context.ModelUrl = FString::Printf(TEXT("%s/static/%s.glb"), *GetRestBase(), *Components.Model.AssetId);
     }
+    if (Components.bHasAudio && !Components.Audio.AssetId.IsEmpty())
+    {
+        // The same rule for a sound: every stored sound is `<assetId>.wav`
+        // (docs/scene-format.md, "The `audio` component").
+        Context.SoundUrl = FString::Printf(TEXT("%s/static/%s.wav"), *GetRestBase(), *Components.Audio.AssetId);
+    }
     return Context;
 }
 
@@ -3186,23 +3193,38 @@ FString ULoomaSceneSyncSubsystem::MakeWebAssetUrl(const FString& AssetId) const
 
 void ULoomaSceneSyncSubsystem::RequestGlb(ALoomaSyncedActor& Actor, const FString& Url)
 {
-    // One queued download per node: a newer `model` supersedes the one still waiting.
-    // One already on the wire is left to finish and is dropped as stale on arrival.
-    GlbQueue.RemoveAll([&Actor](const FGlbFetch& Queued) { return Queued.Actor.Get() == &Actor; });
+    EnqueueFetch(Actor, Url, /*bSound=*/false);
+}
+
+void ULoomaSceneSyncSubsystem::RequestSound(ALoomaSyncedActor& Actor, const FString& Url)
+{
+    EnqueueFetch(Actor, Url, /*bSound=*/true);
+}
+
+void ULoomaSceneSyncSubsystem::EnqueueFetch(ALoomaSyncedActor& Actor, const FString& Url, bool bSound)
+{
+    // One queued download per node and kind: a newer `model` supersedes the one still
+    // waiting, and a newer sound the sound. One already on the wire is left to finish
+    // and is dropped as stale on arrival.
+    GlbQueue.RemoveAll([&Actor, bSound](const FGlbFetch& Queued) {
+        return Queued.Actor.Get() == &Actor && Queued.bSound == bSound;
+    });
 
     FGlbFetch Fetch;
     Fetch.Actor = &Actor;
     Fetch.Url = Url;
+    Fetch.bSound = bSound;
     GlbQueue.Add(MoveTemp(Fetch));
-    UE_LOG(LogLoomaSync, Log, TEXT("GLB queued for '%s': %s (%d waiting, %d/%d downloading)"),
-        *Actor.Id, *Url, GlbQueue.Num(), GlbInFlight.Num(), MaxConcurrentGlbDownloads);
+    UE_LOG(LogLoomaSync, Log, TEXT("%s queued for '%s': %s (%d waiting, %d/%d downloading)"),
+        bSound ? TEXT("Sound") : TEXT("GLB"), *Actor.Id, *Url, GlbQueue.Num(), GlbInFlight.Num(),
+        MaxConcurrentGlbDownloads);
     PumpGlbQueue();
 }
 
 bool ULoomaSceneSyncSubsystem::IsGlbFetchWanted(const FGlbFetch& Fetch)
 {
     const ALoomaSyncedActor* Actor = Fetch.Actor.Get();
-    return IsValid(Actor) && Actor->GetWantedModelUrl() == Fetch.Url;
+    return IsValid(Actor) && (Fetch.bSound ? Actor->GetWantedSoundUrl() : Actor->GetWantedModelUrl()) == Fetch.Url;
 }
 
 void ULoomaSceneSyncSubsystem::PumpGlbQueue()
@@ -3247,7 +3269,7 @@ void ULoomaSceneSyncSubsystem::StartGlbFetch(FGlbFetch Fetch)
     // server has. Unchanged is a 304 with no body, a fraction of a second where the
     // download was a quarter of a minute.
     FString ETag, LastModified;
-    if (FLoomaGlbCache* Cache = GetGlbCache(); Cache && Cache->FindValidators(Fetch.Url, ETag, LastModified))
+    if (FLoomaGlbCache* Cache = GetCacheFor(Fetch); Cache && Cache->FindValidators(Fetch.Url, ETag, LastModified))
     {
         if (!ETag.IsEmpty())
         {
@@ -3277,7 +3299,8 @@ void ULoomaSceneSyncSubsystem::FinishGlbFetch(const FGlbFetch& Fetch, const FHtt
     const bool bConnected = Response.IsValid();
     const int32 Code = bConnected ? Response->GetResponseCode() : 0;
     const TArray<uint8>* Content = bConnected ? &Response->GetContent() : nullptr;
-    FLoomaGlbCache* Cache = GetGlbCache();
+    FLoomaGlbCache* Cache = GetCacheFor(Fetch);
+    const TCHAR* What = Fetch.bSound ? TEXT("Sound") : TEXT("GLB");
     TArray<uint8> Cached;
     bool bFromCache = false;
 
@@ -3305,7 +3328,8 @@ void ULoomaSceneSyncSubsystem::FinishGlbFetch(const FGlbFetch& Fetch, const FHtt
     ALoomaSyncedActor* Actor = Fetch.Actor.Get();
     if (!IsGlbFetchWanted(Fetch))
     {
-        UE_LOG(LogLoomaSync, Verbose, TEXT("GLB %s finished for a node that no longer wants it — dropped"), *Fetch.Url);
+        UE_LOG(LogLoomaSync, Verbose, TEXT("%s %s finished for a node that no longer wants it — dropped"),
+            What, *Fetch.Url);
         return;
     }
     const double Seconds = FPlatformTime::Seconds() - Fetch.Started;
@@ -3314,10 +3338,15 @@ void ULoomaSceneSyncSubsystem::FinishGlbFetch(const FGlbFetch& Fetch, const FHtt
     // HTML went to the GLB parser; checking here also tells "not there" from "not now".
     if (bFromCache || (bConnected && EHttpResponseCodes::IsOk(Code) && Content->Num() > 0))
     {
-        UE_LOG(LogLoomaSync, Log, TEXT("GLB %s for '%s': %.1f MB in %.1f s (%d waiting, %d/%d downloading)"),
-            bFromCache ? TEXT("unchanged, read from cache") : TEXT("downloaded"),
+        UE_LOG(LogLoomaSync, Log, TEXT("%s %s for '%s': %.1f MB in %.1f s (%d waiting, %d/%d downloading)"),
+            What, bFromCache ? TEXT("unchanged, read from cache") : TEXT("downloaded"),
             *Actor->Id, Content->Num() / (1024.0 * 1024.0), Seconds,
             GlbQueue.Num(), GlbInFlight.Num(), MaxConcurrentGlbDownloads);
+        if (Fetch.bSound)
+        {
+            Actor->OnSoundDownloaded(Fetch.Url, Content);
+            return; // a sound draws nothing, so no border moves
+        }
         Actor->OnGlbDownloaded(Fetch.Url, Content);
         // The mesh component may have just been created or swapped (a static slot
         // replaced by a skeletal one), so a remote selection border has to be re-laid
@@ -3340,8 +3369,8 @@ void ULoomaSceneSyncSubsystem::FinishGlbFetch(const FGlbFetch& Fetch, const FHtt
         const double Delay = GlbRetryBaseDelay * FMath::Pow(2.0, static_cast<double>(Retry.Retries - 1));
         Retry.NotBefore = FPlatformTime::Seconds() + Delay;
         GlbQueue.Add(MoveTemp(Retry));
-        UE_LOG(LogLoomaSync, Warning, TEXT("GLB for '%s' failed (%s): %s — retry %d/%d in %.0f s (%d waiting)"),
-            *Actor->Id, *Why, *Fetch.Url, Fetch.Retries + 1, MaxGlbRetries, Delay, GlbQueue.Num());
+        UE_LOG(LogLoomaSync, Warning, TEXT("%s for '%s' failed (%s): %s — retry %d/%d in %.0f s (%d waiting)"),
+            What, *Actor->Id, *Why, *Fetch.Url, Fetch.Retries + 1, MaxGlbRetries, Delay, GlbQueue.Num());
         return;
     }
 
@@ -3357,9 +3386,22 @@ void ULoomaSceneSyncSubsystem::FinishGlbFetch(const FGlbFetch& Fetch, const FHtt
         return;
     }
 
-    UE_LOG(LogLoomaSync, Warning, TEXT("GLB for '%s' failed (%s): %s — giving up after %d attempt(s)"),
-        *Actor->Id, *Why, *Fetch.Url, Fetch.Retries + 1);
+    UE_LOG(LogLoomaSync, Warning, TEXT("%s for '%s' failed (%s): %s — giving up after %d attempt(s)"),
+        What, *Actor->Id, *Why, *Fetch.Url, Fetch.Retries + 1);
+    if (Fetch.bSound)
+    {
+        Actor->OnSoundDownloaded(Fetch.Url, nullptr);
+        return;
+    }
     Actor->OnGlbDownloaded(Fetch.Url, nullptr);
+}
+
+FLoomaGlbCache* ULoomaSceneSyncSubsystem::GetCacheFor(const FGlbFetch& Fetch)
+{
+    // Models only. The cache is the models' (its setting, limit and console command
+    // all say so), and a sound is small enough that fetching it again costs little:
+    // a canonical WAV is about 1.7 MB for ten seconds of stereo.
+    return Fetch.bSound ? nullptr : GetGlbCache();
 }
 
 FLoomaGlbCache* ULoomaSceneSyncSubsystem::GetGlbCache()

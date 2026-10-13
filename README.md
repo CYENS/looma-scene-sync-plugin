@@ -20,7 +20,8 @@ The protocol it implements is specified in
 | `ULoomaSceneSyncSubsystem` | Owns the WebSocket connection, dispatches scene messages, loads GLBs at runtime, spawns synced assets |
 | `ULoomaSceneSyncSettings` | Project Settings > Plugins > Looma Scene Sync — the backend URL and the rendering knobs, read live |
 | `ALoomaSyncedActor` | One scene **node**: a transform, with the engine components its wire components ask for |
-| `LoomaSceneComponents` | The wire's `components` array parsed into keyed specs (`model` / `mesh` / `material` / `light`) |
+| `LoomaSceneComponents` | The wire's `components` array parsed into keyed specs (`model` / `mesh` / `material` / `light` / `audio`) |
+| `LoomaSceneAudio` | The `audio` component's sound: a datalake WAV decoded (`LoomaDecodeWav`), played from memory (`ULoomaSoundWave`), and faded as the format says (`LoomaMakeAttenuation`) |
 | `LoomaWireConvert` | Wire↔UE transform conversion, shared by the scene-sync layer and the generation-job parser |
 | `ELoomaJobState` / `LoomaGenerationTypes` | Text→3D job lifecycle, mirroring the backend's `JobState` vocabulary |
 | `ULoomaGenerationHandle` | One generation job's events, scoped to that job — raw state events plus per-stage ones (queued / generating images / awaiting selection / generating asset / generated), and the calls to drive the job |
@@ -113,6 +114,7 @@ warning naming the actor. Component edits are not reported outbound yet.
 | `mesh` | `UStaticMeshComponent` with an `/Engine/BasicShapes` primitive — box / sphere / plane / cylinder. `size` is an **extent in metres**, so the primitive is measured and scaled to fit; pivot is the node origin (a box at y = 0 sits half in the floor, as in the browser) |
 | `material` | A `UMaterialInstanceDynamic` on the sibling `mesh`, from `BasicShapeMaterial`: `color` (sRGB hex → linear) and `roughness`. Never applied to a `model`, which carries its own materials. `metalness` has no parameter to drive and is ignored |
 | `light` | `UPointLightComponent` / `USpotLightComponent` / `UDirectionalLightComponent`. Aim convention: **the node's local −Y is the beam direction** |
+| `audio` | `UAudioComponent` playing `<BackendUrl>/static/<assetId>.wav`, fetched through the same queue as the GLBs and decoded into a `ULoomaSoundWave`. `volume`, `pitch`, `loop`, `playing`, `spatial`, `minDistance`, `maxDistance` and `rolloff`, as below |
 | anything else | **Skipped, with the node kept** — logged once per type. That rule is what lets a new component type ship without a coordinated release across three clients |
 
 ### Light intensity
@@ -131,6 +133,39 @@ same candela value can read brighter or darker on screen. `LightIntensityScale` 
 always clamped at its attenuation radius — so it maps to 10 m. `angle` is a half-angle in both
 engines (radians vs degrees), and `penumbra` becomes the inner cone: `inner = outer × (1 −
 penumbra)`.
+
+### Sound
+
+The `audio` component (looma-xr-asset-demo `docs/scene-format.md`, "The `audio` component") is
+a sound source: a speaker on its own node, or a model's own sound beside its `model`. Its fields
+are the ones Unity's `AudioSource`, `UAudioComponent` and Web Audio's `PannerNode` share:
+
+| Field | Default | Unreal |
+| --- | --- | --- |
+| `playing` | `true` | `Play()` / `Stop()`. A sound starts from the beginning when `playing` turns true, when the component arrives and when `assetId` changes; any other edit leaves it where it is |
+| `loop` | `true` | Read by the sound's generator as it plays, so it changes a sound that is already playing: off, it finishes the pass it is on |
+| `volume` | `1` | `VolumeMultiplier` |
+| `pitch` | `1` | `PitchMultiplier` (0.5…2, changes the speed too) |
+| `spatial` | `true` | Attenuation and spatialisation on. `false` is a 2D sound with no attenuation at all, heard at `volume` everywhere |
+| `minDistance` | `1` | The attenuation sphere's radius, ×100 cm |
+| `maxDistance` | `20` | The sphere's radius plus its falloff distance |
+| `rolloff` | `"inverse"` | `linear` is UE's own Linear. `inverse` (minDistance / d) is not UE's Inverse, which is a different formula, so it is drawn as a custom curve; a curve that ends above zero also keeps the sound audible past `maxDistance`, at minDistance / maxDistance, as the format says |
+
+`loop` and `spatial` default to true, unlike both engines: a sound placed in a shared scene is a
+thing in the room, heard where it is for as long as the scene is open. Absent fields take these
+defaults, and the backend's clamps are made again on the way in.
+
+Every stored sound is the backend's canonical WAV: 16-bit PCM, one or two channels, at its
+source's own rate. It is read with the engine's own `FWaveModInfo` and played from memory by a
+`USoundWaveProcedural` subclass, because it arrives at runtime and is never imported. A spatial
+source is one point, so a stereo sound is mixed down to mono for it, as the browser does; a
+non-spatial one keeps its stereo. The WAV comes through the GLB download queue (same host, same
+connection pool, same retries) but not the model cache, which is the models' and is sized for
+them: a sound is about 1.7 MB for ten seconds of stereo, cheap to fetch again.
+
+Sound is heard from the player's view in PIE or a packaged game, which is where this subsystem
+runs. Each client starts a sound when its component reaches it; the format does not synchronise
+where in the clip each listener is.
 
 ### Coordinate conventions
 
@@ -671,6 +706,20 @@ and scene identity changes with reused node ids versus same-scene resyncs.
 Check the exported `index.json` for **eight successes and zero failures**: the editor process can exit
 with code 0 even when an automation assertion fails. These checks verify ownership and stencil
 assignment; the host's outline material still needs a rendering acceptance pass.
+
+`Looma.Audio` checks the `audio` component: parsing with the format's defaults and repairs,
+WAV decoding and the mono mix-down, the fade (UE's own `Evaluate` of the attenuation against the
+format's formula, inside, along and past each fade), the sound wave's looping as it plays, and a
+node's source kept in step with its component as it changes, without touching the network.
+`Looma.Audio.Playback` plays through the real mixer and measures the main output, so it only
+runs under the engine's silent renderer and skips itself otherwise:
+
+```text
+UnrealEditor-Cmd.exe <host-project.uproject> -unattended -nullrhi -DeterministicAudio -ExecCmds="Automation RunTests Looma.Audio; Quit"
+```
+
+That renderer mixes nothing for a 3D-panned source, the engine's own imported sounds included,
+so the playback test plays non-spatial sources only. Hearing a fade is a PIE check.
 
 ## Status
 

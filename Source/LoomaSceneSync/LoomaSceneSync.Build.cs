@@ -27,6 +27,9 @@ public class LoomaSceneSync : ModuleRules
             "JsonUtilities",
             // Decode downloaded PNGs into UTexture2D (FImageUtils / IImageWrapper).
             "ImageWrapper",
+            // The `audio` component's sound wave: a USoundWave is an audio proxy
+            // factory, whose interface lives here.
+            "AudioExtensions",
         });
 
         // The plugin's only editor dependency, and it must stay editor-only: UnrealEd

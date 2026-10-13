@@ -103,6 +103,36 @@ void ParseAnimation(const TSharedPtr<FJsonObject>& C, FLoomaNodeComponents& Out)
     C->TryGetStringField(TEXT("clip"), Out.Animation.Clip);
     C->TryGetBoolField(TEXT("playing"), Out.Animation.bPlaying);
 }
+
+/** Smallest `minDistance`, in metres: the backend's AUDIO_MIN_DISTANCE. */
+constexpr float AudioMinDistance = 0.01f;
+
+void ParseAudio(const TSharedPtr<FJsonObject>& C, FLoomaNodeComponents& Out)
+{
+    Out.bHasAudio = true;
+    FLoomaAudioSpec& Audio = Out.Audio;
+    C->TryGetStringField(TEXT("assetId"), Audio.AssetId);
+    // `url` is ignored, as a model's is: it is the browser's /api-proxied path.
+    C->TryGetBoolField(TEXT("playing"), Audio.bPlaying);
+    C->TryGetBoolField(TEXT("loop"), Audio.bLoop);
+    C->TryGetBoolField(TEXT("spatial"), Audio.bSpatial);
+    ReadFloat(C, TEXT("volume"), Audio.Volume);
+    ReadFloat(C, TEXT("pitch"), Audio.Pitch);
+    ReadFloat(C, TEXT("minDistance"), Audio.MinDistance);
+    ReadFloat(C, TEXT("maxDistance"), Audio.MaxDistance);
+    FString Rolloff;
+    if (C->TryGetStringField(TEXT("rolloff"), Rolloff))
+    {
+        Audio.Rolloff = Rolloff == TEXT("linear") ? ELoomaAudioRolloff::Linear : ELoomaAudioRolloff::Inverse;
+    }
+    // The backend's own repairs (scenegraph._clean_audio), made again here because the
+    // wire is repaired, never rejected: an unknown rolloff is inverse, and the numbers
+    // are clamped into what every client can play.
+    Audio.Volume = FMath::Clamp(Audio.Volume, 0.0f, 1.0f);
+    Audio.Pitch = FMath::Clamp(Audio.Pitch, 0.5f, 2.0f);
+    Audio.MinDistance = FMath::Max(Audio.MinDistance, AudioMinDistance);
+    Audio.MaxDistance = FMath::Max(Audio.MaxDistance, Audio.MinDistance);
+}
 } // namespace
 
 FLoomaNodeComponents LoomaParseComponents(const TArray<TSharedPtr<FJsonValue>>* Components)
@@ -127,6 +157,7 @@ FLoomaNodeComponents LoomaParseComponents(const TArray<TSharedPtr<FJsonValue>>* 
         else if (Type == TEXT("material")) { ParseMaterial(C, Out); }
         else if (Type == TEXT("light"))    { ParseLight(C, Out); }
         else if (Type == TEXT("animation")) { ParseAnimation(C, Out); }
+        else if (Type == TEXT("audio"))    { ParseAudio(C, Out); }
         else if (Type == TEXT("livelink"))
         {
             C->TryGetStringField(TEXT("subject"), Out.LiveLinkSubject);

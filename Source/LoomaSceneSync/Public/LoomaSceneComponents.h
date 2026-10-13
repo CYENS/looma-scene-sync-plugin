@@ -25,7 +25,7 @@ class FJsonValue;
  *    a new component type without a coordinated Unreal release.
  *
  * Defaults here are deliberately the *web client's* defaults
- * (looma-xr-asset-demo/frontend/src/scene/components/{mesh,light}.jsx), because a
+ * (looma-xr-asset-demo/frontend/src/scene/components/{mesh,light,audio}.jsx), because a
  * field absent from the payload is filled in by whoever renders it — the stored
  * document never carries defaults.
  */
@@ -45,6 +45,16 @@ enum class ELoomaLightType : uint8
     Point,
     Spot,
     Directional,
+};
+
+/** How an `audio` component fades with distance. See FLoomaAudioSpec. */
+UENUM(BlueprintType)
+enum class ELoomaAudioRolloff : uint8
+{
+    /** gain = minDistance / d: how sound really falls off. Unity's Logarithmic. */
+    Inverse,
+    /** gain = 1 - (d - minDistance) / (maxDistance - minDistance), silent past maxDistance. */
+    Linear,
 };
 
 /** `model`: a datalake GLB — an opaque whole sub-scene, not one mesh. */
@@ -203,6 +213,66 @@ struct FLoomaAnimationSpec
     bool operator!=(const FLoomaAnimationSpec& Other) const { return !(*this == Other); }
 };
 
+/**
+ * `audio`: a sound source. On its own node it is a speaker; beside a `model` it is
+ * that model's own sound (looma-xr-asset-demo/docs/scene-format.md, "The `audio`
+ * component").
+ *
+ * The fields are the ones Unity's AudioSource, UAudioComponent and Web Audio's
+ * PannerNode share, under Unity's names. Two defaults differ from both engines on
+ * purpose: `loop` and `spatial` are true, because a sound placed in a shared scene is
+ * a thing in the room, heard where it is for as long as the scene is open.
+ */
+USTRUCT(BlueprintType)
+struct FLoomaAudioSpec
+{
+    GENERATED_BODY()
+
+    /** Datalake sound. The WAV url is rebuilt from this, as a model's GLB url is. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    FString AssetId;
+
+    /** Whether it sounds. Turning true starts it from the beginning. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    bool bPlaying = true;
+
+    /** Start again at the end. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    bool bLoop = true;
+
+    /** Gain, 0…1: UAudioComponent's VolumeMultiplier. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    float Volume = 1.0f;
+
+    /** Playback rate, 0.5…2, which changes the speed too: PitchMultiplier. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    float Pitch = 1.0f;
+
+    /** Heard from the node and fading with distance; false is heard at Volume everywhere. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    bool bSpatial = true;
+
+    /** Wire metres within which it is at full volume: the attenuation sphere's radius. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    float MinDistance = 1.0f;
+
+    /** Wire metres at which the fade stops: the sphere's radius plus its falloff. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    float MaxDistance = 20.0f;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    ELoomaAudioRolloff Rolloff = ELoomaAudioRolloff::Inverse;
+
+    bool operator==(const FLoomaAudioSpec& Other) const
+    {
+        return AssetId == Other.AssetId && bPlaying == Other.bPlaying && bLoop == Other.bLoop
+            && FMath::IsNearlyEqual(Volume, Other.Volume) && FMath::IsNearlyEqual(Pitch, Other.Pitch)
+            && bSpatial == Other.bSpatial && FMath::IsNearlyEqual(MinDistance, Other.MinDistance)
+            && FMath::IsNearlyEqual(MaxDistance, Other.MaxDistance) && Rolloff == Other.Rolloff;
+    }
+    bool operator!=(const FLoomaAudioSpec& Other) const { return !(*this == Other); }
+};
+
 /** Every component on one node, keyed by type. */
 /** The `source` of a `livelink` component the backend's own Live Link drives (HAM-328, HAM-329). */
 inline constexpr const TCHAR* LoomaLiveLinkHubSource = TEXT("hub");
@@ -242,6 +312,12 @@ struct FLoomaNodeComponents
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
     FLoomaAnimationSpec Animation;
 
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    bool bHasAudio = false;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    FLoomaAudioSpec Audio;
+
     /**
      * The `livelink` component's subject: the Live Link subject that drives this
      * node, or empty for nobody (HAM-316; docs/rig-format.md, "Who drives a
@@ -277,7 +353,7 @@ struct FLoomaNodeComponents
     TArray<FString> UnknownTypes;
 
     /** True for an empty object — a transform and nothing else. */
-    bool IsEmpty() const { return !bHasModel && !bHasMesh && !bHasLight; }
+    bool IsEmpty() const { return !bHasModel && !bHasMesh && !bHasLight && !bHasAudio; }
 
     bool operator==(const FLoomaNodeComponents& Other) const
     {
@@ -286,6 +362,7 @@ struct FLoomaNodeComponents
             && bHasMaterial == Other.bHasMaterial && (!bHasMaterial || Material == Other.Material)
             && bHasLight == Other.bHasLight && (!bHasLight || Light == Other.Light)
             && bHasAnimation == Other.bHasAnimation && (!bHasAnimation || Animation == Other.Animation)
+            && bHasAudio == Other.bHasAudio && (!bHasAudio || Audio == Other.Audio)
             && LiveLinkSubject == Other.LiveLinkSubject && LiveLinkSource == Other.LiveLinkSource
             && LiveLinkStream == Other.LiveLinkStream;
     }
