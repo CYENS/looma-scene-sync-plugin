@@ -5,6 +5,7 @@
 #include "Kismet/BlueprintAsyncActionBase.h"
 #include "LoomaSubmitGenerationAction.generated.h"
 
+class FJsonObject;
 class ULoomaGenerationHandle;
 class ULoomaSceneSyncSubsystem;
 
@@ -44,14 +45,30 @@ public:
      *                           from the job and place the model with
      *                           `Spawn Synced Asset` when you want it.
      * @param NImages            Candidate images to render (clamped 1..8).
+     * @param MetaJson           Your own context for the job, as one JSON object.
+     *                           Build it with `Make Generation Meta`. Kept on the job
+     *                           as sent and read back from Job.MetaJson on every
+     *                           update. Every client sees it, so never put a secret
+     *                           in it, and group your keys under your client's name
+     *                           (`{"unreal": {...}}`). Empty sends none. Anything that
+     *                           is not a JSON object fails here and sends nothing.
      */
     UFUNCTION(BlueprintCallable,
         meta = (BlueprintInternalUseOnly = "true", WorldContext = "WorldContextObject"),
         Category = "Looma|Generation")
     static ULoomaSubmitGenerationAction* SubmitGeneration(UObject* WorldContextObject, const FString& Prompt,
-        FTransform SuggestedTransform, bool bSuggestTransform = false, int32 NImages = 3);
+        FTransform SuggestedTransform, bool bSuggestTransform = false, int32 NImages = 3,
+        const FString& MetaJson = TEXT(""));
 
     virtual void Activate() override;
+
+    /**
+     * The `POST /generate` body for these inputs. Meta, when there is one, goes in
+     * as an object, because the backend refuses it as a string with a 422. Public
+     * so the tests can read a body without sending it.
+     */
+    static TSharedRef<FJsonObject> MakeRequestBody(const FString& Prompt, const FTransform& SuggestedTransform,
+        bool bSuggestTransform, int32 NImages, const TSharedPtr<FJsonObject>& Meta);
 
 private:
     void OnResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedSuccessfully);
@@ -62,4 +79,7 @@ private:
     FTransform SuggestedTransform;
     bool bSuggestTransform = false;
     int32 NImages = 3;
+    FString MetaJson;
+    /** The meta as sent, in the form the job reports it. Empty when none was. */
+    FString SentMetaJson;
 };
