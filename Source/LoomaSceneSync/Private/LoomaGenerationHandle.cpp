@@ -75,6 +75,10 @@ void ULoomaGenerationHandle::Apply(const FLoomaGenerationJob& InJob)
     // Job.bHasSuggestedTransform back to false.
     const bool bKeepKnownTransform = !InJob.bHasSuggestedTransform && Job.bHasSuggestedTransform;
     const FTransform KnownTransform = Job.SuggestedTransform;
+    // The submitter's meta is set once in the same way and arrives late for the
+    // same reason.
+    const bool bKeepKnownMeta = !InJob.bHasMeta && Job.bHasMeta;
+    const FString KnownMeta = Job.MetaJson;
 
     Job = InJob;
     JobId = InJob.JobId;
@@ -84,6 +88,11 @@ void ULoomaGenerationHandle::Apply(const FLoomaGenerationJob& InJob)
     {
         Job.SuggestedTransform = KnownTransform;
         Job.bHasSuggestedTransform = true;
+    }
+    if (bKeepKnownMeta)
+    {
+        Job.MetaJson = KnownMeta;
+        Job.bHasMeta = true;
     }
 
     UpdateImageSelected(Previous);
@@ -190,6 +199,12 @@ void ULoomaGenerationHandle::SeedTransform(const FTransform& InTransform)
 {
     Job.SuggestedTransform = InTransform;
     Job.bHasSuggestedTransform = true;
+}
+
+void ULoomaGenerationHandle::SeedMeta(const FString& InMetaJson)
+{
+    Job.MetaJson = InMetaJson;
+    Job.bHasMeta = true;
 }
 
 ULoomaSceneSyncSubsystem* ULoomaGenerationHandle::GetSubsystem() const

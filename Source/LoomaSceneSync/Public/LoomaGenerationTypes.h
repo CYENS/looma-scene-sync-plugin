@@ -4,6 +4,7 @@
 #include "LoomaGenerationTypes.generated.h"
 
 class FJsonObject;
+class FJsonValue;
 
 /**
  * Lifecycle of a text->3D generation job, mirroring the backend vocabulary
@@ -125,6 +126,29 @@ struct FLoomaGenerationJob
     UPROPERTY(BlueprintReadOnly, Category = "Looma|Generation")
     bool bHasSuggestedTransform = false;
 
+    /**
+     * The submitter's own context for this job, as compact JSON text: the `meta`
+     * object it sent with the request, such as
+     * `{"unreal":{"environment":"LVL_Demo"}}`. Empty when the job has none. The
+     * backend stores it as sent and never reads it, so what it means is up to the
+     * clients. Set with `Submit Generation`'s MetaJson; read one value back with
+     * `Get Generation Meta String`.
+     *
+     * Set once, when the job is submitted, and never changed. Readable at every
+     * update once known: the subsystem merges it into snapshots that arrive
+     * without it (the backend announces a job before it has stored the meta, so a
+     * job's earliest events lack it). A model's own sound or motion job carries a
+     * copy of the model job's meta.
+     *
+     * Every client of every session sees it. Never put a secret in it.
+     */
+    UPROPERTY(BlueprintReadOnly, Category = "Looma|Generation")
+    FString MetaJson;
+
+    /** True once this job's meta is known. See MetaJson. */
+    UPROPERTY(BlueprintReadOnly, Category = "Looma|Generation")
+    bool bHasMeta = false;
+
     /** Human-readable failure reason (set when State == Failed). */
     UPROPERTY(BlueprintReadOnly, Category = "Looma|Generation")
     FString Error;
@@ -146,3 +170,25 @@ LOOMASCENESYNC_API ELoomaJobState LoomaJobStateFromString(const FString& State);
  * created_at). Returns a job with an empty JobId if the object is invalid.
  */
 LOOMASCENESYNC_API FLoomaGenerationJob LoomaParseGenerationJob(const TSharedPtr<FJsonObject>& JobObj);
+
+/**
+ * A meta value as compact JSON text, the form FLoomaGenerationJob::MetaJson holds.
+ *
+ * Numbers are written as the shortest text that reads back exactly (0.1, not
+ * 0.10000000000000001), which is how the backend and the browser write them, so
+ * one object always comes out as the same text whichever way it arrived. Empty
+ * for a null pointer.
+ */
+LOOMASCENESYNC_API FString LoomaWriteGenerationMeta(const TSharedPtr<FJsonValue>& Value);
+
+/**
+ * Read the MetaJson text a Blueprint hands to `Submit Generation`.
+ *
+ * Empty or blank text is no meta: true, with OutMeta null. Anything else has to
+ * be one JSON object, because the backend refuses every other shape; otherwise
+ * this is false and OutError says why. A number JSON cannot carry (an overflow to
+ * Infinity) is refused too. OutMeta's numbers are already in the form
+ * LoomaWriteGenerationMeta writes.
+ */
+LOOMASCENESYNC_API bool LoomaReadGenerationMeta(const FString& MetaJson, TSharedPtr<FJsonObject>& OutMeta,
+    FString& OutError);
