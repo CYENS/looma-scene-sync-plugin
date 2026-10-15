@@ -86,6 +86,13 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_FourParams(FLoomaJobAssetGeneratedEvent,
  * created it has finished binding. So `Submit Generation` -> bind -> done never
  * misses an event, even though the first `queued` event can arrive over the
  * socket before the POST response carrying the job id.
+ *
+ * Two things on `Job` are the submitter's and never change: `SuggestedTransform`
+ * and `MetaJson` (the submitter's own context, as JSON; read a value with
+ * `Get Generation Meta String`). The backend stores both just after it first
+ * announces a job, so a job's earliest events can lack them. Once known they are
+ * on every snapshot after it, and a handle from `Submit Generation` has both from
+ * the start.
  */
 UCLASS(BlueprintType)
 class LOOMASCENESYNC_API ULoomaGenerationHandle : public UObject
@@ -232,6 +239,13 @@ private:
      * would otherwise report none.
      */
     void SeedTransform(const FTransform& InTransform);
+
+    /**
+     * The same for the submitter's meta, so `Job.MetaJson` / `Job.bHasMeta` are
+     * readable the moment you get the handle. Driven by the subsystem's
+     * NoteGenerationMeta.
+     */
+    void SeedMeta(const FString& InMetaJson);
 
     /** The owning subsystem (this object's outer). */
     ULoomaSceneSyncSubsystem* GetSubsystem() const;

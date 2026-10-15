@@ -1218,6 +1218,16 @@ public:
      */
     void NoteSuggestedTransform(const FString& JobId, const FTransform& SuggestedTransform);
 
+    /**
+     * Record the meta a job was submitted with (compact JSON text, as
+     * FLoomaGenerationJob::MetaJson holds it), so every reader of that job reports
+     * it from the start. The same reason as NoteSuggestedTransform: the backend
+     * announces a job before storing its meta, so its earliest events have none.
+     *
+     * Not exposed to Blueprint: `Submit Generation` calls this for you.
+     */
+    void NoteGenerationMeta(const FString& JobId, const FString& MetaJson);
+
     /** Look up a cached job by id. Returns false if unknown. */
     UFUNCTION(BlueprintCallable, Category = "Looma|Generation")
     bool GetGenerationJob(const FString& JobId, FLoomaGenerationJob& OutJob) const;
@@ -1308,6 +1318,7 @@ private:
     friend struct FLoomaBorderRefreshTestFixture;
     friend struct FLoomaLivePoseTestAccess;
     friend struct FLoomaAudioTestAccess;
+    friend struct FLoomaGenerationMetaTestAccess;
 #endif
 
     void Connect();
@@ -1987,6 +1998,9 @@ private:
 
     /** jobId -> suggested spawn pose, once learned. Never changes for a job. */
     TMap<FString, FTransform> SuggestedTransforms;
+
+    /** jobId -> the submitter's meta as compact JSON, once learned. Never changes for a job. */
+    TMap<FString, FString> JobMetas;
 
     /** Handles awaiting their first replay; drained at the top of Tick. */
     TArray<FString> PendingHandleReplays;

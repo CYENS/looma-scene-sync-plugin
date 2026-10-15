@@ -52,6 +52,12 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FLoomaJobStageEvent,
  *     whole queue on reconnect, so an every-snapshot OnAssetGenerated would spawn
  *     the asset twice.
  *
+ * Every event's Job carries the submitter's `MetaJson` once it is known: from the
+ * first event for a job this client submitted, and a moment after the job appears
+ * for anyone else's, once the backend has stored it.
+ * To act only on jobs from your own environment, read it in OnAssetGenerated with
+ * `Get Generation Meta String` and compare.
+ *
  * Watching a second job unbinds the first, and the component unbinds itself on
  * EndPlay — handles outlive actors (they live as long as the subsystem), so a
  * destroyed orb must not keep receiving events.

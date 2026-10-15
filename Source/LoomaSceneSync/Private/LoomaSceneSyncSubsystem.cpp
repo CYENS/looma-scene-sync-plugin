@@ -382,6 +382,7 @@ void ULoomaSceneSyncSubsystem::Deinitialize()
     JobHandles.Empty();
     PendingHandleReplays.Empty();
     SuggestedTransforms.Empty();
+    JobMetas.Empty();
     ActiveSceneId.Reset();
     bHasSceneIdentity = false;
     ActivePerformance = FLoomaPerformance();
@@ -5063,6 +5064,16 @@ void ULoomaSceneSyncSubsystem::ApplyJob(const FLoomaGenerationJob& InJob)
         Job.SuggestedTransform = *Known;
         Job.bHasSuggestedTransform = true;
     }
+    // The submitter's meta, the same way and for the same reason.
+    if (Job.bHasMeta)
+    {
+        JobMetas.Add(Job.JobId, Job.MetaJson);
+    }
+    else if (const FString* KnownMeta = JobMetas.Find(Job.JobId))
+    {
+        Job.MetaJson = *KnownMeta;
+        Job.bHasMeta = true;
+    }
 
     Jobs.Add(Job.JobId, Job);
     OnGenerationJobUpdated.Broadcast(Job);
@@ -5111,6 +5122,28 @@ void ULoomaSceneSyncSubsystem::NoteSuggestedTransform(const FString& JobId, cons
         if (ULoomaGenerationHandle* Handle = Found->Get())
         {
             Handle->SeedTransform(SuggestedTransform);
+        }
+    }
+}
+
+void ULoomaSceneSyncSubsystem::NoteGenerationMeta(const FString& JobId, const FString& MetaJson)
+{
+    if (JobId.IsEmpty() || MetaJson.IsEmpty())
+    {
+        return;
+    }
+    JobMetas.Add(JobId, MetaJson);
+
+    if (FLoomaGenerationJob* Cached = Jobs.Find(JobId))
+    {
+        Cached->MetaJson = MetaJson;
+        Cached->bHasMeta = true;
+    }
+    if (const TObjectPtr<ULoomaGenerationHandle>* Found = JobHandles.Find(JobId))
+    {
+        if (ULoomaGenerationHandle* Handle = Found->Get())
+        {
+            Handle->SeedMeta(MetaJson);
         }
     }
 }
