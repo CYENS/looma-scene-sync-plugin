@@ -17,7 +17,8 @@ ULoomaFollowGenerationAction* ULoomaFollowGenerationAction::FollowGeneration(UOb
 }
 
 ULoomaFollowGenerationAction* ULoomaFollowGenerationAction::SubmitGenerationAndFollow(UObject* WorldContextObject,
-    const FString& Prompt, FTransform SuggestedTransform, bool bSuggestTransform, int32 NImages)
+    const FString& Prompt, FTransform SuggestedTransform, bool bSuggestTransform, int32 NImages,
+    const FString& MetaJson)
 {
     ULoomaFollowGenerationAction* Action = NewObject<ULoomaFollowGenerationAction>();
     Action->WorldContextObject = WorldContextObject;
@@ -25,6 +26,7 @@ ULoomaFollowGenerationAction* ULoomaFollowGenerationAction::SubmitGenerationAndF
     Action->SuggestedTransform = SuggestedTransform;
     Action->bSuggestTransform = bSuggestTransform;
     Action->NImages = NImages;
+    Action->MetaJson = MetaJson;
     Action->bSubmitFirst = true;
     return Action;
 }
@@ -47,10 +49,11 @@ void ULoomaFollowGenerationAction::Activate()
     if (bSubmitFirst)
     {
         // Reuse the existing submit node rather than duplicating the POST: it already
-        // mints the handle before broadcasting and registers the suggested pose with
-        // the subsystem, both of which we would otherwise have to repeat here.
+        // checks the meta, mints the handle before broadcasting and registers the
+        // suggested pose and the meta with the subsystem, all of which we would
+        // otherwise have to repeat here.
         SubmitAction = ULoomaSubmitGenerationAction::SubmitGeneration(
-            WorldContextObject.Get(), Prompt, SuggestedTransform, bSuggestTransform, NImages);
+            WorldContextObject.Get(), Prompt, SuggestedTransform, bSuggestTransform, NImages, MetaJson);
         if (!SubmitAction)
         {
             FailWith(TEXT("Could not create the submit action"));

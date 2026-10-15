@@ -51,6 +51,10 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FLoomaFollowGenerationEvent,
  *   On Failed                Job.Error
  *   On Cancelled             nothing in particular; the job is gone
  *
+ * On every pin, Job.MetaJson is the MetaJson the job was submitted with: from the
+ * first pin to fire when this node submitted the job, and a moment after the job
+ * appears when it follows someone else's, once the backend has stored it.
+ *
  * The two queue pins exist so the stage is legible without a Phase parameter: the
  * backend puts a job back in the queue after a candidate is picked, so `Queued`
  * alone is ambiguous.
@@ -144,6 +148,11 @@ public:
      *                           from Job.SuggestedTransform and place the model with
      *                           `Spawn Synced Asset` when you want it.
      * @param NImages            Candidate images to render (clamped 1..8).
+     * @param MetaJson           Your own context for the job, as one JSON object.
+     *                           Build it with `Make Generation Meta`; read it back
+     *                           from Job.MetaJson. Every client sees it, so never put
+     *                           a secret in it. Empty sends none. Anything that is not
+     *                           a JSON object fires On Failed and sends nothing.
      */
     UFUNCTION(BlueprintCallable,
         meta = (BlueprintInternalUseOnly = "true", WorldContext = "WorldContextObject",
@@ -151,7 +160,7 @@ public:
         Category = "Looma|Generation")
     static ULoomaFollowGenerationAction* SubmitGenerationAndFollow(UObject* WorldContextObject,
         const FString& Prompt, FTransform SuggestedTransform, bool bSuggestTransform = false,
-        int32 NImages = 3);
+        int32 NImages = 3, const FString& MetaJson = TEXT(""));
 
     virtual void Activate() override;
 
@@ -215,4 +224,5 @@ private:
     bool bSuggestTransform = false;
     bool bSubmitFirst = false;
     int32 NImages = 3;
+    FString MetaJson;
 };
