@@ -30,6 +30,7 @@ The protocol it implements is specified in
 | `FLoomaBorderGroup` | What to draw for one remote client — its colour, its stencil slot, the nodes it won outright and their descendants |
 | `ULoomaLoginAction` | Async Blueprint node — log in (`POST /auth/login`) |
 | `ULoomaSubmitGenerationAction` | Async Blueprint node — submit a text→3D job (`POST /generate`) |
+| `ULoomaGenerationLibrary` | Blueprint helpers for a job's `meta` — `Make Generation Meta` and `Get Generation Meta String` |
 | `ULoomaDownloadImageAction` | Async Blueprint node — download a candidate/selected image, decode to a transient `UTexture2D` |
 | `ULoomaLoginUI` | *(UI module)* Two Blueprint calls that put the bare-bones login form on the viewport, or take it off |
 
@@ -174,6 +175,53 @@ centimetres. The mapping must match glTFRuntime's **default** `SceneBasis`
 (`FglTFRuntimeConfig::GetMatrix`), which maps `(x, y, z) -> (-z, x, y)`, so mesh geometry and
 actor transforms agree. That map flips handedness (det = -1), so rotations conjugate as
 `q_UE = (qz, -qx, -qy, qw)`. See `LoomaWireConvert.h`.
+
+## Generation jobs
+
+The protocol is looma-xr-asset-demo `docs/unreal-sync.md`, "Generation jobs (text→3D)". This
+section covers only what is easy to get wrong from Unreal.
+
+### Your own context on a job (`meta`)
+
+A job can carry your client's own context, such as the environment it was asked for from.
+`Submit Generation` and `Submit Generation And Follow` take an optional **MetaJson**, their last
+input and empty by default. Every job reports it back as **`Job.MetaJson`**, compact JSON text,
+with **`Job.bHasMeta`**. The backend stores it exactly as sent and never reads it, so what it
+means is up to the clients. The contract is `docs/unreal-sync.md`, "The submitter's context
+(`meta`)".
+
+Build it and read it with `ULoomaGenerationLibrary`, never by hand. Both nodes name a value by a
+dotted path:
+
+| Node | What it does |
+| --- | --- |
+| `Make Generation Meta` | A map of dotted paths to strings, made into the JSON for MetaJson: `unreal.environment` → `LVL_Demo` becomes `{"unreal":{"environment":"LVL_Demo"}}`. False, with a warning, when a path has an empty part or two paths collide (`unreal` and `unreal.environment`). An empty map is no meta |
+| `Get Generation Meta String` | One value off a job by the same path. A string as it is, a number or boolean as its JSON text (`2`, `0.1`, `true`), a group or list as compact JSON. False when the job has no meta or the path is not in it |
+
+- **It has to be one JSON object.** A string, a list or a number fails the node with the reason,
+  and nothing is sent; the backend would refuse it with a 422. It goes into the request as an
+  object, never as a string. More than 4096 bytes is the backend's 413, and the node's failure
+  carries the backend's reason.
+- **Set once.** Nothing changes it after the submit.
+- **A job's earliest events lack it.** The backend announces a job before storing its meta, and
+  its first progress can arrive before that too (in the live check: `queued`, then `running`,
+  both without it). It announces the job again once the meta is stored. The subsystem learns it
+  from the first event that carries it, or at submit for a job this client sent, and merges it
+  into every later snapshot. So the handle, the hub-wide `OnGenerationJob*` events and
+  `Get Generation Job` all agree, and a finished job always has it.
+- **A model's sound or motion job** (`audio` / `motion`) gets a copy of the model job's meta, so
+  filtering the queue on it keeps those jobs too.
+- **Every client of every session sees it.** Never put a secret in it.
+- **Group your keys under your client's name**, `{"unreal": {...}}`. The keys inside are never
+  re-cased, so the group is what keeps two clients from colliding on a key.
+
+To tag each generation with its environment and act only on your own: feed `Make Generation Meta`
+with `unreal.environment` → your environment's id into `Submit Generation`'s MetaJson. Then, when
+a job finishes (`On Asset Generated`, or the hub-wide `On Generation Job Done`), carry on only if
+`Get Generation Meta String (Job, "unreal.environment")` returns true with that same id.
+
+The web client shows a job's meta in its Details panel, under *Generation meta*, when you select
+an object placed from it.
 
 ## Requirements
 
@@ -720,6 +768,27 @@ UnrealEditor-Cmd.exe <host-project.uproject> -unattended -nullrhi -Deterministic
 
 That renderer mixes nothing for a 3D-panned source, the engine's own imported sounds included,
 so the playback test plays non-spatial sources only. Hearing a fade is a PIE check.
+
+`Looma.Generation.Meta` checks a job's `meta`: reading it off the event and the REST hydrate, a
+null or absent one, keeping it once known when a later event lacks it (in the cache, the
+hub-wide events and a handle), the submit body carrying it as an object, a non-object refused
+before any request, and the dotted-path helpers. It needs no backend:
+
+```text
+UnrealEditor-Cmd.exe <host-project.uproject> -unattended -nullrhi -ExecCmds="Automation RunTests Looma.Generation.Meta; Quit"
+```
+
+`Looma.Generation.Meta.Live` is the same path against a real backend, and skips itself unless it
+is given one. It plays a blank map in PIE, connects, submits one job with a meta built by
+`Make Generation Meta`, picks the candidate if the provider offers one, and follows the job to
+Done. It checks the finished job, every hub-wide event once one has carried the meta, and every
+event of the handle. Given a scene the client may edit, it then places the result there, so a web
+client on the same backend can select it and see *Generation meta* in Details. It submits a real
+job, so point it at a worktree backend in mock mode, never the everyday one:
+
+```text
+UnrealEditor-Cmd.exe <host-project.uproject> -unattended -nullrhi -nosound -LoomaLiveBackend=http://127.0.0.1:8002 -LoomaLiveScene=demo-imported-set-model -ExecCmds="Automation RunTests Looma.Generation.Meta.Live; Quit"
+```
 
 ## Status
 
