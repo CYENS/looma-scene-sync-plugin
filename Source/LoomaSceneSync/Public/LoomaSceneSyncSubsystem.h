@@ -676,12 +676,21 @@ public:
      * transform: whoever calls this has already written the pose in the wire's
      * terms, which is what lets every other client apply it without retargeting.
      *
-     * The hub relays it to the other clients on this scene and stores nothing. It
-     * is dropped silently, here on a closed socket and at the hub if the node is
-     * not in the scene or this client may not edit it, because a refusal thirty
-     * times a second is not a message anyone wants.
+     * The hub relays it to the other clients on this scene and keeps nothing
+     * unless it is recording a take of the node. It is dropped silently, here on
+     * a closed socket and at the hub if the node is not in the scene or this
+     * client may not edit it, because a refusal thirty times a second is not a
+     * message anyone wants.
+     *
+     * `Time`, when set, is sent as the frame's `t`: when the pose was captured,
+     * in seconds on this client's own clock, any origin, advancing with the
+     * poses (the same pose sent twice may repeat it). The hub maps it onto its
+     * own clock, so a take keeps the spacing the poses were captured at rather
+     * than the spacing they arrived at; unset, the hub stamps the pose on
+     * arrival. It is not relayed. A time that is not finite is not sent.
      */
-    void PublishPose(const FString& NodeId, const FVector& Hips, const TArray<FQuat>& Rotations);
+    void PublishPose(const FString& NodeId, const FVector& Hips, const TArray<FQuat>& Rotations,
+                     TOptional<double> Time = TOptional<double>());
 
     /**
      * Tell the other clients on this scene which Live Link subjects this client
