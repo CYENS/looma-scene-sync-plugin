@@ -3,6 +3,7 @@
 #include "CoreMinimal.h"
 #include "LoomaGenerationHandle.h"
 #include "LoomaGenerationTypes.h"
+#include "LoomaSyncedActor.h"
 #include "UObject/Object.h"
 #include "LoomaGenerationTestObserver.generated.h"
 
@@ -55,5 +56,14 @@ public:
     void ObserveHandleJob(const FLoomaGenerationJob& Job)
     {
         HandleJobs.Add(Job);
+    }
+
+    /** Each `On Synced Actor Meta Changed`, as "<node id>=<MetaJson>": "<node id>=" for none. */
+    TArray<FString> ActorMetas;
+
+    UFUNCTION()
+    void ObserveActorMeta(ALoomaSyncedActor* Actor)
+    {
+        ActorMetas.Add(Actor ? Actor->Id + TEXT("=") + Actor->MetaJson : FString(TEXT("<null>")));
     }
 };
