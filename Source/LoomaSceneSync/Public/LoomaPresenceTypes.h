@@ -259,3 +259,57 @@ LOOMASCENESYNC_API void LoomaParseClientColor(const FString& Wire, FString& OutH
  * drop — an entry with no id names nobody, and a border has to be attributable.
  */
 LOOMASCENESYNC_API FLoomaClient LoomaParseClient(const TSharedPtr<FJsonObject>& ClientObj);
+
+/**
+ * Where one other client is (docs/scene-format.md, "Where each client is — the
+ * `clientPose` message", HAM-311 part 1): its head in a headset, or its camera or
+ * pawn, with its hands when it has them.
+ *
+ * In UE world space, converted from the wire like any node transform, so a head
+ * looks down its +X: the wire's −Z, which is where a headset looks, maps there
+ * (LoomaWireConvert.h). Presence, not scene state: never saved, cleared with the
+ * roster, and drawn by ALoomaRemotePerson unless the project turns that off.
+ */
+USTRUCT(BlueprintType)
+struct LOOMASCENESYNC_API FLoomaClientPose
+{
+    GENERATED_BODY()
+
+    UPROPERTY(BlueprintReadOnly, Category = "Looma|Presence")
+    FString ClientId;
+
+    /** The hub's colour for that client, as on its roster entry. */
+    UPROPERTY(BlueprintReadOnly, Category = "Looma|Presence")
+    FLinearColor Color = FLinearColor::Gray;
+
+    UPROPERTY(BlueprintReadOnly, Category = "Looma|Presence")
+    FString ColorHex;
+
+    /** What the sender says it is: `vr-head`, `camera`, `pawn`. A label; never acted on. */
+    UPROPERTY(BlueprintReadOnly, Category = "Looma|Presence")
+    FString Hint;
+
+    UPROPERTY(BlueprintReadOnly, Category = "Looma|Presence")
+    FTransform Head;
+
+    UPROPERTY(BlueprintReadOnly, Category = "Looma|Presence")
+    bool bHasLeftHand = false;
+
+    UPROPERTY(BlueprintReadOnly, Category = "Looma|Presence")
+    FTransform LeftHand;
+
+    UPROPERTY(BlueprintReadOnly, Category = "Looma|Presence")
+    bool bHasRightHand = false;
+
+    UPROPERTY(BlueprintReadOnly, Category = "Looma|Presence")
+    FTransform RightHand;
+};
+
+/**
+ * Read a pose (`{t, hands?, hint?}`, from a `clientPose` message or a roster entry's
+ * `pose`) into OutPose's transforms and hint. False, leaving OutPose untouched, when
+ * `t` is missing or not `{p: [3 numbers], q: [4 numbers]}`; a bad hand is left out.
+ * ClientId and colour are the caller's to fill: they come from different places in
+ * the two messages.
+ */
+LOOMASCENESYNC_API bool LoomaParseClientPose(const TSharedPtr<FJsonObject>& PoseObj, FLoomaClientPose& OutPose);

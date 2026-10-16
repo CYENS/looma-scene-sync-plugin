@@ -19,6 +19,7 @@ class FJsonValue;
 class ULoomaGenerationHandle;
 class UMaterialParameterCollection;
 class UPrimitiveComponent;
+class ALoomaRemotePerson;
 
 /**
  * The performance — the workspace — this socket is in, as the `scene` frame reports it
@@ -854,6 +855,32 @@ public:
     UPROPERTY(BlueprintAssignable, Category = "Looma|Presence")
     FLoomaClientsEvent OnClientsChanged;
 
+    // --- Where everyone is: `clientPose` (HAM-311 part 1) -----------------------
+    //
+    // A client in a headset (or any client that chooses to) says where its head and
+    // hands are; everyone else on the scene draws it there. Presence like the
+    // roster: never saved, cleared with it, and a joiner hydrates from the roster's
+    // `pose`. The plugin draws each person itself (ALoomaRemotePerson) unless
+    // Project Settings > Looma Scene Sync > Draw Remote People is off.
+
+    /** Everyone else on this scene who has said where they are, in UE world space. */
+    UFUNCTION(BlueprintPure, Category = "Looma|Presence")
+    TArray<FLoomaClientPose> GetClientPoses() const;
+
+    /**
+     * Tell the scene where we are: a head (looking down its +X, like any UE camera)
+     * and the hands we have, in UE world space. Call it as often as the pose moves,
+     * up to about 20 times a second (ALoomaVRPawn does, while in VR); the hub drops
+     * more than 60 a second. Dropped without a word while disconnected.
+     */
+    UFUNCTION(BlueprintCallable, Category = "Looma|Presence")
+    void SendClientPose(const FTransform& Head, bool bHasLeftHand, const FTransform& LeftHand,
+                        bool bHasRightHand, const FTransform& RightHand, const FString& Hint = TEXT("vr-head"));
+
+    /** We are no longer anywhere to be shown: the headset came off. */
+    UFUNCTION(BlueprintCallable, Category = "Looma|Presence")
+    void ClearClientPose();
+
     // --- The claim ledger: who gets to draw a border on a node ----------------
     //
     // Nothing stops two people selecting one node and **nothing is locked** — both can
@@ -1319,6 +1346,7 @@ private:
     friend struct FLoomaLivePoseTestAccess;
     friend struct FLoomaAudioTestAccess;
     friend struct FLoomaGenerationMetaTestAccess;
+    friend struct FLoomaClientPoseTestAccess;
 #endif
 
     void Connect();
@@ -1460,6 +1488,12 @@ private:
     void HandleClients(const TSharedPtr<FJsonObject>& Msg);
     /** One client's whole selection, replacing what it held. See the claim-ledger block. */
     void HandleSelection(const TSharedPtr<FJsonObject>& Msg);
+    /** Where one client is now, or `t: null` for nowhere. See GetClientPoses. */
+    void HandleClientPose(const TSharedPtr<FJsonObject>& Msg);
+    /** Spawn, ease and remove the ALoomaRemotePerson for each pose. */
+    void TickRemotePeople(float DeltaTime);
+    /** Destroy every drawn person; the next tick draws whoever is still here. */
+    void DestroyRemotePeople();
 
     // --- Claim ledger maintenance --------------------------------------------
     // The spec's four rules, one function each, so that nothing else in the plugin
@@ -1916,6 +1950,15 @@ private:
      * dies with the socket outright, or on a scene identity change — see ClearPresence.
      */
     TArray<FLoomaClient> RemoteClients;
+
+    /** Where the other clients are, by client id. Lifetime as RemoteClients. */
+    TMap<FString, FLoomaClientPose> ClientPoses;
+
+    /** The figure drawn for each of ClientPoses, by client id. */
+    TMap<FString, TWeakObjectPtr<ALoomaRemotePerson>> RemotePeople;
+
+    /** Our own `clientPose` counter. */
+    int64 ClientPoseSeq = 0;
 
     /**
      * Our own roster entry, held apart from RemoteClients so nothing that iterates

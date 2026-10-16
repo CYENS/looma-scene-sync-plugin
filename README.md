@@ -737,6 +737,28 @@ The plugin deliberately does **not** drive a stencil for your own local selectio
 project's business and it must not change when the room does — which is the point of the
 your-selection-always-wins rule above.
 
+## Where everyone is (`clientPose`)
+
+A client can tell the scene where it is: its head in a headset, with its hands. The hub stamps
+who sent it and in which colour, and relays it to everyone else on the scene
+(docs/scene-format.md in looma-xr-asset-demo, "Where each client is — the `clientPose`
+message", HAM-311 part 1). The web client sends it while it is in VR. The 5.8 viewer's VR
+pawn does too.
+
+**Drawing others.** The plugin draws each person on the scene who has said where they are as an
+`ALoomaRemotePerson`: a head in their roster colour, a dark visor on the side they look out
+of, their hands, and their name turned towards the camera. This is the same figure the web
+client draws. Each figure eases towards every new pose and goes away when that person leaves
+the scene or VR. It has no collision, casts no shadow and is never saved. *Draw Remote People*
+in Project Settings > Plugins > Looma Scene Sync turns this off. `GetClientPoses()` (UE world
+space, head looking down +X) is there for a project that would rather draw people itself.
+
+**Saying where you are.** Call `SendClientPose(Head, bHasLeftHand, LeftHand, bHasRightHand,
+RightHand, Hint)` as the pose moves, up to about 20 times a second, with UE world transforms;
+the head looks down its +X like any camera. Call `ClearClientPose()` when there is nothing to
+show any more. A desktop camera should not send this: it flies, orbits and jumps between shots,
+and nobody is standing there.
+
 ## Automation tests
 
 After building the host's Editor target, run `Looma.Presence` through Unreal's
@@ -754,6 +776,24 @@ and scene identity changes with reused node ids versus same-scene resyncs.
 Check the exported `index.json` for **eight successes and zero failures**: the editor process can exit
 with code 0 even when an automation assertion fails. These checks verify ownership and stencil
 assignment; the host's outline material still needs a rendering acceptance pass.
+
+`Looma.Presence.ClientPose` checks `clientPose`:
+
+- reading a pose into UE space, which way the head faces, and dropping a malformed hand;
+- ignoring our own pose, and clearing on `t: null`;
+- hydrating from the roster only for clients not heard from yet, and taking the roster's colour;
+- forgetting whoever leaves the roster, and everyone when the socket drops;
+- the figure: its parts, where they land, and easing between poses.
+
+`Looma.Presence.ClientPose.Live` runs the same path against a real backend and skips itself unless
+it is given one and a scene. In PIE it waits for somebody in VR on that scene, then checks a
+figure is drawn where they are. It then sends its own pose for six seconds at wire (0, 1.7, −3),
+so a web client on the scene can check that it sees Unreal, and clears it. It changes nothing in
+the scene:
+
+```text
+UnrealEditor-Cmd.exe <host-project.uproject> -unattended -nullrhi -nosound -LoomaLiveBackend=http://127.0.0.1:8003 -LoomaLiveScene=demo-studio-floor -ExecCmds="Automation RunTests Looma.Presence.ClientPose.Live; Quit"
+```
 
 `Looma.Audio` checks the `audio` component: parsing with the format's defaults and repairs,
 WAV decoding and the mono mix-down, the fade (UE's own `Evaluate` of the attenuation against the
