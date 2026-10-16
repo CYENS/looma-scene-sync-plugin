@@ -6,10 +6,13 @@
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 #include "Engine/GameInstance.h"
+#include "IWebSocket.h"
 #include "Misc/AutomationTest.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "UObject/StrongObjectPtr.h"
+
+#include <limits>
 
 namespace
 {
@@ -95,14 +98,120 @@ bool FLoomaLiveLinkComponentSourceTest::RunTest(const FString& Parameters)
     return true;
 }
 
+namespace
+{
+    /** A socket that is always open and keeps what it is sent instead of sending it. */
+    class FLoomaRecordingSocket : public IWebSocket
+    {
+    public:
+        TArray<FString> Sent;
+
+        virtual void Connect() override {}
+        virtual void Close(int32 Code, const FString& Reason) override {}
+        virtual bool IsConnected() override { return true; }
+        virtual void Send(const FString& Data) override { Sent.Add(Data); }
+        virtual void Send(const void* Data, SIZE_T Size, bool bIsBinary) override {}
+        virtual void SetTextMessageMemoryLimit(uint64 Limit) override {}
+        virtual FWebSocketConnectedEvent& OnConnected() override { return Connected; }
+        virtual FWebSocketConnectionErrorEvent& OnConnectionError() override { return ConnectionError; }
+        virtual FWebSocketClosedEvent& OnClosed() override { return Closed; }
+        virtual FWebSocketMessageEvent& OnMessage() override { return Message; }
+        virtual FWebSocketBinaryMessageEvent& OnBinaryMessage() override { return BinaryMessage; }
+        virtual FWebSocketRawMessageEvent& OnRawMessage() override { return RawMessage; }
+        virtual FWebSocketMessageSentEvent& OnMessageSent() override { return MessageSent; }
+
+    private:
+        FWebSocketConnectedEvent Connected;
+        FWebSocketConnectionErrorEvent ConnectionError;
+        FWebSocketClosedEvent Closed;
+        FWebSocketMessageEvent Message;
+        FWebSocketBinaryMessageEvent BinaryMessage;
+        FWebSocketRawMessageEvent RawMessage;
+        FWebSocketMessageSentEvent MessageSent;
+    };
+}
+
 /** Feeds wire frames to a subsystem that never opened a socket. */
 struct FLoomaLivePoseTestAccess
 {
     TStrongObjectPtr<UGameInstance> GameInstance{NewObject<UGameInstance>()};
     TStrongObjectPtr<ULoomaSceneSyncSubsystem> Sync{NewObject<ULoomaSceneSyncSubsystem>(GameInstance.Get())};
 
+    ~FLoomaLivePoseTestAccess() { Sync->Socket.Reset(); }
+
     void Receive(const FString& Json) { Sync->OnRawMessage(Json); }
+
+    /** Connects the subsystem to a socket that keeps what it is sent. */
+    TSharedRef<FLoomaRecordingSocket> Plug()
+    {
+        const TSharedRef<FLoomaRecordingSocket> Socket = MakeShared<FLoomaRecordingSocket>();
+        Sync->Socket = Socket;
+        Sync->ClientId = TEXT("ue-test");
+        return Socket;
+    }
 };
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoomaLivePosePublishTest,
+    "Looma.LiveLink.PublishPose",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoomaLivePosePublishTest::RunTest(const FString& Parameters)
+{
+    FLoomaLivePoseTestAccess Access;
+    TArray<FQuat> Rotations;
+    Rotations.Init(FQuat::Identity, 22);
+    const FVector Hips(0.1, 1.0, -0.4);
+    const TSharedRef<FLoomaRecordingSocket> Socket = Access.Plug();
+
+    // What the hub reads off each frame.
+    const auto Parse = [this, &Socket](int32 Index) -> TSharedPtr<FJsonObject>
+    {
+        TSharedPtr<FJsonObject> Frame;
+        if (!TestTrue(TEXT("a frame was sent"), Socket->Sent.IsValidIndex(Index))
+            || !TestTrue(TEXT("and it is JSON"), FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Socket->Sent[Index]), Frame)))
+        {
+            return nullptr;
+        }
+        return Frame;
+    };
+
+    Access.Sync->PublishPose(TEXT("n1"), Hips, Rotations);
+    const TSharedPtr<FJsonObject> Untimed = Parse(0);
+    if (!Untimed)
+    {
+        return false;
+    }
+    TestEqual(TEXT("a pose frame"), Untimed->GetStringField(TEXT("type")), FString(TEXT("pose")));
+    TestEqual(TEXT("from this client"), Untimed->GetStringField(TEXT("origin")), FString(TEXT("ue-test")));
+    TestEqual(TEXT("for its node"), Untimed->GetStringField(TEXT("node")), FString(TEXT("n1")));
+    TestEqual(TEXT("with its hips"), Untimed->GetArrayField(TEXT("hips")).Num(), 3);
+    TestEqual(TEXT("and all its rotations"), Untimed->GetArrayField(TEXT("rot")).Num(), 22);
+    TestFalse(TEXT("given no time, it carries none, and the hub stamps it on arrival"), Untimed->HasField(TEXT("t")));
+
+    // An engine clock's seconds: FPlatformTime::Seconds() counts from boot.
+    const double Captured = 812345.67891;
+    Access.Sync->PublishPose(TEXT("n1"), Hips, Rotations, Captured);
+    const TSharedPtr<FJsonObject> Timed = Parse(1);
+    if (!Timed)
+    {
+        return false;
+    }
+    TestTrue(TEXT("given a time, it carries it as t"), Timed->HasTypedField<EJson::Number>(TEXT("t")));
+    TestTrue(TEXT("in seconds, to a tenth of a millisecond"),
+             FMath::IsNearlyEqual(Timed->GetNumberField(TEXT("t")), Captured, 1e-4));
+    TestTrue(TEXT("written fixed-point, not rounded to whole seconds"), Socket->Sent[1].Contains(TEXT("\"t\":812345.6789")));
+    TestEqual(TEXT("the rest of the frame is as before"), Timed->GetArrayField(TEXT("rot")).Num(), 22);
+
+    Access.Sync->PublishPose(TEXT("n1"), Hips, Rotations, 0.0);
+    const TSharedPtr<FJsonObject> Zero = Parse(2);
+    TestTrue(TEXT("zero is a time like any other"), Zero && Zero->HasField(TEXT("t")));
+
+    Access.Sync->PublishPose(TEXT("n1"), Hips, Rotations, std::numeric_limits<double>::quiet_NaN());
+    const TSharedPtr<FJsonObject> NotANumber = Parse(3);
+    TestTrue(TEXT("a time that is not a number is left out, and the frame stays JSON"),
+             NotANumber && !NotANumber->HasField(TEXT("t")));
+    return true;
+}
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoomaLivePoseReceiveTest,
     "Looma.LiveLink.ReceivePose",
