@@ -53,4 +53,10 @@ public:
      */
     UFUNCTION(BlueprintPure, Category = "Looma|Generation")
     static bool GetGenerationMetaString(const FLoomaGenerationJob& Job, const FString& Path, FString& Value);
+
+    /**
+     * What `Get Generation Meta String` does, on MetaJson text rather than a job: the
+     * job's node and ALoomaSyncedActor's both read through this. Empty text is no meta.
+     */
+    static bool FindGenerationMetaString(const FString& MetaJson, const FString& Path, FString& Value);
 };

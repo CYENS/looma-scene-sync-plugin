@@ -383,6 +383,7 @@ void ULoomaSceneSyncSubsystem::Deinitialize()
     PendingHandleReplays.Empty();
     SuggestedTransforms.Empty();
     JobMetas.Empty();
+    JobIdsByAsset.Empty();
     ActiveSceneId.Reset();
     bHasSceneIdentity = false;
     ActivePerformance = FLoomaPerformance();
@@ -3069,6 +3070,7 @@ void ULoomaSceneSyncSubsystem::UpsertNode(const TSharedPtr<FJsonObject>& Node)
         Entry->bMoving = false;
         Entry->StillFrames = 0;
     }
+    ApplyGenerationMeta(*Actor);
 
     if (bFresh)
     {
@@ -3587,6 +3589,7 @@ void ULoomaSceneSyncSubsystem::HandlePatch(const TSharedPtr<FJsonObject>& Msg)
             // Components are replaced as a whole, so the primitives we marked last
             // frame may be gone and new ones may now carry an existing claim.
             MarkBordersDirty();
+            ApplyGenerationMeta(*Actor);
         }
     }
 }
@@ -4173,6 +4176,8 @@ ALoomaSyncedActor* ULoomaSceneSyncSubsystem::SpawnSyncedAsset(const FString& Ass
     Msg->SetArrayField(TEXT("nodes"), Nodes);
     SendJson(Msg);
 
+    // Last, so a handler that looks the actor up, or despawns it, finds it complete.
+    ApplyGenerationMeta(*Actor);
     return Actor;
 }
 
@@ -5076,6 +5081,22 @@ void ULoomaSceneSyncSubsystem::ApplyJob(const FLoomaGenerationJob& InJob)
     }
 
     Jobs.Add(Job.JobId, Job);
+
+    // Which job made each asset, for the synced actors showing it. The newest wins, as
+    // in the backend's provenance, and the hydrate lists jobs newest first, so an older
+    // job must not take an asset over afterwards. Before the events below, so a node a
+    // handler spawns from this job already finds it.
+    if (!Job.AssetId.IsEmpty())
+    {
+        const FString* OwnerId = JobIdsByAsset.Find(Job.AssetId);
+        const FLoomaGenerationJob* Owner = OwnerId ? Jobs.Find(*OwnerId) : nullptr;
+        if (!Owner || Owner->JobId == Job.JobId || Owner->CreatedAt <= Job.CreatedAt)
+        {
+            JobIdsByAsset.Add(Job.AssetId, Job.JobId);
+            RefreshGenerationMeta(Job.AssetId);
+        }
+    }
+
     OnGenerationJobUpdated.Broadcast(Job);
     switch (Job.State)
     {
@@ -5298,6 +5319,43 @@ ALoomaSyncedActor* ULoomaSceneSyncSubsystem::FindSyncedActorByJobId(const FStrin
         }
     }
     return nullptr;
+}
+
+void ULoomaSceneSyncSubsystem::ApplyGenerationMeta(ALoomaSyncedActor& Actor)
+{
+    const FString& AssetId = Actor.GetMetaAssetId();
+    const FString* JobId = AssetId.IsEmpty() ? nullptr : JobIdsByAsset.Find(AssetId);
+    const FLoomaGenerationJob* Job = JobId ? Jobs.Find(*JobId) : nullptr;
+    const bool bHasMeta = Job && Job->bHasMeta;
+    const FString& MetaJson = bHasMeta ? Job->MetaJson : FString();
+    if (Actor.bHasMeta == bHasMeta && Actor.MetaJson == MetaJson)
+    {
+        return;
+    }
+    Actor.bHasMeta = bHasMeta;
+    Actor.MetaJson = MetaJson;
+    OnSyncedActorMetaChanged.Broadcast(&Actor);
+}
+
+void ULoomaSceneSyncSubsystem::RefreshGenerationMeta(const FString& AssetId)
+{
+    // Collected first: a handler may spawn or despawn nodes, which changes Tracked.
+    TArray<ALoomaSyncedActor*, TInlineAllocator<4>> Showing;
+    for (const TPair<FString, FLoomaTrackedActor>& Pair : Tracked)
+    {
+        ALoomaSyncedActor* Actor = Pair.Value.Actor.Get();
+        if (Actor && Actor->GetMetaAssetId() == AssetId)
+        {
+            Showing.Add(Actor);
+        }
+    }
+    for (ALoomaSyncedActor* Actor : Showing)
+    {
+        if (IsValid(Actor))
+        {
+            ApplyGenerationMeta(*Actor);
+        }
+    }
 }
 
 void ULoomaSceneSyncSubsystem::SelectImage(const FString& JobId, const FString& ImageId)

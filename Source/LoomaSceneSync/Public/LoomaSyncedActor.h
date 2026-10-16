@@ -102,6 +102,44 @@ public:
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
     FString JobId;
 
+    /**
+     * The meta the generation request behind this node's asset was submitted with, as
+     * compact JSON text (FLoomaGenerationJob::MetaJson), such as
+     * `{"unreal":{"environment":"LVL_Demo"}}`. The asset is its `model`'s, or its
+     * `audio`'s when it has no model, and the job is the newest one that produced it:
+     * what the web client's Details shows under *Generation meta*. Read one value with
+     * `Get Generation Meta String`.
+     *
+     * It describes the request, not this instance. A generated asset stays in the
+     * catalog and can be placed anywhere later, and every node showing it reports the
+     * same meta. A node needs no JobId for this: the asset is enough.
+     *
+     * Empty, with bHasMeta false, when the asset was not generated with a meta, and
+     * also while the job that made it is not known yet. A scene usually arrives before
+     * the connect-time job list does, so do not read it once at spawn: bind the
+     * subsystem's `On Synced Actor Meta Changed`, which fires when it changes.
+     */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    FString MetaJson;
+
+    /** True once this node's asset is known to have been generated with a meta. See MetaJson. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    bool bHasMeta = false;
+
+    /**
+     * Read one value of MetaJson by dotted path, such as "unreal.environment", as the
+     * library's node of the same name does for a job. False, with Value empty, while
+     * bHasMeta is false, when the path is not in it, or when it names a null.
+     */
+    UFUNCTION(BlueprintPure, Category = "Looma|Generation")
+    bool GetGenerationMetaString(const FString& Path, FString& Value) const;
+
+    /**
+     * The asset whose generation meta this node reports: its `model`'s, or its
+     * `audio`'s when it has no model. Empty when it has neither.
+     */
+    const FString& GetMetaAssetId() const;
+
     /** The node's transform. Always present, even when nothing renders. */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
     TObjectPtr<USceneComponent> SceneRoot;
