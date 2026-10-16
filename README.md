@@ -223,6 +223,26 @@ a job finishes (`On Asset Generated`, or the hub-wide `On Generation Job Done`),
 The web client shows a job's meta in its Details panel, under *Generation meta*, when you select
 an object placed from it.
 
+#### On a placed node
+
+Every `ALoomaSyncedActor` reports the same thing as **`MetaJson`** / **`bHasMeta`**, visible in
+its Details panel. They come from the newest job that produced the node's asset: its `model`'s, or
+its `audio`'s on a node with no model. That is the web client's rule, and the backend's asset
+provenance. The node needs no JobId, so a node another client placed from the catalog reports
+its meta too. Read one value with the actor's own `Get Generation Meta String (Path)`.
+
+- **It describes the request, not the node.** Every node showing one asset reports that asset's
+  meta, wherever it stands.
+- **It can arrive after the node.** On connect the scene usually lands before `GET /generate`
+  answers, so a node can sit there with `bHasMeta` false until its job is known. Bind the
+  subsystem's **`On Synced Actor Meta Changed`** once instead of reading the property at spawn. It
+  fires for each node when its meta becomes known, whichever arrived first, and when a node
+  changes to another asset (to none, if that one has none). A node that never has a meta never
+  fires it.
+
+To act only on nodes asked for from your environment, bind `On Synced Actor Meta Changed` and
+compare `Get Generation Meta String (Actor, "unreal.environment")` with your environment's id.
+
 ## Requirements
 
 - Unreal Engine 5.6
@@ -772,7 +792,10 @@ so the playback test plays non-spatial sources only. Hearing a fade is a PIE che
 `Looma.Generation.Meta` checks a job's `meta`: reading it off the event and the REST hydrate, a
 null or absent one, keeping it once known when a later event lacks it (in the cache, the
 hub-wide events and a handle), the submit body carrying it as an object, a non-object refused
-before any request, and the dotted-path helpers. It needs no backend:
+before any request, and the dotted-path helpers. `Looma.Generation.Meta.Actor` checks it on a
+placed node: known whether the node or the job comes first, from the newest job of the asset,
+from a sound only on a node with no model, dropped when the node changes asset, and the event
+fired once per change. They need no backend:
 
 ```text
 UnrealEditor-Cmd.exe <host-project.uproject> -unattended -nullrhi -ExecCmds="Automation RunTests Looma.Generation.Meta; Quit"
