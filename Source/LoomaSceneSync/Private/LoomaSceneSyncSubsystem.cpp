@@ -569,7 +569,8 @@ void ULoomaSceneSyncSubsystem::SendJson(const TSharedRef<FJsonObject>& Msg)
     Socket->Send(Text);
 }
 
-void ULoomaSceneSyncSubsystem::PublishPose(const FString& NodeId, const FVector& Hips, const TArray<FQuat>& Rotations)
+void ULoomaSceneSyncSubsystem::PublishPose(const FString& NodeId, const FVector& Hips, const TArray<FQuat>& Rotations,
+                                           TOptional<double> Time)
 {
     if (NodeId.IsEmpty() || !IsSyncConnected())
     {
@@ -592,7 +593,14 @@ void ULoomaSceneSyncSubsystem::PublishPose(const FString& NodeId, const FVector&
         const FQuat& Q = Rotations[Index];
         Text += FString::Printf(TEXT("%s[%.4f,%.4f,%.4f,%.4f]"), Index > 0 ? TEXT(",") : TEXT(""), Q.X, Q.Y, Q.Z, Q.W);
     }
-    Text += TEXT("]}");
+    Text += TEXT("]");
+    // Four decimals too: a tenth of a millisecond, finer than any capture rate. A
+    // NaN would print as `nan`, which is not JSON, and lose the hub the whole frame.
+    if (Time.IsSet() && FMath::IsFinite(Time.GetValue()))
+    {
+        Text += FString::Printf(TEXT(",\"t\":%.4f"), Time.GetValue());
+    }
+    Text += TEXT("}");
     Socket->Send(Text);
 }
 
