@@ -62,10 +62,16 @@ bool ULoomaGenerationLibrary::MakeGenerationMeta(const TMap<FString, FString>& V
 bool ULoomaGenerationLibrary::GetGenerationMetaString(const FLoomaGenerationJob& Job, const FString& Path,
     FString& Value)
 {
+    return FindGenerationMetaString(Job.bHasMeta ? Job.MetaJson : FString(), Path, Value);
+}
+
+bool ULoomaGenerationLibrary::FindGenerationMetaString(const FString& MetaJson, const FString& Path,
+    FString& Value)
+{
     Value.Reset();
     TSharedPtr<FJsonObject> Meta;
-    if (!Job.bHasMeta
-        || !FJsonSerializer::Deserialize(TJsonReaderFactory<TCHAR>::Create(Job.MetaJson), Meta)
+    if (MetaJson.IsEmpty()
+        || !FJsonSerializer::Deserialize(TJsonReaderFactory<TCHAR>::Create(MetaJson), Meta)
         || !Meta.IsValid())
     {
         return false;

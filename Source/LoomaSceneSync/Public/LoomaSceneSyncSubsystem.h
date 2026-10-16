@@ -165,6 +165,9 @@ struct FLoomaTrackedActor
 /** Fired for generation-job lifecycle changes. Carries the full job snapshot. */
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FLoomaGenerationJobEvent, const FLoomaGenerationJob&, Job);
 
+/** Fired for one synced actor. Which change it reports is the bound event's to say. */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FLoomaSyncedActorEvent, ALoomaSyncedActor*, Actor);
+
 /** Fired when the scene-sync socket connects / disconnects. */
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FLoomaSyncConnectionEvent);
 
@@ -1240,6 +1243,20 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Looma|Generation")
     ALoomaSyncedActor* FindSyncedActorByJobId(const FString& JobId) const;
 
+    /**
+     * A synced actor's MetaJson / bHasMeta changed (ALoomaSyncedActor::MetaJson): the
+     * job that made its asset became known, from the connect-time job list or a job
+     * finishing, or the node changed to an asset with another meta or none.
+     *
+     * Fires for every node whose asset has a meta, whichever arrived first, the node or
+     * its job, so one binding is enough to act on every node by its meta, such as
+     * hiding the ones another environment asked for. A node that never has one never
+     * fires. Nodes that already had theirs when you bound do not fire again: read their
+     * bHasMeta.
+     */
+    UPROPERTY(BlueprintAssignable, Category = "Looma|Generation")
+    FLoomaSyncedActorEvent OnSyncedActorMetaChanged;
+
     // --- Generation jobs (drive) ---------------------------------------------
     // SubmitGeneration is the async node ULoomaSubmitGenerationAction. The calls
     // below are fire-and-forget; the resulting state arrives via the events above.
@@ -1319,6 +1336,7 @@ private:
     friend struct FLoomaLivePoseTestAccess;
     friend struct FLoomaAudioTestAccess;
     friend struct FLoomaGenerationMetaTestAccess;
+    friend struct FLoomaSyncedActorMetaTestAccess;
 #endif
 
     void Connect();
@@ -1666,6 +1684,14 @@ private:
     void HydrateGenerationQueue();
     /** Store/replace a job and broadcast the matching events. */
     void ApplyJob(const FLoomaGenerationJob& Job);
+    /**
+     * Set Actor's MetaJson from the job that made its asset (GetMetaAssetId), and fire
+     * OnSyncedActorMetaChanged if that changed it. After every ApplyComponents, once
+     * the actor is tracked.
+     */
+    void ApplyGenerationMeta(ALoomaSyncedActor& Actor);
+    /** ApplyGenerationMeta on every tracked actor whose meta comes from AssetId. */
+    void RefreshGenerationMeta(const FString& AssetId);
     /** Fire-and-forget REST call; Body may be null. Results arrive over the WS. */
     void SendRest(const FString& Verb, const FString& Path, const TSharedPtr<FJsonObject>& Body);
 
@@ -2001,6 +2027,13 @@ private:
 
     /** jobId -> the submitter's meta as compact JSON, once learned. Never changes for a job. */
     TMap<FString, FString> JobMetas;
+
+    /**
+     * assetId -> the newest job that produced it, as the backend's asset provenance
+     * picks it. A synced actor's meta is read through this, because every node carries
+     * its asset and only a node spawned from a job carries the job's id.
+     */
+    TMap<FString, FString> JobIdsByAsset;
 
     /** Handles awaiting their first replay; drained at the top of Tick. */
     TArray<FString> PendingHandleReplays;

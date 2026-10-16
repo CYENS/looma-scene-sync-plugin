@@ -12,6 +12,7 @@
 #include "Engine/Scene.h"
 #include "Engine/SkeletalMesh.h"
 #include "Engine/StaticMesh.h"
+#include "LoomaGenerationLibrary.h"
 #include "LoomaSceneSyncLog.h"
 #include "LoomaSceneSyncSubsystem.h"
 #include "Materials/MaterialInstanceDynamic.h"
@@ -166,6 +167,25 @@ void ALoomaSyncedActor::ApplyComponents(const FLoomaNodeComponents& Next, const 
     }
 
     Components = Next;
+}
+
+// --- Generation meta ----------------------------------------------------------
+
+bool ALoomaSyncedActor::GetGenerationMetaString(const FString& Path, FString& Value) const
+{
+    return ULoomaGenerationLibrary::FindGenerationMetaString(bHasMeta ? MetaJson : FString(), Path, Value);
+}
+
+const FString& ALoomaSyncedActor::GetMetaAssetId() const
+{
+    // The web client's rule (frontend/src/ui/GenerationMeta.jsx): the model's asset,
+    // and a sound's only on a node with no model.
+    static const FString None;
+    if (Components.bHasModel)
+    {
+        return Components.Model.AssetId;
+    }
+    return Components.bHasAudio ? Components.Audio.AssetId : None;
 }
 
 void ALoomaSyncedActor::ApplyModel(const FLoomaNodeComponents& Next, const FLoomaNodeRenderContext& Context)
