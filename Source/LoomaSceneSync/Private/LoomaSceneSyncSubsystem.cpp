@@ -12,11 +12,14 @@
 #include "Interfaces/IHttpRequest.h"
 #include "Interfaces/IHttpResponse.h"
 #include "IWebSocket.h"
+#include "Camera/PlayerCameraManager.h"
+#include "Kismet/GameplayStatics.h"
 #include "Kismet/KismetMaterialLibrary.h"
 #include "LoomaAuthTypes.h"
 #include "LoomaGenerationHandle.h"
 #include "LoomaGenerationTypes.h"
 #include "LoomaGlbCache.h"
+#include "LoomaRemotePerson.h"
 #include "LoomaSceneComponents.h"
 #include "LoomaSceneSyncLog.h"
 #include "LoomaSceneSyncSettings.h"
@@ -368,6 +371,7 @@ void ULoomaSceneSyncSubsystem::Deinitialize()
     SettingsChangedHandle.Reset();
     CloseSocket();
     CancelGlbDownloads();
+    DestroyRemotePeople();
     // Drop the in-memory copy only. The saved session on disk is deliberately left
     // alone: outliving the game instance is the entire point of it, and closing the
     // editor is not a logout — ClearSession is the one thing that deletes the file.
@@ -2834,6 +2838,10 @@ void ULoomaSceneSyncSubsystem::OnRawMessage(const FString& Text)
     {
         HandleSelection(Msg);
     }
+    else if (Type == TEXT("clientPose"))
+    {
+        HandleClientPose(Msg);
+    }
     else
     {
         // Not an error — the hub may speak messages a newer backend added — but
@@ -3652,6 +3660,9 @@ void ULoomaSceneSyncSubsystem::Tick(float DeltaTime)
     // of the things the borders subtract — running it first would draw one frame of a
     // remote border on a node we had just taken.
     TickBorders();
+    // Ahead of the reconnect early-out like the borders: a dropped socket clears
+    // ClientPoses (ClearPresence), and this is what takes the figures away.
+    TickRemotePeople(DeltaTime);
 
     if (ReconnectCooldown > 0.0f)
     {
@@ -4326,6 +4337,51 @@ void ULoomaSceneSyncSubsystem::HandleClients(const TSharedPtr<FJsonObject>& Msg)
         }
     }
 
+    // Where everyone is (HAM-311 part 1), under the same two rules as selections:
+    // somebody the roster no longer lists is nowhere, and the roster's `pose` only
+    // hydrates somebody we have not heard from yet, since a roster can arrive after
+    // a fresher `clientPose`. A known client takes its colour from the roster.
+    {
+        TMap<FString, TSharedPtr<FJsonObject>> RosterPoses;
+        for (const TSharedPtr<FJsonValue>& Value : *Entries)
+        {
+            const TSharedPtr<FJsonObject>* Entry = nullptr;
+            const TSharedPtr<FJsonObject>* Pose = nullptr;
+            FString Id;
+            if (Value.IsValid() && Value->TryGetObject(Entry) && Entry
+                && (*Entry)->TryGetStringField(TEXT("id"), Id)
+                && (*Entry)->TryGetObjectField(TEXT("pose"), Pose) && Pose)
+            {
+                RosterPoses.Add(Id, *Pose);
+            }
+        }
+        for (auto It = ClientPoses.CreateIterator(); It; ++It)
+        {
+            if (!NextIds.Contains(It->Key))
+            {
+                It.RemoveCurrent();
+            }
+        }
+        for (const FLoomaClient& Client : RemoteClients)
+        {
+            if (FLoomaClientPose* Known = ClientPoses.Find(Client.Id))
+            {
+                Known->Color = Client.Color;
+                Known->ColorHex = Client.ColorHex;
+                continue;
+            }
+            const TSharedPtr<FJsonObject>* Pose = RosterPoses.Find(Client.Id);
+            FLoomaClientPose Hydrated;
+            if (Pose && LoomaParseClientPose(*Pose, Hydrated))
+            {
+                Hydrated.ClientId = Client.Id;
+                Hydrated.Color = Client.Color;
+                Hydrated.ColorHex = Client.ColorHex;
+                ClientPoses.Add(Client.Id, MoveTemp(Hydrated));
+            }
+        }
+    }
+
     // Only on an actual change — see FLoomaClientsEvent. The self half is folded into
     // the same event rather than given one of its own: a consumer showing "the colour
     // everyone else sees me in" has exactly one roster to read, and two events for one
@@ -4335,6 +4391,185 @@ void ULoomaSceneSyncSubsystem::HandleClients(const TSharedPtr<FJsonObject>& Msg)
         MarkBordersDirty();
         OnClientsChanged.Broadcast(RemoteClients);
     }
+}
+
+// --- Presence: where everyone is (`clientPose`, HAM-311 part 1) ---------------
+
+void ULoomaSceneSyncSubsystem::HandleClientPose(const TSharedPtr<FJsonObject>& Msg)
+{
+    FString SenderId;
+    if (!Msg->TryGetStringField(TEXT("clientId"), SenderId) || SenderId.IsEmpty()
+        || SenderId == ClientId || (!OwnClientId.IsEmpty() && SenderId == OwnClientId))
+    {
+        return;
+    }
+    // `t: null` is a real message: that client is no longer anywhere to be shown.
+    const TSharedPtr<FJsonValue> T = Msg->TryGetField(TEXT("t"));
+    if (!T.IsValid() || T->IsNull())
+    {
+        ClientPoses.Remove(SenderId);
+        return;
+    }
+    FLoomaClientPose Pose;
+    if (!LoomaParseClientPose(Msg, Pose))
+    {
+        return;
+    }
+    Pose.ClientId = SenderId;
+    // The message's colour, else the roster's, else grey: the same precedence a
+    // `selection` follows, since a pose can race the roster that introduces it.
+    FString Wire;
+    Msg->TryGetStringField(TEXT("color"), Wire);
+    const FLoomaClient* Known = RemoteClients.FindByPredicate(
+        [&SenderId](const FLoomaClient& Candidate) { return Candidate.Id == SenderId; });
+    if (LoomaNormalizeClientColorHex(Wire).IsEmpty() && Known)
+    {
+        Pose.Color = Known->Color;
+        Pose.ColorHex = Known->ColorHex;
+    }
+    else
+    {
+        LoomaParseClientColor(Wire, Pose.ColorHex, Pose.Color);
+    }
+    ClientPoses.Add(SenderId, MoveTemp(Pose));
+}
+
+TArray<FLoomaClientPose> ULoomaSceneSyncSubsystem::GetClientPoses() const
+{
+    TArray<FLoomaClientPose> Out;
+    ClientPoses.GenerateValueArray(Out);
+    return Out;
+}
+
+namespace
+{
+    /** `{"p":[…],"q":[…]}` for one UE transform, four decimals a number (see PublishPose). */
+    FString WirePose(const FTransform& T)
+    {
+        const TSharedRef<FJsonObject> Wire = LoomaUeToWire(T);
+        const TArray<TSharedPtr<FJsonValue>>& P = Wire->GetArrayField(TEXT("p"));
+        const TArray<TSharedPtr<FJsonValue>>& Q = Wire->GetArrayField(TEXT("q"));
+        return FString::Printf(TEXT("{\"p\":[%.4f,%.4f,%.4f],\"q\":[%.5f,%.5f,%.5f,%.5f]}"),
+            P[0]->AsNumber(), P[1]->AsNumber(), P[2]->AsNumber(),
+            Q[0]->AsNumber(), Q[1]->AsNumber(), Q[2]->AsNumber(), Q[3]->AsNumber());
+    }
+}
+
+void ULoomaSceneSyncSubsystem::SendClientPose(const FTransform& Head, bool bHasLeftHand, const FTransform& LeftHand,
+                                              bool bHasRightHand, const FTransform& RightHand, const FString& Hint)
+{
+    if (!IsSyncConnected())
+    {
+        return;
+    }
+    // Written by hand, like PublishPose, so twenty a second stay small.
+    FString Text;
+    Text.Reserve(384);
+    Text += TEXT("{\"type\":\"clientPose\",\"origin\":\"");
+    Text += ClientId.ReplaceCharWithEscapedChar();
+    Text += FString::Printf(TEXT("\",\"seq\":%lld"), ClientPoseSeq++);
+    if (!Hint.IsEmpty())
+    {
+        Text += TEXT(",\"hint\":\"");
+        Text += Hint.ReplaceCharWithEscapedChar();
+        Text += TEXT("\"");
+    }
+    Text += TEXT(",\"t\":");
+    Text += WirePose(Head);
+    if (bHasLeftHand || bHasRightHand)
+    {
+        Text += TEXT(",\"hands\":{");
+        if (bHasLeftHand)
+        {
+            Text += TEXT("\"left\":");
+            Text += WirePose(LeftHand);
+        }
+        if (bHasRightHand)
+        {
+            Text += bHasLeftHand ? TEXT(",\"right\":") : TEXT("\"right\":");
+            Text += WirePose(RightHand);
+        }
+        Text += TEXT("}");
+    }
+    Text += TEXT("}");
+    Socket->Send(Text);
+}
+
+void ULoomaSceneSyncSubsystem::ClearClientPose()
+{
+    TSharedRef<FJsonObject> Msg = MakeShared<FJsonObject>();
+    Msg->SetStringField(TEXT("type"), TEXT("clientPose"));
+    Msg->SetField(TEXT("t"), MakeShared<FJsonValueNull>());
+    SendJson(Msg);
+}
+
+void ULoomaSceneSyncSubsystem::TickRemotePeople(float DeltaTime)
+{
+    UWorld* World = GetGameInstance() ? GetGameInstance()->GetWorld() : nullptr;
+    const bool bDraw = World && GetDefault<ULoomaSceneSyncSettings>()->bDrawRemotePeople;
+
+    // Gone from the table, or from the world it was spawned in (a level change).
+    for (auto It = RemotePeople.CreateIterator(); It; ++It)
+    {
+        ALoomaRemotePerson* Person = It->Value.Get();
+        if (!Person || !bDraw || !ClientPoses.Contains(It->Key) || Person->GetWorld() != World)
+        {
+            if (Person)
+            {
+                Person->Destroy();
+            }
+            It.RemoveCurrent();
+        }
+    }
+    if (!bDraw || ClientPoses.IsEmpty())
+    {
+        return;
+    }
+
+    // Most of the way to a new pose within a frame interval or two of the sender's
+    // twenty a second, as the web eases it.
+    const float Alpha = 1.0f - FMath::Exp(-12.0f * FMath::Min(DeltaTime, 0.1f));
+    FVector ViewLocation = FVector::ZeroVector;
+    if (APlayerCameraManager* Camera = UGameplayStatics::GetPlayerCameraManager(World, 0))
+    {
+        ViewLocation = Camera->GetCameraLocation();
+    }
+
+    for (const TPair<FString, FLoomaClientPose>& Entry : ClientPoses)
+    {
+        bool bSnap = false;
+        TWeakObjectPtr<ALoomaRemotePerson>& Slot = RemotePeople.FindOrAdd(Entry.Key);
+        if (!Slot.IsValid())
+        {
+            FActorSpawnParameters Params;
+            Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+            Params.ObjectFlags |= RF_Transient;
+            Slot = World->SpawnActor<ALoomaRemotePerson>(Entry.Value.Head.GetLocation(), FRotator::ZeroRotator, Params);
+            bSnap = true;
+        }
+        ALoomaRemotePerson* Person = Slot.Get();
+        if (!Person)
+        {
+            continue;
+        }
+        const FLoomaClient* Client = RemoteClients.FindByPredicate(
+            [&Entry](const FLoomaClient& Candidate) { return Candidate.Id == Entry.Key; });
+        const FString Name = Client && !Client->DisplayName.IsEmpty() ? Client->DisplayName : FString(TEXT("Somebody"));
+        Person->SetLook(Entry.Value.Color, Name);
+        Person->Follow(Entry.Value, Alpha, bSnap, ViewLocation);
+    }
+}
+
+void ULoomaSceneSyncSubsystem::DestroyRemotePeople()
+{
+    for (const TPair<FString, TWeakObjectPtr<ALoomaRemotePerson>>& Entry : RemotePeople)
+    {
+        if (ALoomaRemotePerson* Person = Entry.Value.Get())
+        {
+            Person->Destroy();
+        }
+    }
+    RemotePeople.Reset();
 }
 
 void ULoomaSceneSyncSubsystem::HandleSelection(const TSharedPtr<FJsonObject>& Msg)
@@ -4883,6 +5118,9 @@ void ULoomaSceneSyncSubsystem::ClearPresence()
 {
     const bool bHadRoom = RemoteClients.Num() > 0 || !OwnClientId.IsEmpty() || !SelfClient.Id.IsEmpty();
     RemoteClients.Reset();
+    // Where people were is scene-scoped presence too: gone with the socket or the
+    // scene. The figures follow on the next tick.
+    ClientPoses.Reset();
     SelfClient = FLoomaClient();
     OwnClientId.Reset();
     // The ledger goes with the room it describes. It is derived entirely from the

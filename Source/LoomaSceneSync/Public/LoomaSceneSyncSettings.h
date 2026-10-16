@@ -71,6 +71,15 @@ public:
     bool bBaseAlignModels = true;
 
     /**
+     * Draw the other people on the scene who say where they are (`clientPose`,
+     * HAM-311 part 1): a head in their colour, their hands and their name, as the web
+     * client draws them. Off leaves GetClientPoses() and OnClientPosesChanged for a
+     * project that would rather draw them itself.
+     */
+    UPROPERTY(EditAnywhere, Config, Category = "Rendering", meta = (DisplayName = "Draw Remote People"))
+    bool bDrawRemotePeople = true;
+
+    /**
      * Prefix a **web** client needs in front of `/static/...` — the Vite proxy path,
      * i.e. the backend's `LOOMA_PUBLIC_API_PREFIX`. Only used to fill in the `url` of
      * a `model` we spawn, since the browser cannot rebuild that path itself and the

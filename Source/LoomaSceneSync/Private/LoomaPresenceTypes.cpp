@@ -2,6 +2,7 @@
 
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
+#include "LoomaWireConvert.h"
 
 const TCHAR* const LoomaFallbackClientColorHex = TEXT("#bbbbbb");
 
@@ -111,4 +112,76 @@ FLoomaClient LoomaParseClient(const TSharedPtr<FJsonObject>& ClientObj)
         }
     }
     return Client;
+}
+
+namespace
+{
+    /** `{p: [x,y,z], q: [x,y,z,w]}` with numbers in both, as the hub vets them. */
+    bool IsWireTransform(const TSharedPtr<FJsonObject>& T)
+    {
+        if (!T.IsValid())
+        {
+            return false;
+        }
+        const TArray<TSharedPtr<FJsonValue>>* P = nullptr;
+        const TArray<TSharedPtr<FJsonValue>>* Q = nullptr;
+        if (!T->TryGetArrayField(TEXT("p"), P) || !P || P->Num() != 3
+            || !T->TryGetArrayField(TEXT("q"), Q) || !Q || Q->Num() != 4)
+        {
+            return false;
+        }
+        // A JSON number and nothing else: TryGetNumber would also take the string
+        // "1", which the hub refuses and so must we.
+        auto Numbers = [](const TArray<TSharedPtr<FJsonValue>>& Values)
+        {
+            for (const TSharedPtr<FJsonValue>& Value : Values)
+            {
+                if (!Value.IsValid() || Value->Type != EJson::Number || !FMath::IsFinite(Value->AsNumber()))
+                {
+                    return false;
+                }
+            }
+            return true;
+        };
+        return Numbers(*P) && Numbers(*Q);
+    }
+
+    /** One wire transform, without its scale: a head or a hand has none. */
+    bool ReadPose(const TSharedPtr<FJsonObject>& Parent, const TCHAR* Field, FTransform& Out)
+    {
+        const TSharedPtr<FJsonObject>* T = nullptr;
+        if (!Parent->TryGetObjectField(Field, T) || !T || !IsWireTransform(*T))
+        {
+            return false;
+        }
+        Out = LoomaWireToUe(*T);
+        Out.SetScale3D(FVector::OneVector);
+        Out.NormalizeRotation();
+        return true;
+    }
+}
+
+bool LoomaParseClientPose(const TSharedPtr<FJsonObject>& PoseObj, FLoomaClientPose& OutPose)
+{
+    if (!PoseObj.IsValid())
+    {
+        return false;
+    }
+    FTransform Head;
+    if (!ReadPose(PoseObj, TEXT("t"), Head))
+    {
+        return false;
+    }
+    OutPose.Head = Head;
+    OutPose.Hint.Reset();
+    PoseObj->TryGetStringField(TEXT("hint"), OutPose.Hint);
+    OutPose.bHasLeftHand = false;
+    OutPose.bHasRightHand = false;
+    const TSharedPtr<FJsonObject>* Hands = nullptr;
+    if (PoseObj->TryGetObjectField(TEXT("hands"), Hands) && Hands && Hands->IsValid())
+    {
+        OutPose.bHasLeftHand = ReadPose(*Hands, TEXT("left"), OutPose.LeftHand);
+        OutPose.bHasRightHand = ReadPose(*Hands, TEXT("right"), OutPose.RightHand);
+    }
+    return true;
 }
