@@ -3114,6 +3114,8 @@ void ULoomaSceneSyncSubsystem::ApplyParent(ALoomaSyncedActor& Actor, const FStri
     {
         Actor.DetachFromActor(FDetachmentTransformRules::KeepRelativeTransform);
     }
+    // Under a hidden parent it is hidden too, and out from under one it is not.
+    Actor.RefreshHidden();
 
     // Set the pose *after* attaching, because it is relative to whatever we just
     // attached to. UE composes parent scale x child relative location the same way
@@ -3138,6 +3140,7 @@ void ULoomaSceneSyncSubsystem::ResolvePendingParents()
             UE_LOG(LogLoomaSync, Verbose, TEXT("Node '%s' found parent '%s' late — attaching"),
                 *Actor->Id, *Actor->ParentId);
             Actor->AttachToActor(Parent, FAttachmentTransformRules::KeepRelativeTransform);
+            Actor->RefreshHidden();
         }
     }
 }

@@ -208,6 +208,23 @@ public:
     void ApplyComponents(const FLoomaNodeComponents& Next, const FLoomaNodeRenderContext& Context);
 
     /**
+     * True while this node is not drawn: it carries the `hidden` component, or a node
+     * it is attached under does. RefreshHidden keeps it.
+     */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    bool bHiddenInScene = false;
+
+    /**
+     * Hide or show this actor by its own `hidden` switch and its parent's state, and
+     * pass the answer down to the synced actors attached under it.
+     *
+     * The format hides a whole subtree, where SetActorHiddenInGame hides one actor, so
+     * the parent's state has to be pushed down the attachment by hand. ApplyComponents
+     * calls this, and the subsystem calls it after every change of parent.
+     */
+    void RefreshHidden();
+
+    /**
      * Ask for the `model` component's GLB. The download goes through the subsystem's
      * queue (ULoomaSceneSyncSubsystem::RequestGlb), which calls OnGlbDownloaded.
      */

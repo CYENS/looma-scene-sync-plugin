@@ -348,6 +348,16 @@ struct FLoomaNodeComponents
     /** Whether the backend's hub, not a client, drives this node. */
     bool IsLiveLinkFromHub() const { return !LiveLinkSubject.IsEmpty() && LiveLinkSource == LoomaLiveLinkHubSource; }
 
+    /**
+     * The `hidden` component (looma-xr-asset-demo docs/scene-format.md, "The `hidden`
+     * component"): the node is switched off, and so is everything under it. Nothing of
+     * it is drawn, lit or collided with; its sound plays on. This is the node's own
+     * switch only. Whether an ancestor's is on is the actor's to work out, from its
+     * attachment (ALoomaSyncedActor::RefreshHidden).
+     */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    bool bHidden = false;
+
     /** Types this build does not understand. Logged once each; never rendered, never dropped. */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
     TArray<FString> UnknownTypes;
@@ -364,7 +374,7 @@ struct FLoomaNodeComponents
             && bHasAnimation == Other.bHasAnimation && (!bHasAnimation || Animation == Other.Animation)
             && bHasAudio == Other.bHasAudio && (!bHasAudio || Audio == Other.Audio)
             && LiveLinkSubject == Other.LiveLinkSubject && LiveLinkSource == Other.LiveLinkSource
-            && LiveLinkStream == Other.LiveLinkStream;
+            && LiveLinkStream == Other.LiveLinkStream && bHidden == Other.bHidden;
     }
     bool operator!=(const FLoomaNodeComponents& Other) const { return !(*this == Other); }
 };
