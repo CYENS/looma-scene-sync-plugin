@@ -1337,6 +1337,7 @@ private:
     friend struct FLoomaAudioTestAccess;
     friend struct FLoomaGenerationMetaTestAccess;
     friend struct FLoomaSyncedActorMetaTestAccess;
+    friend struct FLoomaHiddenTestFixture;
 #endif
 
     void Connect();
