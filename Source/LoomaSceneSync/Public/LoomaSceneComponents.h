@@ -370,8 +370,10 @@ struct FLoomaNodeComponents
 };
 
 /**
- * Parse a node's `components` array. A null/absent array is an empty object, which
- * is a perfectly good node — its children's transforms are relative to it.
+ * Parse the active runtime specs from a node's `components` array. A literal
+ * `enabled: false` omits that spec; the actor retains the full wire array for edits.
+ * A null/absent array is an empty object, which is a perfectly good node — its
+ * children's transforms are relative to it.
  */
 LOOMASCENESYNC_API FLoomaNodeComponents LoomaParseComponents(const TArray<TSharedPtr<FJsonValue>>* Components);
 

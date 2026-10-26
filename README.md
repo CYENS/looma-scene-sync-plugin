@@ -118,6 +118,17 @@ warning naming the actor. Component edits are not reported outbound yet.
 | `audio` | `UAudioComponent` playing `<BackendUrl>/static/<assetId>.wav`, fetched through the same queue as the GLBs and decoded into a `ULoomaSoundWave`. `volume`, `pitch`, `loop`, `playing`, `spatial`, `minDistance`, `maxDistance` and `rolloff`, as below |
 | anything else | **Skipped, with the node kept** — logged once per type. That rule is what lets a new component type ship without a coordinated release across three clients |
 
+**`enabled: false` switches off one component**, leaving its definition on the node
+for edits and re-enabling. Models, meshes, lights and sound use their normal removal
+paths; a disabled material uses the default grey, a disabled animation stands at
+rest, and disabled Live Link exposes no active subject. Children keep rendering.
+Only a literal JSON false means off; missing or any other value means on. The
+Blueprint component getters describe these active runtime specs; `WireComponents`
+retains the complete definitions. This does not implement whole-object `hidden`.
+
+See [the backend compatibility review](docs/backend-compatibility-2026-10-26.md)
+for the remaining gaps and existing work to reuse.
+
 ### Light intensity
 
 three.js in its physically-correct mode (which the web client uses, `decay = 2`) measures point
@@ -758,6 +769,10 @@ project's business and it must not change when the room does — which is the po
 your-selection-always-wins rule above.
 
 ## Automation tests
+
+`Looma.Components.Enabled` checks the component switch through parsing and real
+scene patches, including re-enabling, retained wire fields, material defaults and
+unaffected children. It runs headless without a backend.
 
 After building the host's Editor target, run `Looma.Presence` through Unreal's
 Automation window, or from the command line:

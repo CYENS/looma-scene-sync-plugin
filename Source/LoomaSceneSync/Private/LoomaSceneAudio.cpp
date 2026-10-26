@@ -2,6 +2,7 @@
 
 #include "Audio.h"
 #include "Curves/RichCurve.h"
+#include "Runtime/Launch/Resources/Version.h"
 #include "Sound/SoundGenerator.h"
 
 #include <atomic>
@@ -203,7 +204,11 @@ public:
 
     virtual bool IsFinished() const override { return bFinished; }
 
+#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 8)
+    // 5.8's generator-source renderer asks the generator; 5.6 reads USoundWave's
+    // NumChannels, which SetSound also fills, and has no such virtual to override.
     virtual int32 GetNumChannels() const override { return Shared->NumChannels; }
+#endif
 
 private:
     TSharedPtr<FLoomaSoundSamples, ESPMode::ThreadSafe> Shared;
