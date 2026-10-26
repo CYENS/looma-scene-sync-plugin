@@ -152,6 +152,16 @@ FLoomaNodeComponents LoomaParseComponents(const TArray<TSharedPtr<FJsonValue>>* 
             continue; // unaddressable — dropped, exactly as the backend drops it
         }
 
+        // Only a literal false switches a component off (scene-format.md). Keep
+        // its definition in the actor's WireComponents, but omit its runtime spec
+        // so the existing removal paths stop it without touching the children.
+        // TryGetBoolField alone would also coerce 0 and "false" into an off switch.
+        const TSharedPtr<FJsonValue> Enabled = C->TryGetField(TEXT("enabled"));
+        if (Enabled.IsValid() && Enabled->Type == EJson::Boolean && !Enabled->AsBool())
+        {
+            continue;
+        }
+
         if (Type == TEXT("model"))         { ParseModel(C, Out); }
         else if (Type == TEXT("mesh"))     { ParseMesh(C, Out); }
         else if (Type == TEXT("material")) { ParseMaterial(C, Out); }

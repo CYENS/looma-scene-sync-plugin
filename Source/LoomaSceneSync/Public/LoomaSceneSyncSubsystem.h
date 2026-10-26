@@ -1333,6 +1333,7 @@ private:
     // The fixture seeds a transient scene and feeds wire frames without opening a
     // socket or restoring a session. Production callers use the public scene API.
     friend struct FLoomaBorderRefreshTestFixture;
+    friend struct FLoomaComponentEnabledTestAccess;
     friend struct FLoomaLivePoseTestAccess;
     friend struct FLoomaAudioTestAccess;
     friend struct FLoomaGenerationMetaTestAccess;
