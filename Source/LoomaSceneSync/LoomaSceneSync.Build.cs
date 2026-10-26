@@ -30,6 +30,9 @@ public class LoomaSceneSync : ModuleRules
             // The `audio` component's sound wave: a USoundWave is an audio proxy
             // factory, whose interface lives here.
             "AudioExtensions",
+            "ImageCore",
+            "RenderCore",
+            "RHI",
         });
 
         // The plugin's only editor dependency, and it must stay editor-only: UnrealEd

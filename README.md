@@ -15,13 +15,33 @@ The protocol it implements is specified in
 
 ## Contents
 
+Skyboxes use the same Scene Document v3 component path as geometry and lights.
+Upload a 2:1 PNG/JPEG/HDR/EXR panorama or optional cubemap ZIP to the backend, then add its `skybox` component in
+the web editor, or call `SpawnSyncedSkybox(Spec, Name)` from Blueprint/C++. The
+shared controls are right-handed Y yaw in degrees, exposure in stops and a linear
+tint (sRGB hex on the wire). The smallest ordinal enabled, non-hidden node ID wins;
+node transforms do not orient the background. See the asset-demo's
+`docs/skyboxes.md` for the full portable contract.
+
+Set `Spec.Url` to the catalog URL for HDR (`.hdr`); the legacy ID-only fallback is
+PNG. `bLighting` enables a movable sky light with HDR diffuse/specular filtering,
+and `LightingIntensity` is a linear multiplier (0–16). Lighting defaults off for
+older scenes. Tint/exposure/yaw apply to both background and light. Existing host
+sky lights are suspended while active and restored on disable/removal. The
+runtime creates its cubemap from the canonical panorama; cube upload is optional.
+
+The plugin now ships **Content/Materials/M_LoomaPanorama.uasset**. Include Content
+when distributing it. `Scripts/create_skybox_material.py` rebuilds the asset in an
+editor with PythonScriptPlugin enabled; the runtime has no Python dependency.
+
 | Unit | Purpose |
 | --- | --- |
 | `ULoomaSceneSyncSubsystem` | Owns the WebSocket connection, dispatches scene messages, loads GLBs at runtime, spawns synced assets |
 | `ULoomaSceneSyncSettings` | Project Settings > Plugins > Looma Scene Sync — the backend URL and the rendering knobs, read live |
 | `ALoomaSyncedActor` | One scene **node**: a transform, with the engine components its wire components ask for |
-| `LoomaSceneComponents` | The wire's `components` array parsed into keyed specs (`model` / `mesh` / `material` / `light` / `audio`) |
+| `LoomaSceneComponents` | The wire's `components` array parsed into keyed specs (`model` / `mesh` / `material` / `light` / `audio` / `skybox`), with disabled and hidden handling |
 | `LoomaSceneAudio` | The `audio` component's sound: a datalake WAV decoded (`LoomaDecodeWav`), played from memory (`ULoomaSoundWave`), and faded as the format says (`LoomaMakeAttenuation`) |
+| `ALoomaSkyboxActor` | Camera-relative panoramic background, loaded over HTTP; stale image requests cannot reinstall old skies |
 | `LoomaWireConvert` | Wire↔UE transform conversion, shared by the scene-sync layer and the generation-job parser |
 | `ELoomaJobState` / `LoomaGenerationTypes` | Text→3D job lifecycle, mirroring the backend's `JobState` vocabulary |
 | `ULoomaGenerationHandle` | One generation job's events, scoped to that job — raw state events plus per-stage ones (queued / generating images / awaiting selection / generating asset / generated), and the calls to drive the job |

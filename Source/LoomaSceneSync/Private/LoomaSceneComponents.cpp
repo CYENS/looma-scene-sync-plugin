@@ -152,6 +152,7 @@ FLoomaNodeComponents LoomaParseComponents(const TArray<TSharedPtr<FJsonValue>>* 
             continue; // unaddressable — dropped, exactly as the backend drops it
         }
 
+        if (Type == TEXT("hidden")) { Out.bHidden = true; continue; }
         // Only a literal false switches a component off (scene-format.md). Keep
         // its definition in the actor's WireComponents, but omit its runtime spec
         // so the existing removal paths stop it without touching the children.
@@ -162,7 +163,22 @@ FLoomaNodeComponents LoomaParseComponents(const TArray<TSharedPtr<FJsonValue>>* 
             continue;
         }
 
-        if (Type == TEXT("model"))         { ParseModel(C, Out); }
+        if (Type == TEXT("skybox"))
+        {
+            Out.bHasSkybox = true;
+            C->TryGetStringField(TEXT("assetId"), Out.Skybox.AssetId);
+            C->TryGetStringField(TEXT("url"), Out.Skybox.Url);
+            ReadFloat(C, TEXT("rotation"), Out.Skybox.Rotation);
+            ReadFloat(C, TEXT("exposure"), Out.Skybox.Exposure);
+            Out.Skybox.Rotation = FMath::IsFinite(Out.Skybox.Rotation) ? FMath::Fmod(Out.Skybox.Rotation, 360.0f) : 0;
+            Out.Skybox.Exposure = FMath::IsFinite(Out.Skybox.Exposure) ? FMath::Clamp(Out.Skybox.Exposure, -8.0f, 8.0f) : 0;
+            ReadColor(C, TEXT("tint"), Out.Skybox.Tint);
+            C->TryGetBoolField(TEXT("lighting"), Out.Skybox.bLighting);
+            ReadFloat(C, TEXT("lightingIntensity"), Out.Skybox.LightingIntensity);
+            Out.Skybox.LightingIntensity = FMath::IsFinite(Out.Skybox.LightingIntensity)
+                ? FMath::Clamp(Out.Skybox.LightingIntensity, 0.0f, 16.0f) : 1;
+        }
+        else if (Type == TEXT("model"))    { ParseModel(C, Out); }
         else if (Type == TEXT("mesh"))     { ParseMesh(C, Out); }
         else if (Type == TEXT("material")) { ParseMaterial(C, Out); }
         else if (Type == TEXT("light"))    { ParseLight(C, Out); }

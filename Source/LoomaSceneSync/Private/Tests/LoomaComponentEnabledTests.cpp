@@ -41,8 +41,8 @@ bool FLoomaComponentEnabledParseTest::RunTest(const FString& Parameters)
         const TArray<TSharedPtr<FJsonValue>> Values = ParseArray(FString::Printf(TEXT(R"([
             {"type":"model","assetId":"chair"%s}, {"type":"mesh"%s},
             {"type":"material"%s}, {"type":"light"%s}, {"type":"audio","assetId":"sound"%s},
-            {"type":"animation","clip":"Walk"%s}, {"type":"livelink","subject":"Actor0","source":"hub"%s}
-        ])"), Field, Field, Field, Field, Field, Field, Field));
+            {"type":"skybox","assetId":"sky"%s}, {"type":"animation","clip":"Walk"%s}, {"type":"livelink","subject":"Actor0","source":"hub"%s}
+        ])"), Field, Field, Field, Field, Field, Field, Field, Field));
         const bool bActive = FString(Field) != TEXT(",\"enabled\":false");
         const FLoomaNodeComponents Parsed = LoomaParseComponents(&Values);
         const FString Label = FString::Printf(TEXT("field '%s': "), Field);
@@ -51,10 +51,11 @@ bool FLoomaComponentEnabledParseTest::RunTest(const FString& Parameters)
         TestEqual(Label + TEXT("material"), Parsed.bHasMaterial, bActive);
         TestEqual(Label + TEXT("light"), Parsed.bHasLight, bActive);
         TestEqual(Label + TEXT("audio"), Parsed.bHasAudio, bActive);
+        TestEqual(Label + TEXT("skybox"), Parsed.bHasSkybox, bActive);
         TestEqual(Label + TEXT("animation"), Parsed.bHasAnimation, bActive);
         TestEqual(Label + TEXT("Live Link subject"), !Parsed.LiveLinkSubject.IsEmpty(), bActive);
         TestEqual(Label + TEXT("hub driver"), Parsed.IsLiveLinkFromHub(), bActive);
-        TestEqual(TEXT("parsing keeps every wire component"), Values.Num(), 7);
+        TestEqual(TEXT("parsing keeps every wire component"), Values.Num(), 8);
     }
 
     // A later Live Link edit must keep the disabled model's fields, even though it

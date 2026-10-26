@@ -18,6 +18,7 @@
 #include "LoomaGenerationTypes.h"
 #include "LoomaGlbCache.h"
 #include "LoomaSceneComponents.h"
+#include "LoomaSkyboxActor.h"
 #include "LoomaSceneSyncLog.h"
 #include "LoomaSceneSyncSettings.h"
 #include "LoomaSyncedActor.h"
@@ -380,6 +381,8 @@ void ULoomaSceneSyncSubsystem::Deinitialize()
     AuthToken.Empty();
     CurrentIdentity = FLoomaIdentity();
     Tracked.Empty();
+    if (SkyboxActor) SkyboxActor->Destroy();
+    SkyboxActor = nullptr;
     JobHandles.Empty();
     PendingHandleReplays.Empty();
     SuggestedTransforms.Empty();
@@ -2786,6 +2789,8 @@ void ULoomaSceneSyncSubsystem::OnRawMessage(const FString& Text)
         return;
     }
     const FString Type = Msg->GetStringField(TEXT("type"));
+    if (Type == TEXT("scene") || Type == TEXT("spawn") || Type == TEXT("despawn") ||
+        Type == TEXT("patch") || Type == TEXT("reparent")) bSkyboxDirty = true;
 
     bApplyingRemote = true;
     if (Type == TEXT("scene"))
@@ -2844,6 +2849,46 @@ void ULoomaSceneSyncSubsystem::OnRawMessage(const FString& Text)
         UE_LOG(LogLoomaSync, Verbose, TEXT("Ignoring unknown message type '%s'"), *Type);
     }
     bApplyingRemote = false;
+}
+
+void ULoomaSceneSyncSubsystem::RefreshSkybox()
+{
+    ALoomaSyncedActor* Chosen = nullptr;
+    FString Url;
+    for (const auto& Pair : Tracked)
+    {
+        ALoomaSyncedActor* Actor = Pair.Value.Actor.Get();
+        if (!Actor) continue;
+        TSet<FString> Visited;
+        bool bHidden = false;
+        for (ALoomaSyncedActor* Current = Actor; Current; Current = FindSyncedActor(Current->ParentId))
+        {
+            if (Visited.Contains(Current->Id) || Current->GetComponents().bHidden) { bHidden = true; break; }
+            Visited.Add(Current->Id);
+        }
+        if (Actor->IsHidden() != bHidden)
+        {
+            Actor->SetActorHiddenInGame(bHidden);
+            Actor->SceneRoot->SetVisibility(!bHidden, true);
+        }
+        const auto& Components = Actor->GetComponents();
+        if (bHidden || !Components.bHasSkybox || (Chosen && Actor->Id.Compare(Chosen->Id, ESearchCase::CaseSensitive) >= 0)) continue;
+        const auto& Sky = Components.Skybox;
+        FString Candidate = Sky.Url;
+        if (Candidate.IsEmpty() && !Sky.AssetId.IsEmpty()) Candidate = TEXT("/static/") + FGenericPlatformHttp::UrlEncode(Sky.AssetId) + TEXT(".png");
+        if (Candidate.StartsWith(TEXT("/api/"))) Candidate.RightChopInline(4);
+        if (Candidate.StartsWith(TEXT("/")) && !Candidate.StartsWith(TEXT("//"))) Candidate = GetRestBase() + Candidate;
+        if (!Candidate.StartsWith(TEXT("http://")) && !Candidate.StartsWith(TEXT("https://"))) continue;
+        Chosen = Actor;
+        Url = Candidate;
+    }
+    if (!Chosen)
+    {
+        if (SkyboxActor) SkyboxActor->Apply(FString(), FLoomaSkyboxSpec());
+        return;
+    }
+    if (!SkyboxActor && GetWorld()) SkyboxActor = GetWorld()->SpawnActor<ALoomaSkyboxActor>();
+    if (SkyboxActor) SkyboxActor->Apply(Url, Chosen->GetComponents().Skybox);
 }
 
 void ULoomaSceneSyncSubsystem::HandleScene(const TSharedPtr<FJsonObject>& Msg)
@@ -3613,6 +3658,7 @@ void ULoomaSceneSyncSubsystem::OnSyncedActorDestroyed(AActor* DestroyedActor)
         return;
     }
     const bool bWasTracked = Tracked.Remove(Actor->Id) > 0;
+    bSkyboxDirty = true;
     MarkBordersDirty();
     if (bWasTracked && !bApplyingRemote)
     {
@@ -3656,6 +3702,7 @@ void ULoomaSceneSyncSubsystem::Tick(float DeltaTime)
     // of the things the borders subtract — running it first would draw one frame of a
     // remote border on a node we had just taken.
     TickBorders();
+    if (bSkyboxDirty) { bSkyboxDirty = false; RefreshSkybox(); }
 
     if (ReconnectCooldown > 0.0f)
     {
@@ -4180,6 +4227,33 @@ ALoomaSyncedActor* ULoomaSceneSyncSubsystem::SpawnSyncedAsset(const FString& Ass
     // Last, so a handler that looks the actor up, or despawns it, finds it complete.
     ApplyGenerationMeta(*Actor);
     return Actor;
+}
+
+FString ULoomaSceneSyncSubsystem::SpawnSyncedSkybox(const FLoomaSkyboxSpec& Skybox, const FString& Name)
+{
+    if (!IsSyncConnected() || ActiveSceneId.IsEmpty()) return FString();
+    const FString Id = FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphens).ToLower();
+    TSharedRef<FJsonObject> Component = MakeShared<FJsonObject>();
+    Component->SetStringField(TEXT("type"), TEXT("skybox"));
+    Component->SetStringField(TEXT("assetId"), Skybox.AssetId);
+    Component->SetStringField(TEXT("url"), Skybox.Url.IsEmpty()
+        ? TEXT("/api/static/") + FGenericPlatformHttp::UrlEncode(Skybox.AssetId) + TEXT(".png") : Skybox.Url);
+    Component->SetNumberField(TEXT("rotation"), Skybox.Rotation);
+    Component->SetNumberField(TEXT("exposure"), Skybox.Exposure);
+    Component->SetBoolField(TEXT("lighting"), Skybox.bLighting);
+    Component->SetNumberField(TEXT("lightingIntensity"), Skybox.LightingIntensity);
+    Component->SetStringField(TEXT("tint"), TEXT("#") + Skybox.Tint.ToFColorSRGB().ToHex().Left(6));
+    TSharedRef<FJsonObject> Node = MakeShared<FJsonObject>();
+    Node->SetStringField(TEXT("id"), Id);
+    Node->SetField(TEXT("parent"), MakeShared<FJsonValueNull>());
+    Node->SetStringField(TEXT("name"), Name.IsEmpty() ? TEXT("Skybox") : Name);
+    Node->SetObjectField(TEXT("t"), LoomaUeToWire(FTransform::Identity));
+    Node->SetArrayField(TEXT("components"), { MakeShared<FJsonValueObject>(Component) });
+    TSharedRef<FJsonObject> Message = MakeShared<FJsonObject>();
+    Message->SetStringField(TEXT("type"), TEXT("spawn"));
+    Message->SetArrayField(TEXT("nodes"), { MakeShared<FJsonValueObject>(Node) });
+    SendJson(Message);
+    return Id;
 }
 
 void ULoomaSceneSyncSubsystem::DespawnSyncedActor(ALoomaSyncedActor* Actor)

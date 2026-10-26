@@ -273,6 +273,34 @@ struct FLoomaAudioSpec
     bool operator!=(const FLoomaAudioSpec& Other) const { return !(*this == Other); }
 };
 
+/** Portable panorama and optional HDR lighting. Right-handed Y-up degrees. */
+USTRUCT(BlueprintType)
+struct FLoomaSkyboxSpec
+{
+    GENERATED_BODY()
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Looma")
+    FString AssetId;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Looma")
+    FString Url;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Looma")
+    float Rotation = 0.0f;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Looma")
+    float Exposure = 0.0f;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Looma")
+    FLinearColor Tint = FLinearColor::White;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Looma")
+    bool bLighting = false;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Looma", meta = (ClampMin = "0", ClampMax = "16"))
+    float LightingIntensity = 1.0f;
+
+    bool operator==(const FLoomaSkyboxSpec& Other) const
+    {
+        return AssetId == Other.AssetId && Url == Other.Url && Tint.Equals(Other.Tint)
+            && FMath::IsNearlyEqual(Rotation, Other.Rotation) && FMath::IsNearlyEqual(Exposure, Other.Exposure)
+            && bLighting == Other.bLighting && FMath::IsNearlyEqual(LightingIntensity, Other.LightingIntensity);
+    }
+};
+
 /** Every component on one node, keyed by type. */
 /** The `source` of a `livelink` component the backend's own Live Link drives (HAM-328, HAM-329). */
 inline constexpr const TCHAR* LoomaLiveLinkHubSource = TEXT("hub");
@@ -281,6 +309,13 @@ USTRUCT(BlueprintType)
 struct FLoomaNodeComponents
 {
     GENERATED_BODY()
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    bool bHasSkybox = false;
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    FLoomaSkyboxSpec Skybox;
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    bool bHidden = false;
 
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
     bool bHasModel = false;
@@ -353,11 +388,12 @@ struct FLoomaNodeComponents
     TArray<FString> UnknownTypes;
 
     /** True for an empty object — a transform and nothing else. */
-    bool IsEmpty() const { return !bHasModel && !bHasMesh && !bHasLight && !bHasAudio; }
+    bool IsEmpty() const { return !bHasModel && !bHasMesh && !bHasLight && !bHasAudio && !bHasSkybox; }
 
     bool operator==(const FLoomaNodeComponents& Other) const
     {
         return bHasModel == Other.bHasModel && (!bHasModel || Model == Other.Model)
+            && bHasSkybox == Other.bHasSkybox && (!bHasSkybox || Skybox == Other.Skybox) && bHidden == Other.bHidden
             && bHasMesh == Other.bHasMesh && (!bHasMesh || Mesh == Other.Mesh)
             && bHasMaterial == Other.bHasMaterial && (!bHasMaterial || Material == Other.Material)
             && bHasLight == Other.bHasLight && (!bHasLight || Light == Other.Light)

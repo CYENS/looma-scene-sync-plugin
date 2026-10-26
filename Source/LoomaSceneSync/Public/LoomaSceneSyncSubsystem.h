@@ -316,6 +316,10 @@ public:
     ALoomaSyncedActor* SpawnSyncedAsset(const FString& AssetId, const FString& Name, const FTransform& Transform,
         const FString& JobId = TEXT(""));
 
+    /** Ask the hub to add a panorama node. Returns its id; render on the accepted spawn echo. */
+    UFUNCTION(BlueprintCallable, Category = "Looma")
+    FString SpawnSyncedSkybox(const FLoomaSkyboxSpec& Skybox, const FString& Name);
+
     /** Remove a synced actor here and on every connected peer. The hub cascades to its children. */
     UFUNCTION(BlueprintCallable, Category = "Looma")
     void DespawnSyncedActor(ALoomaSyncedActor* Actor);
@@ -1329,6 +1333,9 @@ public:
     FLoomaGlbCache* GetGlbCache();
 
 private:
+    void RefreshSkybox();
+    UPROPERTY() TObjectPtr<class ALoomaSkyboxActor> SkyboxActor;
+    bool bSkyboxDirty = true;
 #if WITH_DEV_AUTOMATION_TESTS
     // The fixture seeds a transient scene and feeds wire frames without opening a
     // socket or restoring a session. Production callers use the public scene API.
