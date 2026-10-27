@@ -47,6 +47,29 @@ try:
     material.set_scalar_parameter_value("Yaw", math.pi / 2)
     turned = sample(0, 0)
     assert abs(turned.r - red.r) < 0.03 and abs(turned.g - red.g) < 0.03, turned
+
+    # Through an orthographic camera the sky is drawn as a perspective camera standing
+    # there would see it, at that camera's own fov (asset-demo docs/skyboxes.md), not
+    # as one colour. A 90-degree square perspective capture is the reference.
+    material.set_scalar_parameter_value("Yaw", 0.0)
+    capture_actor.set_actor_rotation(unreal.Rotator(pitch=20, yaw=30, roll=0), False)
+    capture.set_editor_property("fov_angle", 90.0)
+    points = [(256, 256), (256, 24), (24, 256), (488, 488), (400, 100)]
+
+    def grab():
+        capture.capture_scene()
+        return [unreal.RenderingLibrary.read_render_target_raw_pixel(world, target, x, y, False) for x, y in points]
+
+    perspective = grab()
+    material.set_scalar_parameter_value("TanHalfFov", 1.0)  # tan(90 / 2)
+    capture.set_editor_property("projection_type", unreal.CameraProjectionMode.ORTHOGRAPHIC)
+    capture.set_editor_property("ortho_width", 1000.0)
+    ortho = grab()
+    for point, seen, expected in zip(points, ortho, perspective):
+        unreal.log("UNREAL_SKYBOX_ORTHO %s %s perspective %s" % (point, seen, expected))
+        assert max(abs(seen.r - expected.r), abs(seen.g - expected.g), abs(seen.b - expected.b)) < 0.05, (point, seen, expected)
+    spread = max(abs(a.r - b.r) + abs(a.g - b.g) + abs(a.b - b.b) for a in ortho for b in ortho)
+    assert spread > 0.1, ("the orthographic sky is one colour", ortho)
     unreal.log("UNREAL_SKYBOX_PASSED")
 finally:
     actors.destroy_actor(capture_actor)

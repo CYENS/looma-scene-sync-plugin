@@ -50,6 +50,7 @@ void ALoomaSkyboxActor::Apply(const FString& Url, const FLoomaSkyboxSpec& Spec)
     {
         Material = UMaterialInstanceDynamic::Create(BaseMaterial, this);
         Dome->SetMaterial(0, Material);
+        Material->SetScalarParameterValue(TEXT("TanHalfFov"), TanHalfFov);
     }
     if (Material)
     {
@@ -99,6 +100,20 @@ void ALoomaSkyboxActor::Apply(const FString& Url, const FLoomaSkyboxSpec& Spec)
         Self->UpdateLighting();
     });
     Request->ProcessRequest();
+}
+
+void ALoomaSkyboxActor::SetOrthographicFov(float VerticalFovDegrees)
+{
+    const float Tan = FMath::Tan(FMath::DegreesToRadians(FMath::Clamp(VerticalFovDegrees, 1.0f, 170.0f)) / 2.0f);
+    if (FMath::IsNearlyEqual(Tan, TanHalfFov))
+    {
+        return; // called every frame
+    }
+    TanHalfFov = Tan;
+    if (Material)
+    {
+        Material->SetScalarParameterValue(TEXT("TanHalfFov"), TanHalfFov);
+    }
 }
 
 void ALoomaSkyboxActor::ReleaseLighting()

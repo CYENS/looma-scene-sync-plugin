@@ -21,8 +21,17 @@ public:
     ALoomaSkyboxActor();
     UFUNCTION(BlueprintCallable, Category = "Looma|Environment")
     void Apply(const FString& Url, const FLoomaSkyboxSpec& Spec);
+    /**
+     * The vertical field of view, degrees, of the camera being looked through. An
+     * orthographic view draws the sky as a perspective camera at this angle would see
+     * it (looma-xr-asset-demo docs/skyboxes.md); a perspective view uses its own.
+     */
+    UFUNCTION(BlueprintCallable, Category = "Looma|Environment")
+    void SetOrthographicFov(float VerticalFovDegrees);
     virtual void EndPlay(const EEndPlayReason::Type Reason) override;
 private:
+    /** tan(fov / 2) for SetOrthographicFov; the format's default camera is 50°. */
+    float TanHalfFov = 0.46630766f;
     UPROPERTY() TObjectPtr<UStaticMeshComponent> Dome;
     UPROPERTY() TObjectPtr<UMaterialInterface> BaseMaterial;
     UPROPERTY() TObjectPtr<UMaterialInstanceDynamic> Material;
