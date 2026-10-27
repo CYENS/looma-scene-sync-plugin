@@ -32,7 +32,10 @@ runtime creates its cubemap from the canonical panorama; cube upload is optional
 
 The plugin now ships **Content/Materials/M_LoomaPanorama.uasset**. Include Content
 when distributing it. `Scripts/create_skybox_material.py` rebuilds the asset in an
-editor with PythonScriptPlugin enabled; the runtime has no Python dependency.
+editor with PythonScriptPlugin enabled; the runtime has no Python dependency. It
+deletes and recreates the asset rather than clearing it, because a 5.8 commandlet
+asserts on the loaded material's rooted expressions. Like the asset it has always
+been, it is saved by 5.8, and an engine cannot load a package saved by a newer one.
 
 | Unit | Purpose |
 | --- | --- |
@@ -290,6 +293,23 @@ switched off still makes its node's volume that camera's, not a global one.
 | `depthOfField` | `false`: focal distance 0, off. `true`: `DepthOfFieldFocalDistance` = 100·focusDistance cm, `DepthOfFieldFstop` = fStop, on a sensor 24 mm high and as wide as the frame |
 | `chromaticAberration` | `SceneFringeIntensity` = 5·value (≈) |
 | `grain` | `FilmGrainIntensity` |
+
+**The sky through a camera** (asset-demo `docs/skyboxes.md`). Through an orthographic camera
+every ray is parallel, so the panorama would be one colour: Unreal hands a sky material
+`CameraVector = −ViewForward` for every pixel. `M_LoomaPanorama` therefore draws the sky, under
+an orthographic view, as a perspective camera standing there would see it, at the `fov` of the
+camera being looked through: this view's basis and aspect, the ray built from the pixel's
+viewport position. The subsystem sets that angle (`ALoomaSkyboxActor::SetOrthographicFov`) every
+frame from the first local player's view target; a perspective view uses its own rays, as
+before. Unreal already holds an *Is Sky* material at the orthographic far plane, so the dome is
+not clipped by a short `far`. `Scripts/test_skybox_material.py` checks an orthographic capture
+against a perspective one at 90°.
+
+A skybox's `exposure` scales only the sky's radiance and its light; a `postProcess` `exposure`
+scales the whole image after that, sky included, so the two stack. Each component keeps its own
+tie-break: the active skybox is the smallest node id, whatever the document order; the scene's
+camera is the first `primary` in document order; global looks go by `priority`, then document
+order.
 
 ### Coordinate conventions
 
