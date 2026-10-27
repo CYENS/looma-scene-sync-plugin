@@ -39,7 +39,11 @@ editor with PythonScriptPlugin enabled; the runtime has no Python dependency.
 | `ULoomaSceneSyncSubsystem` | Owns the WebSocket connection, dispatches scene messages, loads GLBs at runtime, spawns synced assets |
 | `ULoomaSceneSyncSettings` | Project Settings > Plugins > Looma Scene Sync — the backend URL and the rendering knobs, read live |
 | `ALoomaSyncedActor` | One scene **node**: a transform, with the engine components its wire components ask for |
-| `LoomaSceneComponents` | The wire's `components` array parsed into keyed specs (`model` / `mesh` / `material` / `light` / `audio` / `skybox`), with disabled and hidden handling |
+| `LoomaSceneComponents` | The wire's `components` array parsed into keyed specs (`model` / `mesh` / `material` / `light` / `audio` / `skybox` / `camera` / `path` / `lookAt` / `postProcess`), with disabled and hidden handling |
+| `ULoomaCameraComponent` | The `camera` component's lens on a `UCameraComponent`: vertical angle, letterboxed frame, its own near plane |
+| `LoomaDrivers` | A `path`'s curve, length table, clock and carriage, and a `lookAt`'s aim, in the wire's own frame |
+| `LoomaPostProcess` | `postProcess` volumes resolved into one look, and that look as `FPostProcessSettings` |
+| `FLoomaHubClock` | The hub's clock as the `clock` message measures it, which paths run on |
 | `LoomaSceneAudio` | The `audio` component's sound: a datalake WAV decoded (`LoomaDecodeWav`), played from memory (`ULoomaSoundWave`), and faded as the format says (`LoomaMakeAttenuation`) |
 | `ALoomaSkyboxActor` | Camera-relative panoramic background, loaded over HTTP; stale image requests cannot reinstall old skies |
 | `LoomaWireConvert` | Wire↔UE transform conversion, shared by the scene-sync layer and the generation-job parser |
@@ -113,7 +117,8 @@ This plugin speaks **scene format v3**. The normative contract is
 
 A scene is a **flat list of nodes with parent pointers** — `{id, parent, name, t, components?}`.
 There is one kind of node, an object with a transform, and what it *is* comes from the components
-attached to it. So one node is one `ALoomaSyncedActor`, attached to its parent's actor, whose root
+attached to it. So one node is one `ALoomaSyncedActor`, attached to its parent's actor (to that
+actor's carriage, see *Cameras, paths, aims and looks*), whose root
 is a plain `USceneComponent`; a node with no components is an empty object, and a perfectly
 ordinary one, because its children's transforms are relative to it.
 
@@ -136,6 +141,10 @@ warning naming the actor. Component edits are not reported outbound yet.
 | `material` | A `UMaterialInstanceDynamic` on the sibling `mesh`, from `BasicShapeMaterial`: `color` (sRGB hex → linear) and `roughness`. Never applied to a `model`, which carries its own materials. `metalness` has no parameter to drive and is ignored |
 | `light` | `UPointLightComponent` / `USpotLightComponent` / `UDirectionalLightComponent`. Aim convention: **the node's local −Y is the beam direction** |
 | `audio` | `UAudioComponent` playing `<BackendUrl>/static/<assetId>.wav`, fetched through the same queue as the GLBs and decoded into a `ULoomaSoundWave`. `volume`, `pitch`, `loop`, `playing`, `spatial`, `minDistance`, `maxDistance` and `rolloff`, as below |
+| `camera` | `ULoomaCameraComponent`, a `UCameraComponent` with a near plane of its own. See *Cameras, paths, aims and looks* |
+| `path` | The node's **children** ride its `CarriageComponent` along the curve, on the hub's clock |
+| `lookAt` | Turns the node's `AimComponent` to face another node; the stored `t` never moves |
+| `postProcess` | One resolved look: a global volume (`APostProcessVolume`, unbound) and each camera's own settings |
 | anything else | **Skipped, with the node kept** — logged once per type. That rule is what lets a new component type ship without a coordinated release across three clients |
 
 **`enabled: false` switches off one component**, leaving its definition on the node
@@ -198,6 +207,89 @@ them: a sound is about 1.7 MB for ten seconds of stereo, cheap to fetch again.
 Sound is heard from the player's view in PIE or a packaged game, which is where this subsystem
 runs. Each client starts a sound when its component reaches it; the format does not synchronise
 where in the clip each listener is.
+
+### Cameras, paths, aims and looks
+
+Four components make a shot (looma-xr-asset-demo `docs/scene-format.md`, "Cameras, paths, aims
+and looks", whose engine tables this follows), and none knows about the others. A camera moving
+along a rail and keeping a performer in frame is a `path` node with a `camera` node under it, and
+that camera carries a `lookAt` aimed at the performer.
+
+Every node actor carries two scene components that are the identity until a component moves
+them, the web client's groups of the same names:
+
+```
+SceneRoot            the node's t
+  └─ AimComponent    lookAt turns this
+       ├─ model, mesh, light, audio, camera …
+       └─ CarriageComponent    path moves this
+            └─ child nodes     attached here, so their t is relative to the carriage
+```
+
+So a child's `t` stays parent-local while it rides, the aim never touches the stored `t` (the
+outbound diff, the gizmo and the wire never see it), and adding either component never
+re-attaches anything. Carriages are moved first and aims second, every frame, in the
+subsystem's tick — after every actor has ticked and before the cameras are read.
+
+**`camera`** — the node looks down its local −Z with +Y up, which `LoomaWireConvert` maps to UE
++X with +Z up, where an Unreal camera already looks, so the camera has no turn of its own.
+
+| Field | Default | Unreal |
+| --- | --- | --- |
+| `projection` | `perspective` | `ProjectionMode` |
+| `fov` | `50` | Vertical degrees, 1…170. With an `aspect`, `FieldOfView` = deg(2·atan(a·tan(rad(fov)/2))), the horizontal angle. Without one, `FieldOfView` = `fov` under the camera's own `AspectRatio_MaintainYFOV` constraint, so the vertical angle holds on any screen |
+| `orthoSize` | `5` | Half the height. `OrthoWidth` = 200·orthoSize·a cm with an aspect; without one it is 200·orthoSize, which `MaintainYFOV` reads as the full height |
+| `near` | `0.1` | `PerspectiveNearClipPlane` = 100·near cm on the view (what a CineCamera's `CustomNearClippingPlane` does), and `OrthoNearClipPlane` |
+| `far` | `1000` | `OrthoFarClipPlane`. Unreal's perspective far plane is always at infinity |
+| `aspect` | absent | `bConstrainAspectRatio` and `AspectRatio`: the frame is letterboxed, never stretched |
+| `primary` | `false` | The scene's camera: the first one in document order that is switched on |
+
+A plain `UCameraComponent` rather than a CineCamera: the cine camera rewrites `FieldOfView` from
+its filmback and overrides depth of field from its own focus settings on every view, which would
+fight the format's angle and the `postProcess` component. It is not locked to a headset.
+
+**Looking through one** is this client's choice and is never sent. `LookThrough(<id> | "scene" |
+"")` (and `Looma.Camera`) puts the first local player's view on that camera, cutting rather than
+blending, or follows the scene's camera through every cut; a camera that goes away or is
+switched off gives the player its own view back. Project Settings' *View Through Scene Camera*
+starts on `scene`; it is off by default, because the web makes the first camera placed in a scene
+its camera. `GetSceneCamera`, `GetCameras` and `On Scene Camera Changed` are Blueprint-visible.
+
+**`path`** — the curve is a centripetal Catmull-Rom spline through every point (`LoomaDrivers.h`),
+evaluated by the format's own formula rather than by `USplineComponent`, whose `CurveAuto` is the
+uniform kind with other ends. The carriage moves by distance through the format's length table
+— 64 samples per segment, not Unreal's 10 — so it stands where the web puts it; the tests hold
+it to the web's numbers to a micrometre. Time is the hub's: `offset + (hubNow − startedAt)`
+while playing, folded by `mode` and eased by `ease`, with `hubNow` from the `clock` message
+(HAM-330). The subsystem samples the hub's clock as the web does — five pings a quarter-second
+apart when the socket opens, then one every 15 s, keeping the shortest round trip of the last
+eight — and `GetHubTime` reads it. Until the first answer the carriage runs on this machine's
+clock. A path the hub has not stamped waits at its offset. Switched off, the children stand on
+the node itself.
+
+**`lookAt`** — the aim replaces the node's rotation: three.js's `Matrix4.lookAt` with world +Y up,
+taken back out of the node's own rotation. `-z` points a camera; `-y` points a light's beam. A
+target the scene does not hold, or one inside the node, aims nothing; a target exactly where the
+node is keeps the last turn. `offset` is in the target's own frame.
+
+**`postProcess`** — resolved as the web resolves it (`LoomaPostProcess.h`): globals by priority,
+then document order, each overriding only the settings it carries; a camera's own on top while
+looking through it. The global look goes on one unbound `APostProcessVolume` the subsystem
+spawns, at priority 1e6, above anything a level sets; a camera's look goes on its own
+`PostProcessSettings`. A volume on a hidden object, or under one, applies nothing, and a `camera`
+switched off still makes its node's volume that camera's, not a global one.
+
+| Field | Unreal |
+| --- | --- |
+| `exposure` | `AutoExposureBias`, metering `AEM_Manual`, physical camera exposure off |
+| `toneMapping` | `ToneCurveAmount`: 0 for `none`, 1 otherwise — Unreal's filmic curve is always on |
+| `contrast`, `saturation` | `ColorContrast` / `ColorSaturation` = 1 + value on every channel |
+| `colorFilter` | `ColorGain` |
+| `bloomIntensity`, `bloomThreshold` | `BloomIntensity` (≈), `BloomThreshold` |
+| `vignette` | `VignetteIntensity` |
+| `depthOfField` | `false`: focal distance 0, off. `true`: `DepthOfFieldFocalDistance` = 100·focusDistance cm, `DepthOfFieldFstop` = fStop, on a sensor 24 mm high and as wide as the frame |
+| `chromaticAberration` | `SceneFringeIntensity` = 5·value (≈) |
+| `grain` | `FilmGrainIntensity` |
 
 ### Coordinate conventions
 
@@ -333,6 +425,7 @@ the new section, which then wins.
 | `Looma.Deselect [nodeId...]` | Deselects those nodes; with no arguments clears the whole selection, which is what removes this client's borders elsewhere |
 | `Looma.Selection` | Logs the local selection — the ids the next `selection` message would carry |
 | `Looma.Room` | Logs who else is in the room from the hub's roster — id, name, kind, role, colour and selection — with this client's own entry marked `*`. The only way to read our own room name, since `GET /auth/me` mints a fresh guest name per call |
+| `Looma.Camera [id \| scene \| off]` | With an argument, looks through that camera, follows the scene's camera through its cuts, or goes back to the player's own view; an id not there yet applies when it arrives. Never sent: what this client looks through is its own. Then, and with no arguments, lists the cameras that are switched on, marking the scene's `*`, says what this client looks through, and reports the hub's clock offset |
 | `Looma.Claims` | Logs the claim ledger both ways round: each claimed node with its claimants oldest-first (the head draws the border), then each client with how much of its selection it actually wins, then which stencil slots are in use and who the budget left out |
 
 Between them these are self-sufficient: every id and name `Looma.Scene`, `Looma.Performance` and `Looma.Cue` accept can be discovered with `Looma.Scenes`, `Looma.Performances` and `Looma.Cue`, so nothing here needs a browser tab open beside it. The distinction that shapes all of them is that changing **scene** is a message while changing **performance** is a reconnect — a socket's performance is fixed at `hello` for its life.
@@ -793,6 +886,19 @@ your-selection-always-wins rule above.
 `Looma.Components.Enabled` checks the component switch through parsing and real
 scene patches, including re-enabling, retained wire fields, material defaults and
 unaffected children. It runs headless without a backend.
+
+`Looma.Cameras` holds the four shot components to the web client's own numbers, printed from
+its `curve.js` and `lookAt.js` on three.js r169: the curve, its length table and the carriage's
+facing on four paths (open, closed, unevenly spaced, three points), the time folding of every
+mode and ease, and the aims. It also checks the camera's lens mapping, the parsing and repairs
+of all four, the look's precedence and its `FPostProcessSettings`, the hub clock's estimate,
+and real scene frames: a rider on a rail, a camera aiming at a performer, a beam, the scene's
+camera and the looks. Headless, no backend.
+
+One difference from the web is deliberate. On a **two-point open** path, three.js r169 reflects
+both ends into one scratch vector, so its pace along `t` is not the format's; the line is the
+same and the length table all but cancels it (0.23 mm at most on a 4 m path), and the plugin
+follows the format.
 
 After building the host's Editor target, run `Looma.Presence` through Unreal's
 Automation window, or from the command line:
