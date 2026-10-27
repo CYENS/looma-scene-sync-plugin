@@ -22,3 +22,14 @@ LOOMASCENESYNC_API FTransform LoomaWireToUe(const TSharedPtr<FJsonObject>& T);
 
 /** Build a wire {p,q,s} JSON object from a UE transform. */
 LOOMASCENESYNC_API TSharedRef<FJsonObject> LoomaUeToWire(const FTransform& T);
+
+/**
+ * The same map for one point or one rotation, for maths done in the wire's own frame
+ * (a path's curve, an aim) whose result has to land on an engine component. A point
+ * goes from wire metres to UE centimetres; a rotation is conjugated as above, which
+ * keeps products: converting R1·R2 is converting R1 times converting R2.
+ */
+LOOMASCENESYNC_API FVector LoomaWirePointToUe(const FVector& WireMetres);
+LOOMASCENESYNC_API FVector LoomaUePointToWire(const FVector& UeCm);
+LOOMASCENESYNC_API FQuat LoomaWireQuatToUe(const FQuat& Wire);
+LOOMASCENESYNC_API FQuat LoomaUeQuatToWire(const FQuat& Ue);

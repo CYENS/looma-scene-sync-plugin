@@ -301,6 +301,322 @@ struct FLoomaSkyboxSpec
     }
 };
 
+/** `camera`'s `projection`. */
+UENUM(BlueprintType)
+enum class ELoomaCameraProjection : uint8
+{
+    Perspective,
+    Orthographic,
+};
+
+/**
+ * `camera`: a viewpoint. The node looks down its local −Z with +Y up, glTF's and
+ * three.js's camera axes, which is UE +X with +Z up after LoomaWireConvert's map, so
+ * the camera component needs no turn of its own (looma-xr-asset-demo/docs/
+ * scene-format.md, "The `camera` component"). Defaults and clamps are the web's
+ * (frontend/src/scene/camera/lens.js), which are the hub's (`_clean_camera`).
+ */
+USTRUCT(BlueprintType)
+struct FLoomaCameraSpec
+{
+    GENERATED_BODY()
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    ELoomaCameraProjection Projection = ELoomaCameraProjection::Perspective;
+
+    /** **Vertical** field of view, degrees, 1…170. Unreal's own FieldOfView is horizontal. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    float Fov = 50.0f;
+
+    /** Half the view's height, wire metres (orthographic only). */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    float OrthoSize = 5.0f;
+
+    /** Near clip plane, wire metres, at least 0.001. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    float Near = 0.1f;
+
+    /**
+     * Far clip plane, wire metres, beyond Near. Only an orthographic view uses it:
+     * Unreal's perspective far plane is always at infinity.
+     */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    float Far = 1000.0f;
+
+    /** Whether the camera has a frame of its own. Without one it fills whatever screen it is on. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    bool bHasAspect = false;
+
+    /** Width over height of that frame, 0.1…10; shown letterboxed. Meaningless without bHasAspect. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    float Aspect = 16.0f / 9.0f;
+
+    /** Claims to be the scene's camera. The first in document order that is switched on wins. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    bool bPrimary = false;
+
+    bool operator==(const FLoomaCameraSpec& Other) const
+    {
+        return Projection == Other.Projection && FMath::IsNearlyEqual(Fov, Other.Fov)
+            && FMath::IsNearlyEqual(OrthoSize, Other.OrthoSize) && FMath::IsNearlyEqual(Near, Other.Near)
+            && FMath::IsNearlyEqual(Far, Other.Far) && bHasAspect == Other.bHasAspect
+            && (!bHasAspect || FMath::IsNearlyEqual(Aspect, Other.Aspect)) && bPrimary == Other.bPrimary;
+    }
+    bool operator!=(const FLoomaCameraSpec& Other) const { return !(*this == Other); }
+};
+
+/** `path`'s `mode`: what the carriage does at the end of the curve. */
+UENUM(BlueprintType)
+enum class ELoomaPathMode : uint8
+{
+    Loop,
+    PingPong,
+    Once,
+};
+
+/** `path`'s `ease`. */
+UENUM(BlueprintType)
+enum class ELoomaPathEase : uint8
+{
+    Linear,
+    /** Slow out of each end and into the other: u²(3 − 2u). */
+    InOut,
+};
+
+/** `path`'s `orient`: whether the carriage turns along the curve. */
+UENUM(BlueprintType)
+enum class ELoomaPathOrient : uint8
+{
+    /** The carriage keeps the node's own axes. */
+    Fixed,
+    /** The carriage's −Z points along the curve, +Y as near the node's +Y as it can be. */
+    Path,
+};
+
+/**
+ * `path`: a curve the node's **children** ride along, on a carriage, on the hub's
+ * clock (scene-format.md, "The `path` component"; the maths is LoomaDrivers.h).
+ */
+USTRUCT(BlueprintType)
+struct FLoomaPathSpec
+{
+    GENERATED_BODY()
+
+    /** The points the curve passes through, in the node's own frame: wire metres and wire axes. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    TArray<FVector> Points;
+
+    /** Join the last point back to the first. Needs three points; two are drawn open. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    bool bClosed = false;
+
+    /** Seconds for one traversal, 0.1…86400. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    float Duration = 10.0f;
+
+    /** False holds the carriage at Offset. Only a literal false pauses. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    bool bPlaying = true;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    ELoomaPathMode Mode = ELoomaPathMode::Loop;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    ELoomaPathEase Ease = ELoomaPathEase::Linear;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    ELoomaPathOrient Orient = ELoomaPathOrient::Fixed;
+
+    /** Whether the hub has stamped StartedAt yet. A path it has not waits at Offset. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    bool bStamped = false;
+
+    /** The hub's wall clock, Unix seconds, when the carriage was last anchored. The hub's alone. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    double StartedAt = 0.0;
+
+    /** Seconds of travel at StartedAt. The hub's alone. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    double Offset = 0.0;
+
+    bool operator==(const FLoomaPathSpec& Other) const
+    {
+        if (Points.Num() != Other.Points.Num())
+        {
+            return false;
+        }
+        for (int32 I = 0; I < Points.Num(); ++I)
+        {
+            if (!Points[I].Equals(Other.Points[I], 1e-9))
+            {
+                return false;
+            }
+        }
+        return bClosed == Other.bClosed && FMath::IsNearlyEqual(Duration, Other.Duration)
+            && bPlaying == Other.bPlaying && Mode == Other.Mode && Ease == Other.Ease && Orient == Other.Orient
+            && bStamped == Other.bStamped && StartedAt == Other.StartedAt && Offset == Other.Offset;
+    }
+    bool operator!=(const FLoomaPathSpec& Other) const { return !(*this == Other); }
+};
+
+/** `lookAt`'s `axis`: which local axis is turned to point at the target. */
+UENUM(BlueprintType)
+enum class ELoomaLookAtAxis : uint8
+{
+    /** A camera's view and glTF's forward. */
+    MinusZ,
+    /** The way a `light` shines in this format. */
+    MinusY,
+};
+
+/**
+ * `lookAt`: turn the node, every frame, so one of its axes points at another node.
+ * The turn is drawn on the actor's AimComponent; the node's stored `t` never moves
+ * (scene-format.md, "The `lookAt` component").
+ */
+USTRUCT(BlueprintType)
+struct FLoomaLookAtSpec
+{
+    GENERATED_BODY()
+
+    /** The node to face. Empty (a wire `null`) aims nothing, as does an id the scene does not hold. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    FString Target;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    ELoomaLookAtAxis Axis = ELoomaLookAtAxis::MinusZ;
+
+    /** The point aimed at, in the target's own frame: wire metres and wire axes. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    FVector Offset = FVector::ZeroVector;
+
+    bool operator==(const FLoomaLookAtSpec& Other) const
+    {
+        return Target == Other.Target && Axis == Other.Axis && Offset.Equals(Other.Offset, 1e-9);
+    }
+    bool operator!=(const FLoomaLookAtSpec& Other) const { return !(*this == Other); }
+};
+
+/** `postProcess`'s `toneMapping`. */
+UENUM(BlueprintType)
+enum class ELoomaToneMapping : uint8
+{
+    None,
+    Aces,
+    Agx,
+    /** Khronos PBR Neutral. */
+    Neutral,
+};
+
+/**
+ * `postProcess`: how the picture looks, through one camera or everywhere
+ * (scene-format.md, "The `postProcess` component").
+ *
+ * **Every setting is optional, and an absent one overrides nothing**: each carries a
+ * `bHas…` flag, Unity's per-setting override switch and Unreal's `bOverride_…`. The
+ * numbers are in the format's units; LoomaPostProcess.h maps them onto
+ * FPostProcessSettings.
+ */
+USTRUCT(BlueprintType)
+struct FLoomaPostProcessSpec
+{
+    GENERATED_BODY()
+
+    /** Order among global volumes: higher is applied later and wins. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    float Priority = 0.0f;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    bool bHasExposure = false;
+    /** EV stops, −10…10. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    float Exposure = 0.0f;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    bool bHasToneMapping = false;
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    ELoomaToneMapping ToneMapping = ELoomaToneMapping::Aces;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    bool bHasContrast = false;
+    /** −1…1, about mid grey. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    float Contrast = 0.0f;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    bool bHasSaturation = false;
+    /** −1…1. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    float Saturation = 0.0f;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    bool bHasColorFilter = false;
+    /** Linear, already converted out of the wire's sRGB hex. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    FLinearColor ColorFilter = FLinearColor::White;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    bool bHasBloomIntensity = false;
+    /** 0…10; 0 is off. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    float BloomIntensity = 0.0f;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    bool bHasBloomThreshold = false;
+    /** Linear luminance, 0…100: 1 is brighter than white. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    float BloomThreshold = 1.0f;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    bool bHasVignette = false;
+    /** 0…1. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    float Vignette = 0.0f;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    bool bHasDepthOfField = false;
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    bool bDepthOfField = false;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    bool bHasFocusDistance = false;
+    /** Wire metres, 0.01…10000. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    float FocusDistance = 5.0f;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    bool bHasFStop = false;
+    /** 0.5…64. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    float FStop = 2.8f;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    bool bHasChromaticAberration = false;
+    /** 0…1. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    float ChromaticAberration = 0.0f;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    bool bHasGrain = false;
+    /** 0…1. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    float Grain = 0.0f;
+
+    /** True when it carries no setting at all, and so changes nothing. Priority is not a setting. */
+    bool IsEmpty() const
+    {
+        return !bHasExposure && !bHasToneMapping && !bHasContrast && !bHasSaturation && !bHasColorFilter
+            && !bHasBloomIntensity && !bHasBloomThreshold && !bHasVignette && !bHasDepthOfField
+            && !bHasFocusDistance && !bHasFStop && !bHasChromaticAberration && !bHasGrain;
+    }
+
+    /** Lay `Above` over this: every setting it carries replaces this one's, the rest stay. */
+    LOOMASCENESYNC_API void Overlay(const FLoomaPostProcessSpec& Above);
+
+    LOOMASCENESYNC_API bool operator==(const FLoomaPostProcessSpec& Other) const;
+    bool operator!=(const FLoomaPostProcessSpec& Other) const { return !(*this == Other); }
+};
+
 /** Every component on one node, keyed by type. */
 /** The `source` of a `livelink` component the backend's own Live Link drives (HAM-328, HAM-329). */
 inline constexpr const TCHAR* LoomaLiveLinkHubSource = TEXT("hub");
@@ -353,6 +669,39 @@ struct FLoomaNodeComponents
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
     FLoomaAudioSpec Audio;
 
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    bool bHasCamera = false;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    FLoomaCameraSpec Camera;
+
+    /**
+     * A `camera` is on the node, switched on or off. Not the same as bHasCamera: it
+     * decides whether the node's `postProcess` is that camera's or a global one, and a
+     * camera switched off still makes it the camera's (frontend/src/scene/postprocess/
+     * look.js, `resolveLook`), which then applies nowhere.
+     */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    bool bCarriesCamera = false;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    bool bHasPath = false;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    FLoomaPathSpec Path;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    bool bHasLookAt = false;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    FLoomaLookAtSpec LookAt;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    bool bHasPostProcess = false;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    FLoomaPostProcessSpec PostProcess;
+
     /**
      * The `livelink` component's subject: the Live Link subject that drives this
      * node, or empty for nobody (HAM-316; docs/rig-format.md, "Who drives a
@@ -388,7 +737,11 @@ struct FLoomaNodeComponents
     TArray<FString> UnknownTypes;
 
     /** True for an empty object — a transform and nothing else. */
-    bool IsEmpty() const { return !bHasModel && !bHasMesh && !bHasLight && !bHasAudio && !bHasSkybox; }
+    bool IsEmpty() const
+    {
+        return !bHasModel && !bHasMesh && !bHasLight && !bHasAudio && !bHasSkybox && !bHasCamera && !bHasPath
+            && !bHasLookAt && !bHasPostProcess;
+    }
 
     bool operator==(const FLoomaNodeComponents& Other) const
     {
@@ -399,6 +752,11 @@ struct FLoomaNodeComponents
             && bHasLight == Other.bHasLight && (!bHasLight || Light == Other.Light)
             && bHasAnimation == Other.bHasAnimation && (!bHasAnimation || Animation == Other.Animation)
             && bHasAudio == Other.bHasAudio && (!bHasAudio || Audio == Other.Audio)
+            && bHasCamera == Other.bHasCamera && (!bHasCamera || Camera == Other.Camera)
+            && bCarriesCamera == Other.bCarriesCamera
+            && bHasPath == Other.bHasPath && (!bHasPath || Path == Other.Path)
+            && bHasLookAt == Other.bHasLookAt && (!bHasLookAt || LookAt == Other.LookAt)
+            && bHasPostProcess == Other.bHasPostProcess && (!bHasPostProcess || PostProcess == Other.PostProcess)
             && LiveLinkSubject == Other.LiveLinkSubject && LiveLinkSource == Other.LiveLinkSource
             && LiveLinkStream == Other.LiveLinkStream;
     }

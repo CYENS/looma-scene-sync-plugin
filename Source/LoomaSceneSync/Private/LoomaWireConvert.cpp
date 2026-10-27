@@ -3,6 +3,27 @@
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 
+FVector LoomaWirePointToUe(const FVector& W)
+{
+    return FVector(-W.Z * 100.0, W.X * 100.0, W.Y * 100.0);
+}
+
+FVector LoomaUePointToWire(const FVector& U)
+{
+    // Inverse of the map above: UE (X, Y, Z) -> wire (Y, Z, -X).
+    return FVector(U.Y / 100.0, U.Z / 100.0, -U.X / 100.0);
+}
+
+FQuat LoomaWireQuatToUe(const FQuat& W)
+{
+    return FQuat(W.Z, -W.X, -W.Y, W.W);
+}
+
+FQuat LoomaUeQuatToWire(const FQuat& U)
+{
+    return FQuat(-U.Y, -U.Z, U.X, U.W);
+}
+
 FTransform LoomaWireToUe(const TSharedPtr<FJsonObject>& T)
 {
     if (!T.IsValid())
@@ -25,11 +46,11 @@ FTransform LoomaWireToUe(const TSharedPtr<FJsonObject>& T)
     FVector Scale = FVector::OneVector;
     if (P)
     {
-        Location = FVector(-Num(*P, 2, 0) * 100.0, Num(*P, 0, 0) * 100.0, Num(*P, 1, 0) * 100.0);
+        Location = LoomaWirePointToUe(FVector(Num(*P, 0, 0), Num(*P, 1, 0), Num(*P, 2, 0)));
     }
     if (Q)
     {
-        Rotation = FQuat(Num(*Q, 2, 0), -Num(*Q, 0, 0), -Num(*Q, 1, 0), Num(*Q, 3, 1));
+        Rotation = LoomaWireQuatToUe(FQuat(Num(*Q, 0, 0), Num(*Q, 1, 0), Num(*Q, 2, 0), Num(*Q, 3, 1)));
         Rotation.Normalize();
     }
     if (S)
@@ -41,8 +62,8 @@ FTransform LoomaWireToUe(const TSharedPtr<FJsonObject>& T)
 
 TSharedRef<FJsonObject> LoomaUeToWire(const FTransform& T)
 {
-    const FVector L = T.GetLocation();
-    const FQuat Q = T.GetRotation();
+    const FVector L = LoomaUePointToWire(T.GetLocation());
+    const FQuat Q = LoomaUeQuatToWire(T.GetRotation());
     const FVector S = T.GetScale3D();
 
     auto Arr = [](std::initializer_list<double> Values) {
@@ -54,10 +75,9 @@ TSharedRef<FJsonObject> LoomaUeToWire(const FTransform& T)
         return Out;
     };
 
-    // Inverse of the map above: UE (X, Y, Z) -> wire (Y, Z, -X).
     TSharedRef<FJsonObject> Obj = MakeShared<FJsonObject>();
-    Obj->SetArrayField(TEXT("p"), Arr({ L.Y / 100.0, L.Z / 100.0, -L.X / 100.0 }));
-    Obj->SetArrayField(TEXT("q"), Arr({ -Q.Y, -Q.Z, Q.X, Q.W }));
+    Obj->SetArrayField(TEXT("p"), Arr({ L.X, L.Y, L.Z }));
+    Obj->SetArrayField(TEXT("q"), Arr({ Q.X, Q.Y, Q.Z, Q.W }));
     Obj->SetArrayField(TEXT("s"), Arr({ S.Y, S.Z, S.X }));
     return Obj;
 }
