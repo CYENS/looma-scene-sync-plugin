@@ -11,7 +11,7 @@
 /**
  * The console surface, which as of HAM-239 is self-sufficient: every id and name these
  * commands accept can be discovered from the same console, with no browser tab beside
- * it. Eight groups, and the shape of each is a fact about the wire rather than a choice
+ * it. Nine groups, and the shape of each is a fact about the wire rather than a choice
  * of style.
  *
  *   Looma.Status / Looma.Reconnect            what the socket is doing, and do it again
@@ -24,6 +24,8 @@
  *   Looma.Select / Deselect / Selection       what this client has selected
  *   Looma.Room / Looma.Claims                 who else is in the room, and which
  *                                             actors each of them holds
+ *   Looma.Camera [id | scene | off]           the scene's cameras, and which one this
+ *                                             client looks through; never sent
  *
  * The one distinction worth carrying into all of them: changing SCENE is a message and
  * changing PERFORMANCE is a reconnect, because a socket's performance is fixed at
@@ -695,5 +697,60 @@ FAutoConsoleCommandWithWorldAndArgs GLoomaClaimsCommand(
             return;
         }
         Subsystem->LogClaims();
+    }));
+
+/**
+ * `Looma.Camera` — which cameras the scene has, and what this client looks through.
+ *
+ * Looking through a camera is this client's own choice and is never sent anywhere, as
+ * on the web; which camera is the SCENE's is the document's (`primary`), so it is shown
+ * here and changed only by an edit.
+ */
+FAutoConsoleCommandWithWorldAndArgs GLoomaCameraCommand(
+    TEXT("Looma.Camera"),
+    TEXT("Looma.Camera <id> | scene | off: look through a camera, follow the scene's camera through ")
+    TEXT("its cuts, or go back to your own view. With no arguments, list the cameras."),
+    FConsoleCommandWithWorldAndArgsDelegate::CreateStatic([](const TArray<FString>& Args, UWorld* World) {
+        ULoomaSceneSyncSubsystem* Subsystem = FindLoomaSubsystem(World);
+        if (!Subsystem)
+        {
+            UE_LOG(LogLoomaSync, Warning,
+                TEXT("Looma.Camera: Looma Scene Sync is not running (no game instance)."));
+            return;
+        }
+        if (Args.Num() > 0)
+        {
+            const FString Wanted = Args[0] == TEXT("off") || Args[0] == TEXT("none") ? FString() : Args[0];
+            Subsystem->LookThrough(Wanted);
+            if (!Wanted.IsEmpty() && !Subsystem->ResolveCamera(Wanted))
+            {
+                // Kept anyway: it applies as soon as that camera exists and is switched on.
+                UE_LOG(LogLoomaSync, Display, TEXT("Looma.Camera: no camera '%s' to look through yet — waiting for one"),
+                    *Wanted);
+            }
+        }
+
+        const ALoomaSyncedActor* Scene = Subsystem->GetSceneCamera();
+        const TArray<ALoomaSyncedActor*> Cameras = Subsystem->GetCameras();
+        UE_LOG(LogLoomaSync, Display, TEXT("Cameras: %d (* is the scene's)"), Cameras.Num());
+        for (const ALoomaSyncedActor* Camera : Cameras)
+        {
+            const FLoomaCameraSpec& Lens = Camera->GetComponents().Camera;
+            const FString Shape = Lens.Projection == ELoomaCameraProjection::Orthographic
+                ? FString::Printf(TEXT("orthographic, half height %.2f m"), Lens.OrthoSize)
+                : FString::Printf(TEXT("%.0f° vertical"), Lens.Fov);
+            UE_LOG(LogLoomaSync, Display, TEXT("  %s %s '%s': %s%s"), Camera == Scene ? TEXT("*") : TEXT(" "),
+                *Camera->Id, *Camera->DisplayName, *Shape,
+                Lens.bHasAspect ? *FString::Printf(TEXT(", %.2f:1 frame"), Lens.Aspect) : TEXT(""));
+        }
+        const FString Looking = Subsystem->GetLookingThrough();
+        UE_LOG(LogLoomaSync, Display, TEXT("Looking through: %s"),
+            Looking.IsEmpty() ? TEXT("your own view")
+            : Looking == ULoomaSceneSyncSubsystem::SceneCameraName ? TEXT("the scene's camera") : *Looking);
+        const FLoomaHubClock& Clock = Subsystem->GetHubClock();
+        UE_LOG(LogLoomaSync, Display, TEXT("Hub clock: %s"), Clock.IsSynced()
+            ? *FString::Printf(TEXT("%+.0f ms from this machine's (round trip %.0f ms)"), Clock.GetOffsetMs(),
+                Clock.GetRoundTripMs())
+            : TEXT("no answer yet, paths run on this machine's clock"));
     }));
 } // namespace
