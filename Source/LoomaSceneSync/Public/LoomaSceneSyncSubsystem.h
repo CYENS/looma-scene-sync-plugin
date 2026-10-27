@@ -1415,6 +1415,13 @@ private:
     /** Every frame: the first local player's view onto the camera LookThrough names, or back off it. */
     void TickView();
 
+    /**
+     * Every frame: the angle the sky is drawn at through an orthographic camera, which
+     * is the `fov` of the camera the first local player is looking through
+     * (looma-xr-asset-demo docs/skyboxes.md). The format's 50° otherwise.
+     */
+    void TickSkyAngle();
+
     /** The global look on LookVolume, and each camera's own look on that camera. */
     void RefreshLooks(const TArray<ALoomaSyncedActor*>& Ordered);
 

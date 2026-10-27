@@ -3754,6 +3754,7 @@ void ULoomaSceneSyncSubsystem::Tick(float DeltaTime)
     if (bCamerasDirty) { bCamerasDirty = false; RefreshCameras(); }
     TickDrivers();
     TickView();
+    TickSkyAngle();
 
     if (ReconnectCooldown > 0.0f)
     {
@@ -4035,6 +4036,21 @@ void ULoomaSceneSyncSubsystem::TickView()
         Player->SetViewTarget(Pawn ? static_cast<AActor*>(Pawn) : Player);
     }
     ViewedCamera.Reset();
+}
+
+void ULoomaSceneSyncSubsystem::TickSkyAngle()
+{
+    if (!SkyboxActor)
+    {
+        return;
+    }
+    // Read off whatever the player is actually looking through, not only what
+    // LookThrough chose, so a view target set some other way is drawn the same. Only an
+    // orthographic view reads the angle: under parallel rays the sky would be one colour.
+    const APlayerController* Player = FirstLocalPlayer(GetGameInstance());
+    const ALoomaSyncedActor* Viewed = Player ? Cast<ALoomaSyncedActor>(Player->GetViewTarget()) : nullptr;
+    SkyboxActor->SetOrthographicFov(Viewed && Viewed->CameraComponent
+        ? Viewed->GetComponents().Camera.Fov : FLoomaCameraSpec().Fov);
 }
 
 // --- Local selection (outbound `selection`) -----------------------------------
