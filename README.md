@@ -848,6 +848,16 @@ job, so point it at a worktree backend in mock mode, never the everyday one:
 UnrealEditor-Cmd.exe <host-project.uproject> -unattended -nullrhi -nosound -LoomaLiveBackend=http://127.0.0.1:8002 -LoomaLiveScene=demo-imported-set-model -ExecCmds="Automation RunTests Looma.Generation.Meta.Live; Quit"
 ```
 
+`Looma.LiveLink` checks live poses and the `livelink` component, with no backend: editing and
+reading the component, receiving a `pose` frame, the hub's subjects, and the buffer that plays
+received poses back evenly. `Looma.LiveLink.PublishPose` sends through a socket that keeps what
+it is given, and checks that the frame is JSON and carries `t` only when `PublishPose` was given
+a finite time. A host's own tests may share the group, as the 5.8 viewer's do:
+
+```text
+UnrealEditor-Cmd.exe <host-project.uproject> -unattended -nullrhi -nosplash -nosound -ExecCmds="Automation RunTests Looma.LiveLink; Quit"
+```
+
 ## Status
 
 Beta (`IsBetaVersion: true`), version 0.1.0.
