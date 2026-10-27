@@ -133,7 +133,273 @@ void ParseAudio(const TSharedPtr<FJsonObject>& C, FLoomaNodeComponents& Out)
     Audio.MinDistance = FMath::Max(Audio.MinDistance, AudioMinDistance);
     Audio.MaxDistance = FMath::Max(Audio.MaxDistance, Audio.MinDistance);
 }
+
+/** A JSON number in `Field`, or false: absent, null, a string or anything else. */
+bool ReadNumber(const TSharedPtr<FJsonObject>& Obj, const FString& Field, double& Out)
+{
+    const TSharedPtr<FJsonValue> Value = Obj->TryGetField(Field);
+    if (!Value.IsValid() || Value->Type != EJson::Number)
+    {
+        return false;
+    }
+    Out = Value->AsNumber();
+    return FMath::IsFinite(Out);
+}
+
+/**
+ * Only a literal JSON true. TryGetBoolField would also read "true" and 1, which the
+ * web client (`=== true`) does not.
+ */
+bool IsLiteralTrue(const TSharedPtr<FJsonObject>& Obj, const FString& Field)
+{
+    const TSharedPtr<FJsonValue> Value = Obj->TryGetField(Field);
+    return Value.IsValid() && Value->Type == EJson::Boolean && Value->AsBool();
+}
+
+bool IsLiteralFalse(const TSharedPtr<FJsonObject>& Obj, const FString& Field)
+{
+    const TSharedPtr<FJsonValue> Value = Obj->TryGetField(Field);
+    return Value.IsValid() && Value->Type == EJson::Boolean && !Value->AsBool();
+}
+
+/** Exactly three numbers, or false. A path point or an offset is all or nothing. */
+bool ReadTriple(const TSharedPtr<FJsonValue>& Value, FVector& Out)
+{
+    const TArray<TSharedPtr<FJsonValue>>* Items = nullptr;
+    if (!Value.IsValid() || !Value->TryGetArray(Items) || !Items || Items->Num() != 3)
+    {
+        return false;
+    }
+    for (int32 I = 0; I < 3; ++I)
+    {
+        const TSharedPtr<FJsonValue>& Item = (*Items)[I];
+        if (!Item.IsValid() || Item->Type != EJson::Number || !FMath::IsFinite(Item->AsNumber()))
+        {
+            return false;
+        }
+        Out[I] = Item->AsNumber();
+    }
+    return true;
+}
+
+// The hub's bounds (backend/app/scenegraph.py), applied again here for the same
+// reason ParseAudio applies its own: the wire is repaired, never rejected.
+constexpr double CameraMinFov = 1.0;
+constexpr double CameraMaxFov = 170.0;
+constexpr double CameraMinClip = 0.001;
+constexpr double CameraMinAspect = 0.1;
+constexpr double CameraMaxAspect = 10.0;
+constexpr int32 PathMaxPoints = 256;
+constexpr double PathMinDuration = 0.1;
+constexpr double PathMaxDuration = 86400.0;
+
+void ParseCamera(const TSharedPtr<FJsonObject>& C, FLoomaNodeComponents& Out)
+{
+    Out.bHasCamera = true;
+    FLoomaCameraSpec& Camera = Out.Camera;
+    FString Projection;
+    if (C->TryGetStringField(TEXT("projection"), Projection))
+    {
+        Camera.Projection = Projection == TEXT("orthographic")
+            ? ELoomaCameraProjection::Orthographic : ELoomaCameraProjection::Perspective;
+    }
+    double Number = 0.0;
+    if (ReadNumber(C, TEXT("fov"), Number))
+    {
+        Camera.Fov = static_cast<float>(FMath::Clamp(Number, CameraMinFov, CameraMaxFov));
+    }
+    if (ReadNumber(C, TEXT("orthoSize"), Number))
+    {
+        Camera.OrthoSize = static_cast<float>(FMath::Max(Number, CameraMinClip));
+    }
+    if (ReadNumber(C, TEXT("near"), Number))
+    {
+        Camera.Near = static_cast<float>(FMath::Max(Number, CameraMinClip));
+    }
+    if (ReadNumber(C, TEXT("far"), Number))
+    {
+        Camera.Far = static_cast<float>(Number);
+    }
+    // Beyond the near plane, or the frustum is empty. The default far is held to it as
+    // well, as lens.js does: a near plane past 1000 m pushes it out too.
+    Camera.Far = FMath::Max(Camera.Far, Camera.Near * 1.001f);
+    // `aspect: null` is the same as no aspect: whatever the screen is.
+    if (ReadNumber(C, TEXT("aspect"), Number))
+    {
+        Camera.bHasAspect = true;
+        Camera.Aspect = static_cast<float>(FMath::Clamp(Number, CameraMinAspect, CameraMaxAspect));
+    }
+    Camera.bPrimary = IsLiteralTrue(C, TEXT("primary"));
+}
+
+void ParsePath(const TSharedPtr<FJsonObject>& C, FLoomaNodeComponents& Out)
+{
+    Out.bHasPath = true;
+    FLoomaPathSpec& Path = Out.Path;
+    const TArray<TSharedPtr<FJsonValue>>* Points = nullptr;
+    if (C->TryGetArrayField(TEXT("points"), Points) && Points)
+    {
+        for (const TSharedPtr<FJsonValue>& Value : *Points)
+        {
+            FVector Point;
+            // A point that is not three numbers is dropped, not zeroed: a stray
+            // [0, 0, 0] would bend the curve through the node's origin.
+            if (Path.Points.Num() < PathMaxPoints && ReadTriple(Value, Point))
+            {
+                Path.Points.Add(Point);
+            }
+        }
+    }
+    Path.bClosed = IsLiteralTrue(C, TEXT("closed"));
+    Path.bPlaying = !IsLiteralFalse(C, TEXT("playing"));
+    double Number = 0.0;
+    if (ReadNumber(C, TEXT("duration"), Number))
+    {
+        Path.Duration = static_cast<float>(FMath::Clamp(Number, PathMinDuration, PathMaxDuration));
+    }
+    FString Name;
+    if (C->TryGetStringField(TEXT("mode"), Name))
+    {
+        Path.Mode = Name == TEXT("pingpong") ? ELoomaPathMode::PingPong
+            : Name == TEXT("once") ? ELoomaPathMode::Once : ELoomaPathMode::Loop;
+    }
+    if (C->TryGetStringField(TEXT("ease"), Name))
+    {
+        Path.Ease = Name == TEXT("inOut") ? ELoomaPathEase::InOut : ELoomaPathEase::Linear;
+    }
+    if (C->TryGetStringField(TEXT("orient"), Name))
+    {
+        Path.Orient = Name == TEXT("path") ? ELoomaPathOrient::Path : ELoomaPathOrient::Fixed;
+    }
+    Path.bStamped = ReadNumber(C, TEXT("startedAt"), Path.StartedAt);
+    if (!ReadNumber(C, TEXT("offset"), Path.Offset))
+    {
+        Path.Offset = 0.0;
+    }
+}
+
+void ParseLookAt(const TSharedPtr<FJsonObject>& C, FLoomaNodeComponents& Out)
+{
+    Out.bHasLookAt = true;
+    // `target: null` fails TryGetStringField and leaves Target empty, which is what
+    // null means: aim at nothing.
+    C->TryGetStringField(TEXT("target"), Out.LookAt.Target);
+    FString Axis;
+    if (C->TryGetStringField(TEXT("axis"), Axis))
+    {
+        Out.LookAt.Axis = Axis == TEXT("-y") ? ELoomaLookAtAxis::MinusY : ELoomaLookAtAxis::MinusZ;
+    }
+    FVector Offset;
+    if (ReadTriple(C->TryGetField(TEXT("offset")), Offset))
+    {
+        Out.LookAt.Offset = Offset;
+    }
+}
+
+/** One post-process number: present, clamped, and flagged, or absent and untouched. */
+void ReadSetting(const TSharedPtr<FJsonObject>& C, const TCHAR* Field, double Low, double High, bool& bHas,
+    float& Value)
+{
+    double Number = 0.0;
+    if (ReadNumber(C, Field, Number))
+    {
+        bHas = true;
+        Value = static_cast<float>(FMath::Clamp(Number, Low, High));
+    }
+}
+
+void ParsePostProcess(const TSharedPtr<FJsonObject>& C, FLoomaNodeComponents& Out)
+{
+    Out.bHasPostProcess = true;
+    FLoomaPostProcessSpec& Look = Out.PostProcess;
+    // Unlike everything above, a setting nobody can read is ABSENT rather than given a
+    // default: here absence means "this volume does not touch it", and any value put in
+    // its place would override whatever is underneath (`_clean_post_process`).
+    bool bHasPriority = false;
+    ReadSetting(C, TEXT("priority"), -1000000.0, 1000000.0, bHasPriority, Look.Priority);
+    ReadSetting(C, TEXT("exposure"), -10.0, 10.0, Look.bHasExposure, Look.Exposure);
+    ReadSetting(C, TEXT("contrast"), -1.0, 1.0, Look.bHasContrast, Look.Contrast);
+    ReadSetting(C, TEXT("saturation"), -1.0, 1.0, Look.bHasSaturation, Look.Saturation);
+    ReadSetting(C, TEXT("bloomIntensity"), 0.0, 10.0, Look.bHasBloomIntensity, Look.BloomIntensity);
+    ReadSetting(C, TEXT("bloomThreshold"), 0.0, 100.0, Look.bHasBloomThreshold, Look.BloomThreshold);
+    ReadSetting(C, TEXT("vignette"), 0.0, 1.0, Look.bHasVignette, Look.Vignette);
+    ReadSetting(C, TEXT("focusDistance"), 0.01, 10000.0, Look.bHasFocusDistance, Look.FocusDistance);
+    ReadSetting(C, TEXT("fStop"), 0.5, 64.0, Look.bHasFStop, Look.FStop);
+    ReadSetting(C, TEXT("chromaticAberration"), 0.0, 1.0, Look.bHasChromaticAberration, Look.ChromaticAberration);
+    ReadSetting(C, TEXT("grain"), 0.0, 1.0, Look.bHasGrain, Look.Grain);
+
+    FString Name;
+    if (C->TryGetStringField(TEXT("toneMapping"), Name))
+    {
+        Look.bHasToneMapping = true;
+        if (Name == TEXT("none"))         { Look.ToneMapping = ELoomaToneMapping::None; }
+        else if (Name == TEXT("aces"))    { Look.ToneMapping = ELoomaToneMapping::Aces; }
+        else if (Name == TEXT("agx"))     { Look.ToneMapping = ELoomaToneMapping::Agx; }
+        else if (Name == TEXT("neutral")) { Look.ToneMapping = ELoomaToneMapping::Neutral; }
+        else                              { Look.bHasToneMapping = false; }
+    }
+    if (C->TryGetStringField(TEXT("colorFilter"), Name))
+    {
+        // A colour that is not one is absent, for the reason above, rather than white.
+        const FLinearColor Unread(-1.0f, -1.0f, -1.0f);
+        const FLinearColor Filter = LoomaParseColor(Name, Unread);
+        if (Filter != Unread)
+        {
+            Look.bHasColorFilter = true;
+            Look.ColorFilter = Filter;
+        }
+    }
+    const TSharedPtr<FJsonValue> DepthOfField = C->TryGetField(TEXT("depthOfField"));
+    if (DepthOfField.IsValid() && DepthOfField->Type == EJson::Boolean)
+    {
+        Look.bHasDepthOfField = true;
+        Look.bDepthOfField = DepthOfField->AsBool();
+    }
+}
 } // namespace
+
+void FLoomaPostProcessSpec::Overlay(const FLoomaPostProcessSpec& Above)
+{
+    auto Take = [](bool bAbove, const auto& AboveValue, bool& bHas, auto& Value) {
+        if (bAbove)
+        {
+            bHas = true;
+            Value = AboveValue;
+        }
+    };
+    Take(Above.bHasExposure, Above.Exposure, bHasExposure, Exposure);
+    Take(Above.bHasToneMapping, Above.ToneMapping, bHasToneMapping, ToneMapping);
+    Take(Above.bHasContrast, Above.Contrast, bHasContrast, Contrast);
+    Take(Above.bHasSaturation, Above.Saturation, bHasSaturation, Saturation);
+    Take(Above.bHasColorFilter, Above.ColorFilter, bHasColorFilter, ColorFilter);
+    Take(Above.bHasBloomIntensity, Above.BloomIntensity, bHasBloomIntensity, BloomIntensity);
+    Take(Above.bHasBloomThreshold, Above.BloomThreshold, bHasBloomThreshold, BloomThreshold);
+    Take(Above.bHasVignette, Above.Vignette, bHasVignette, Vignette);
+    Take(Above.bHasDepthOfField, Above.bDepthOfField, bHasDepthOfField, bDepthOfField);
+    Take(Above.bHasFocusDistance, Above.FocusDistance, bHasFocusDistance, FocusDistance);
+    Take(Above.bHasFStop, Above.FStop, bHasFStop, FStop);
+    Take(Above.bHasChromaticAberration, Above.ChromaticAberration, bHasChromaticAberration, ChromaticAberration);
+    Take(Above.bHasGrain, Above.Grain, bHasGrain, Grain);
+}
+
+bool FLoomaPostProcessSpec::operator==(const FLoomaPostProcessSpec& Other) const
+{
+    auto Same = [](bool bA, float A, bool bB, float B) { return bA == bB && (!bA || FMath::IsNearlyEqual(A, B)); };
+    return FMath::IsNearlyEqual(Priority, Other.Priority)
+        && Same(bHasExposure, Exposure, Other.bHasExposure, Other.Exposure)
+        && bHasToneMapping == Other.bHasToneMapping && (!bHasToneMapping || ToneMapping == Other.ToneMapping)
+        && Same(bHasContrast, Contrast, Other.bHasContrast, Other.Contrast)
+        && Same(bHasSaturation, Saturation, Other.bHasSaturation, Other.Saturation)
+        && bHasColorFilter == Other.bHasColorFilter && (!bHasColorFilter || ColorFilter.Equals(Other.ColorFilter, 1e-6f))
+        && Same(bHasBloomIntensity, BloomIntensity, Other.bHasBloomIntensity, Other.BloomIntensity)
+        && Same(bHasBloomThreshold, BloomThreshold, Other.bHasBloomThreshold, Other.BloomThreshold)
+        && Same(bHasVignette, Vignette, Other.bHasVignette, Other.Vignette)
+        && bHasDepthOfField == Other.bHasDepthOfField && (!bHasDepthOfField || bDepthOfField == Other.bDepthOfField)
+        && Same(bHasFocusDistance, FocusDistance, Other.bHasFocusDistance, Other.FocusDistance)
+        && Same(bHasFStop, FStop, Other.bHasFStop, Other.FStop)
+        && Same(bHasChromaticAberration, ChromaticAberration, Other.bHasChromaticAberration, Other.ChromaticAberration)
+        && Same(bHasGrain, Grain, Other.bHasGrain, Other.Grain);
+}
 
 FLoomaNodeComponents LoomaParseComponents(const TArray<TSharedPtr<FJsonValue>>* Components)
 {
@@ -153,6 +419,8 @@ FLoomaNodeComponents LoomaParseComponents(const TArray<TSharedPtr<FJsonValue>>* 
         }
 
         if (Type == TEXT("hidden")) { Out.bHidden = true; continue; }
+        // Ahead of the switch: a camera that is off still claims the node's postProcess.
+        if (Type == TEXT("camera")) { Out.bCarriesCamera = true; }
         // Only a literal false switches a component off (scene-format.md). Keep
         // its definition in the actor's WireComponents, but omit its runtime spec
         // so the existing removal paths stop it without touching the children.
@@ -184,6 +452,10 @@ FLoomaNodeComponents LoomaParseComponents(const TArray<TSharedPtr<FJsonValue>>* 
         else if (Type == TEXT("light"))    { ParseLight(C, Out); }
         else if (Type == TEXT("animation")) { ParseAnimation(C, Out); }
         else if (Type == TEXT("audio"))    { ParseAudio(C, Out); }
+        else if (Type == TEXT("camera"))   { ParseCamera(C, Out); }
+        else if (Type == TEXT("path"))     { ParsePath(C, Out); }
+        else if (Type == TEXT("lookAt"))   { ParseLookAt(C, Out); }
+        else if (Type == TEXT("postProcess")) { ParsePostProcess(C, Out); }
         else if (Type == TEXT("livelink"))
         {
             C->TryGetStringField(TEXT("subject"), Out.LiveLinkSubject);
