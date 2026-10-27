@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
+#include "LoomaDrivers.h"
 #include "LoomaSceneAudio.h"
 #include "LoomaSceneComponents.h"
 #include "LoomaSyncedActor.generated.h"
@@ -10,6 +11,7 @@ class UAnimSequence;
 class UAudioComponent;
 class UglTFRuntimeAsset;
 class ULightComponent;
+class ULoomaCameraComponent;
 class ULoomaSceneSyncSubsystem;
 class UMaterialInstanceDynamic;
 class USkeletalMeshComponent;
@@ -55,16 +57,27 @@ struct FLoomaNodeRenderContext
  * lights are children created on demand:
  *
  *   SceneRoot (USceneComponent)     the node's transform — always present
- *     ├─ ModelComponent             `model`    — a datalake GLB via glTFRuntime
- *     ├─ CharacterComponent         `model`    — the same, when the GLB is skinned;
- *     │                                          `animation` picks its clip
- *     ├─ MeshComponent              `mesh`     — an engine primitive, `material` on it
- *     ├─ LightComponent             `light`    — point / spot / directional
- *     └─ AudioComponent             `audio`    — a datalake sound, played from the node
+ *     └─ AimComponent               `lookAt` turns this; identity otherwise
+ *          ├─ ModelComponent        `model`    — a datalake GLB via glTFRuntime
+ *          ├─ CharacterComponent    `model`    — the same, when the GLB is skinned;
+ *          │                                     `animation` picks its clip
+ *          ├─ MeshComponent         `mesh`     — an engine primitive, `material` on it
+ *          ├─ LightComponent        `light`    — point / spot / directional
+ *          ├─ AudioComponent        `audio`    — a datalake sound, played from the node
+ *          ├─ CameraComponent       `camera`   — a viewpoint
+ *          └─ CarriageComponent     `path` moves this; identity otherwise.
+ *               └─ (child nodes)    every synced child actor attaches here
  *
  * That is what makes an empty object (no components at all), a light-only node, and
  * a node carrying both a mesh and a light equally expressible. An empty node is not
  * a degenerate case: its children's transforms are relative to it.
+ *
+ * The aim and the carriage are the web client's two groups of the same names
+ * (frontend/src/scene/SpawnedNode.jsx). Both are always there, so adding either
+ * component never re-attaches a child. They are what keeps the document's rule that
+ * `t` is parent-local: a child's `t` is relative to its parent's carriage, which is
+ * what riding a path means, and an aim turns the node without its stored `t` ever
+ * moving, so the gizmo, the outbound diff and the wire never see the computed turn.
  *
  * The actor's **parent-local** transform mirrors the node's `t`; UE attachment
  * composes the world pose the same way three.js does. Remote transient transforms
@@ -143,6 +156,40 @@ public:
     /** The node's transform. Always present, even when nothing renders. */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
     TObjectPtr<USceneComponent> SceneRoot;
+
+    /**
+     * What `lookAt` turns, inside the node's transform. Everything the node renders,
+     * and its children, hang under it. Always present; identity without a `lookAt`.
+     */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    TObjectPtr<USceneComponent> AimComponent;
+
+    /**
+     * What `path` moves along its curve, and what the node's children are attached
+     * to. Always present; identity without a `path`.
+     */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    TObjectPtr<USceneComponent> CarriageComponent;
+
+    /** The `camera` component's lens. Null unless the node has one switched on. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    TObjectPtr<ULoomaCameraComponent> CameraComponent;
+
+    /** Where a synced child node attaches: the carriage. */
+    USceneComponent* GetChildAttachComponent() const { return CarriageComponent; }
+
+    /**
+     * Put the carriage where the `path` says it is at `HubNowSeconds`, the hub's wall
+     * clock in Unix seconds. Called every frame by the subsystem, carriages before aims.
+     */
+    void DriveCarriage(double HubNowSeconds);
+
+    /**
+     * Turn the aim so the `lookAt` axis points at `Target` (the node its `target`
+     * names, or null when the scene does not hold it). Called every frame by the
+     * subsystem after every carriage has moved, in document order.
+     */
+    void DriveAim(const ALoomaSyncedActor* Target);
 
     /**
      * The `model` component's mesh — built from the GLB. Null unless the node has a
@@ -256,10 +303,14 @@ private:
     void ApplyAudio(const FLoomaNodeComponents& Next, const FLoomaNodeRenderContext& Context);
     /** Volume, pitch and fade: everything about `Spec` that changes a sound as it plays. */
     void ApplyAudioSettings(const FLoomaAudioSpec& Spec);
+    /** Create, set or destroy the camera to match `Next`'s `camera`. */
+    void ApplyCamera(const FLoomaNodeComponents& Next);
+    /** Rebuild the curve when the points change; put the carriage and the aim back when their component goes. */
+    void ApplyDrivers(const FLoomaNodeComponents& Next);
     /** Make SoundWave from DecodedSound, as `Spec` plays it, and hand it to AudioComponent. */
     void BuildSoundWave(const FLoomaAudioSpec& Spec);
 
-    /** Create a mesh component in `Slot` on first use, attached to SceneRoot. */
+    /** Create a mesh component in `Slot` on first use, attached to AimComponent. */
     UStaticMeshComponent* EnsureMeshComponent(TObjectPtr<UStaticMeshComponent>& Slot);
     USkeletalMeshComponent* EnsureCharacterComponent();
     UAudioComponent* EnsureAudioComponent();
@@ -316,6 +367,9 @@ private:
 
     /** Captured from the last ApplyComponents, for the async GLB completion. */
     bool bBaseAlignModel = true;
+
+    /** The `path`'s curve and length table, rebuilt only when its points or `closed` change. */
+    TOptional<FLoomaPathCurve> PathCurve;
 
     FTransform RemoteTarget;
     bool bHasRemoteTarget = false;

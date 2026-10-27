@@ -4,8 +4,14 @@
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 #include "Engine/GameInstance.h"
+#include "Engine/PostProcessVolume.h"
 #include "GenericPlatform/GenericPlatformHttp.h"
 #include "Engine/World.h"
+#include "GameFramework/Pawn.h"
+#include "GameFramework/PlayerController.h"
+#include "LoomaCameraComponent.h"
+#include "LoomaDrivers.h"
+#include "LoomaPostProcess.h"
 #include "HAL/FileManager.h"
 #include "HAL/IConsoleManager.h"
 #include "HttpModule.h"
@@ -330,6 +336,10 @@ void ULoomaSceneSyncSubsystem::Initialize(FSubsystemCollectionBase& Collection)
     FModuleManager::Get().LoadModuleChecked(TEXT("WebSockets"));
     SettingsChangedHandle = ULoomaSceneSyncSettings::OnSettingsChanged().AddUObject(
         this, &ULoomaSceneSyncSubsystem::OnSettingsChanged);
+    if (ULoomaSceneSyncSettings::Get().bViewThroughSceneCamera)
+    {
+        LookingThrough = SceneCameraName;
+    }
     // Before Connect, and that order is the whole point of it: the first handshake then
     // already carries the bearer, so the hub names us the account from the outset. Load
     // it afterwards instead and every launch would connect as a guest and immediately
@@ -383,6 +393,12 @@ void ULoomaSceneSyncSubsystem::Deinitialize()
     Tracked.Empty();
     if (SkyboxActor) SkyboxActor->Destroy();
     SkyboxActor = nullptr;
+    if (LookVolume) LookVolume->Destroy();
+    LookVolume = nullptr;
+    DrivenNodes.Empty();
+    SceneCamera.Reset();
+    ViewedCamera.Reset();
+    HubClock.Reset();
     JobHandles.Empty();
     PendingHandleReplays.Empty();
     SuggestedTransforms.Empty();
@@ -508,6 +524,12 @@ void ULoomaSceneSyncSubsystem::Connect()
         // sent from here so it goes out through the one diffing send path, and so it
         // cannot race the `hello` this socket has only just written.
         bForceSelectionSend = true;
+        // Measure the hub's clock afresh: this may be another backend than the last
+        // socket's. Five samples a quarter-second apart, then one every 15 s (TickClock),
+        // as the web client takes them.
+        HubClock.Reset();
+        ClockBurstLeft = 5;
+        NextClockPingMs = 0.0;
         // The WS never replays generation events to late joiners — pull the
         // current queue over REST so cached jobs reflect all clients.
         HydrateGenerationQueue();
@@ -2790,12 +2812,16 @@ void ULoomaSceneSyncSubsystem::OnRawMessage(const FString& Text)
     }
     const FString Type = Msg->GetStringField(TEXT("type"));
     if (Type == TEXT("scene") || Type == TEXT("spawn") || Type == TEXT("despawn") ||
-        Type == TEXT("patch") || Type == TEXT("reparent")) bSkyboxDirty = true;
+        Type == TEXT("patch") || Type == TEXT("reparent")) bSkyboxDirty = bCamerasDirty = true;
 
     bApplyingRemote = true;
     if (Type == TEXT("scene"))
     {
         HandleScene(Msg);
+    }
+    else if (Type == TEXT("clock"))
+    {
+        HandleClock(Msg);
     }
     else if (Type == TEXT("spawn"))
     {
@@ -2981,7 +3007,11 @@ void ULoomaSceneSyncSubsystem::HandleScene(const TSharedPtr<FJsonObject>& Msg)
         DropNode(NodeId);
     }
 
+    // The frame lists the document in its order, so every node is renumbered from it.
+    NextNodeOrder = 0;
+    bRenumberingNodes = true;
     UpsertNodes(*Nodes);
+    bRenumberingNodes = false;
 
     UE_LOG(LogLoomaSync, Log, TEXT("Scene%s: %d node(s) applied, %d dropped"),
         ActiveSceneId.IsEmpty() ? TEXT(" (unsaved)") : *FString::Printf(TEXT(" '%s'"), *ActiveSceneId),
@@ -3115,6 +3145,12 @@ void ULoomaSceneSyncSubsystem::UpsertNode(const TSharedPtr<FJsonObject>& Node)
         Entry->LastSent = Actor->GetLocalTransform();
         Entry->bMoving = false;
         Entry->StillFrames = 0;
+        // A spawn goes after everything known; an upsert of a known node keeps its place,
+        // unless a `scene` frame is restating the whole order.
+        if (bFresh || bRenumberingNodes)
+        {
+            Entry->Order = NextNodeOrder++;
+        }
     }
     ApplyGenerationMeta(*Actor);
 
@@ -3123,11 +3159,13 @@ void ULoomaSceneSyncSubsystem::UpsertNode(const TSharedPtr<FJsonObject>& Node)
         UE_LOG(LogLoomaSync, Log, TEXT("Node '%s' (%s)%s: %s at local %s"),
             *Actor->DisplayName, *NodeId,
             ParentId.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" under %s"), *ParentId),
-            Components.IsEmpty() ? TEXT("empty (transform only)") : *FString::Printf(TEXT("%s%s%s%s"),
+            Components.IsEmpty() ? TEXT("empty (transform only)") : *FString::Printf(TEXT("%s%s%s%s%s%s"),
                 Components.bHasModel ? TEXT("model ") : TEXT(""),
                 Components.bHasMesh ? TEXT("mesh ") : TEXT(""),
                 Components.bHasLight ? TEXT("light ") : TEXT(""),
-                Components.bHasAudio ? TEXT("audio") : TEXT("")),
+                Components.bHasAudio ? TEXT("audio ") : TEXT(""),
+                Components.bHasCamera ? TEXT("camera ") : TEXT(""),
+                Components.bHasPath ? TEXT("path") : TEXT("")),
             *Local.GetLocation().ToString());
     }
 }
@@ -3150,9 +3188,14 @@ void ULoomaSceneSyncSubsystem::ApplyParent(ALoomaSyncedActor& Actor, const FStri
     ALoomaSyncedActor* Parent = ParentId.IsEmpty() ? nullptr : FindSyncedActor(ParentId);
     if (Parent && Parent != &Actor)
     {
-        if (Actor.GetAttachParentActor() != Parent)
+        // To the parent's carriage, not its root: a child's `t` is relative to where the
+        // parent's `path` has it, and the carriage is the identity without one. The
+        // component, not just the actor, is compared, because an attachment made in the
+        // editor's Outliner lands on the root.
+        USceneComponent* Mount = Parent->GetChildAttachComponent();
+        if (Actor.GetRootComponent()->GetAttachParent() != Mount)
         {
-            Actor.AttachToActor(Parent, FAttachmentTransformRules::KeepRelativeTransform);
+            Actor.AttachToComponent(Mount, FAttachmentTransformRules::KeepRelativeTransform);
         }
     }
     else if (Actor.GetAttachParentActor() != nullptr)
@@ -3182,7 +3225,7 @@ void ULoomaSceneSyncSubsystem::ResolvePendingParents()
             // which is exactly what they always meant.
             UE_LOG(LogLoomaSync, Verbose, TEXT("Node '%s' found parent '%s' late — attaching"),
                 *Actor->Id, *Actor->ParentId);
-            Actor->AttachToActor(Parent, FAttachmentTransformRules::KeepRelativeTransform);
+            Actor->AttachToComponent(Parent->GetChildAttachComponent(), FAttachmentTransformRules::KeepRelativeTransform);
         }
     }
 }
@@ -3658,7 +3701,7 @@ void ULoomaSceneSyncSubsystem::OnSyncedActorDestroyed(AActor* DestroyedActor)
         return;
     }
     const bool bWasTracked = Tracked.Remove(Actor->Id) > 0;
-    bSkyboxDirty = true;
+    bSkyboxDirty = bCamerasDirty = true;
     MarkBordersDirty();
     if (bWasTracked && !bApplyingRemote)
     {
@@ -3703,6 +3746,14 @@ void ULoomaSceneSyncSubsystem::Tick(float DeltaTime)
     // remote border on a node we had just taken.
     TickBorders();
     if (bSkyboxDirty) { bSkyboxDirty = false; RefreshSkybox(); }
+    // After the skybox, whose pass is the one that sets each node's hidden flag, which
+    // the looks read. Then the drivers, every frame and whatever the socket is doing:
+    // a carriage runs on the hub's clock, and the clock keeps its last offset while
+    // the socket is down. A tickable ticks after every actor and before the cameras
+    // are read, so a remote pose eased this frame is where the aim is taken from.
+    if (bCamerasDirty) { bCamerasDirty = false; RefreshCameras(); }
+    TickDrivers();
+    TickView();
 
     if (ReconnectCooldown > 0.0f)
     {
@@ -3715,8 +3766,275 @@ void ULoomaSceneSyncSubsystem::Tick(float DeltaTime)
     }
     if (IsSyncConnected())
     {
+        TickClock();
         TickOutbound(DeltaTime);
     }
+}
+
+// --- Cameras, paths, aims and looks -------------------------------------------
+
+const FString ULoomaSceneSyncSubsystem::SceneCameraName = TEXT("scene");
+
+namespace
+{
+/** Where the global look sits among the level's own volumes: above every one a level would set. */
+constexpr float LookVolumePriority = 1.0e6f;
+
+/** The first local player's controller, the one whose view LookThrough moves. */
+APlayerController* FirstLocalPlayer(const UGameInstance* GameInstance)
+{
+    return GameInstance ? GameInstance->GetFirstLocalPlayerController() : nullptr;
+}
+} // namespace
+
+double ULoomaSceneSyncSubsystem::GetHubTime() const
+{
+    return HubClock.ServerNowMs(FLoomaHubClock::LocalMs()) / 1000.0;
+}
+
+void ULoomaSceneSyncSubsystem::TickClock()
+{
+    const double Now = FLoomaHubClock::LocalMs();
+    if (Now < NextClockPingMs)
+    {
+        return;
+    }
+    TSharedRef<FJsonObject> Ping = MakeShared<FJsonObject>();
+    Ping->SetStringField(TEXT("type"), TEXT("clock"));
+    Ping->SetNumberField(TEXT("t0"), Now);
+    SendJson(Ping);
+    // The hub ignores more than four a second from one socket; a quarter second apart
+    // is the web's pace, and the burst is done in a little over a second.
+    ClockBurstLeft = FMath::Max(0, ClockBurstLeft - 1);
+    NextClockPingMs = Now + (ClockBurstLeft > 0 ? 250.0 : 15000.0);
+}
+
+void ULoomaSceneSyncSubsystem::HandleClock(const TSharedPtr<FJsonObject>& Msg)
+{
+    const double Arrived = FLoomaHubClock::LocalMs();
+    double T0 = 0.0;
+    double Server = 0.0;
+    if (!Msg->TryGetNumberField(TEXT("t0"), T0) || !Msg->TryGetNumberField(TEXT("server"), Server))
+    {
+        return;
+    }
+    const bool bFirst = !HubClock.IsSynced();
+    if (HubClock.AddSample(T0, Server, Arrived) && bFirst)
+    {
+        UE_LOG(LogLoomaSync, Log, TEXT("Hub clock: %+.0f ms from this machine's (round trip %.0f ms)"),
+            HubClock.GetOffsetMs(), HubClock.GetRoundTripMs());
+    }
+}
+
+TArray<ALoomaSyncedActor*> ULoomaSceneSyncSubsystem::NodesInOrder() const
+{
+    TArray<TPair<const FLoomaTrackedActor*, ALoomaSyncedActor*>> Entries;
+    Entries.Reserve(Tracked.Num());
+    for (const TPair<FString, FLoomaTrackedActor>& Pair : Tracked)
+    {
+        if (ALoomaSyncedActor* Actor = Pair.Value.Actor.Get())
+        {
+            Entries.Emplace(&Pair.Value, Actor);
+        }
+    }
+    Entries.Sort([](const auto& A, const auto& B) {
+        return A.Key->Order != B.Key->Order ? A.Key->Order < B.Key->Order
+                                            : A.Value->Id.Compare(B.Value->Id, ESearchCase::CaseSensitive) < 0;
+    });
+    TArray<ALoomaSyncedActor*> Out;
+    Out.Reserve(Entries.Num());
+    for (const auto& Entry : Entries)
+    {
+        Out.Add(Entry.Value);
+    }
+    return Out;
+}
+
+void ULoomaSceneSyncSubsystem::RefreshCameras()
+{
+    const TArray<ALoomaSyncedActor*> Ordered = NodesInOrder();
+
+    DrivenNodes.Reset();
+    ALoomaSyncedActor* Primary = nullptr;
+    for (ALoomaSyncedActor* Actor : Ordered)
+    {
+        const FLoomaNodeComponents& Components = Actor->GetComponents();
+        if (Components.bHasPath || Components.bHasLookAt)
+        {
+            DrivenNodes.Add(Actor);
+        }
+        // A camera switched off is passed over, so switching the scene's camera off
+        // leaves no scene camera rather than one that shows nothing. Hidden does not
+        // matter: a camera draws nothing either way.
+        if (!Primary && Components.bHasCamera && Components.Camera.bPrimary)
+        {
+            Primary = Actor;
+        }
+    }
+    if (SceneCamera.Get() != Primary)
+    {
+        SceneCamera = Primary;
+        UE_LOG(LogLoomaSync, Log, TEXT("Scene camera: %s"),
+            Primary ? *FString::Printf(TEXT("'%s' (%s)"), *Primary->DisplayName, *Primary->Id) : TEXT("none"));
+        OnSceneCameraChanged.Broadcast(Primary);
+    }
+
+    RefreshLooks(Ordered);
+}
+
+void ULoomaSceneSyncSubsystem::RefreshLooks(const TArray<ALoomaSyncedActor*>& Ordered)
+{
+    // Hidden is read off the actor, which RefreshSkybox set from the node and every
+    // ancestor just before this ran.
+    TArray<FLoomaLookVolume> Globals;
+    for (int32 I = 0; I < Ordered.Num(); ++I)
+    {
+        const FLoomaNodeComponents& Components = Ordered[I]->GetComponents();
+        if (Components.bHasPostProcess && !Components.bCarriesCamera && !Ordered[I]->IsHidden())
+        {
+            Globals.Add({ Components.PostProcess, I });
+        }
+    }
+
+    FLoomaPostProcessSpec Global;
+    const bool bGlobal = LoomaResolveLook(Globals, nullptr, Global);
+    if (bGlobal && !LookVolume)
+    {
+        // In the world the scene's nodes are in, which is the game instance's.
+        UWorld* World = Ordered.Num() > 0 ? Ordered[0]->GetWorld()
+            : GetGameInstance() ? GetGameInstance()->GetWorld() : nullptr;
+        if (World)
+        {
+            FActorSpawnParameters Params;
+            Params.ObjectFlags |= RF_Transient;
+            LookVolume = World->SpawnActor<APostProcessVolume>(Params);
+            if (LookVolume)
+            {
+                LookVolume->bUnbound = true;
+                LookVolume->Priority = LookVolumePriority;
+                LookVolume->BlendWeight = 1.0f;
+#if WITH_EDITOR
+                LookVolume->SetActorLabel(TEXT("Looma Scene Look"));
+#endif
+            }
+        }
+    }
+    if (LookVolume)
+    {
+        // A global look has no frame of its own, so its lens is read on a full-frame still.
+        LookVolume->Settings = LoomaMakePostProcessSettings(Global, LoomaDefaultFrameAspect);
+        LookVolume->bEnabled = bGlobal;
+    }
+
+    for (ALoomaSyncedActor* Actor : Ordered)
+    {
+        ULoomaCameraComponent* Camera = Actor->CameraComponent.Get();
+        if (!Camera)
+        {
+            continue;
+        }
+        const FLoomaNodeComponents& Components = Actor->GetComponents();
+        const bool bOwn = Components.bHasPostProcess && !Actor->IsHidden();
+        FLoomaPostProcessSpec Look;
+        // The camera's settings are blended over the world's volumes, so the whole
+        // resolved look goes on it: the globals and its own on top, which Unreal then
+        // lays over the same globals again with no change.
+        if (bOwn && LoomaResolveLook(Globals, &Components.PostProcess, Look))
+        {
+            const FLoomaCameraSpec& Lens = Components.Camera;
+            Camera->PostProcessSettings = LoomaMakePostProcessSettings(Look,
+                Lens.bHasAspect ? Lens.Aspect : LoomaDefaultFrameAspect);
+            Camera->PostProcessBlendWeight = 1.0f;
+        }
+        else
+        {
+            Camera->PostProcessSettings = FPostProcessSettings();
+            Camera->PostProcessBlendWeight = 0.0f;
+        }
+    }
+}
+
+void ULoomaSceneSyncSubsystem::TickDrivers()
+{
+    if (DrivenNodes.IsEmpty())
+    {
+        return;
+    }
+    const double Now = GetHubTime();
+    // Carriages first, every one, so that a camera on a rail aiming at a performer on
+    // another rail aims from where both are this frame. Then the aims, in document
+    // order, so a parent's turn is in place before its child's is taken.
+    for (const TWeakObjectPtr<ALoomaSyncedActor>& Node : DrivenNodes)
+    {
+        if (ALoomaSyncedActor* Actor = Node.Get())
+        {
+            Actor->DriveCarriage(Now);
+        }
+    }
+    for (const TWeakObjectPtr<ALoomaSyncedActor>& Node : DrivenNodes)
+    {
+        ALoomaSyncedActor* Actor = Node.Get();
+        if (Actor && Actor->GetComponents().bHasLookAt)
+        {
+            Actor->DriveAim(FindSyncedActor(Actor->GetComponents().LookAt.Target));
+        }
+    }
+}
+
+TArray<ALoomaSyncedActor*> ULoomaSceneSyncSubsystem::GetCameras() const
+{
+    TArray<ALoomaSyncedActor*> Out = NodesInOrder();
+    Out.RemoveAll([](const ALoomaSyncedActor* Actor) { return !Actor->CameraComponent; });
+    return Out;
+}
+
+ALoomaSyncedActor* ULoomaSceneSyncSubsystem::ResolveCamera(const FString& Camera) const
+{
+    if (Camera.IsEmpty())
+    {
+        return nullptr;
+    }
+    ALoomaSyncedActor* Actor = Camera == SceneCameraName ? SceneCamera.Get() : FindSyncedActor(Camera);
+    return Actor && Actor->CameraComponent ? Actor : nullptr;
+}
+
+void ULoomaSceneSyncSubsystem::LookThrough(const FString& Camera)
+{
+    LookingThrough = Camera;
+    TickView();
+}
+
+void ULoomaSceneSyncSubsystem::TickView()
+{
+    if (LookingThrough.IsEmpty() && !ViewedCamera.IsValid())
+    {
+        return; // the common case: nobody asked, and nothing of ours is on screen
+    }
+    APlayerController* Player = FirstLocalPlayer(GetGameInstance());
+    if (!Player)
+    {
+        return; // not yet: the scene often arrives before the player does
+    }
+    ALoomaSyncedActor* Wanted = ResolveCamera(LookingThrough);
+    AActor* Current = Player->GetViewTarget();
+    if (Wanted)
+    {
+        if (Current != Wanted)
+        {
+            // A cut, as the format calls making another camera the scene's.
+            Player->SetViewTarget(Wanted);
+        }
+        ViewedCamera = Wanted;
+        return;
+    }
+    // Nothing to look through: give the player its own view back, but only off a
+    // camera this put it on, never off a view somebody else chose.
+    if (ViewedCamera.IsValid() && Current == ViewedCamera.Get())
+    {
+        APawn* Pawn = Player->GetPawn();
+        Player->SetViewTarget(Pawn ? static_cast<AActor*>(Pawn) : Player);
+    }
+    ViewedCamera.Reset();
 }
 
 // --- Local selection (outbound `selection`) -----------------------------------

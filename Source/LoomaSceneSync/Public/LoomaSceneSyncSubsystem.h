@@ -3,6 +3,7 @@
 #include "CoreMinimal.h"
 #include "LoomaAuthTypes.h"
 #include "LoomaGenerationTypes.h"
+#include "LoomaHubClock.h"
 #include "LoomaPresenceTypes.h"
 #include "LoomaSyncedActor.h"
 #include "Subsystems/GameInstanceSubsystem.h"
@@ -160,6 +161,12 @@ struct FLoomaTrackedActor
      * warning about it fires on the rising edge — once per attachment, not per tick.
      */
     bool bForeignParent = false;
+    /**
+     * Where the node stands in the document: its place in the last `scene` frame, or
+     * after every node then known for one spawned since. The scene's camera is the first
+     * `primary` one in this order, and global looks of equal priority stack in it.
+     */
+    int32 Order = 0;
 };
 
 /** Fired for generation-job lifecycle changes. Carries the full job snapshot. */
@@ -330,6 +337,60 @@ public:
 
     UFUNCTION(BlueprintPure, Category = "Looma")
     bool IsSyncConnected() const;
+
+    // --- Cameras (scene-format.md, "Cameras, paths, aims and looks") ---------
+    //
+    // What this client looks through is its own choice and is never synced, as on the
+    // web (frontend/src/scene/camera/viewState.js). What the scene's camera IS is in
+    // the document: the first `camera` in document order marked `primary` and switched
+    // on. Making another camera the scene's is a cut, which everybody following the
+    // scene's camera sees.
+
+    /** The node whose camera is the scene's, or null when the scene has none switched on. */
+    UFUNCTION(BlueprintPure, Category = "Looma|Camera")
+    ALoomaSyncedActor* GetSceneCamera() const { return SceneCamera.Get(); }
+
+    /** Every node with a camera switched on, in document order. */
+    UFUNCTION(BlueprintCallable, Category = "Looma|Camera")
+    TArray<ALoomaSyncedActor*> GetCameras() const;
+
+    /** Fired when the scene's camera changes: a cut, or the scene gaining or losing one. Null for none. */
+    UPROPERTY(BlueprintAssignable, Category = "Looma|Camera")
+    FLoomaSyncedActorEvent OnSceneCameraChanged;
+
+    /**
+     * Look through a camera, with the first local player's view: a node id, `scene` to
+     * follow the scene's camera through every cut, or empty for the player's own view
+     * again. Kept until changed, and applied whenever the camera exists, so it can be
+     * set before the scene arrives. Project Settings' *View Through Scene Camera* sets
+     * `scene` at start. Console: `Looma.Camera`.
+     *
+     * The view is cut, not blended. A camera that goes away, or is switched off, gives
+     * the player its own view back until it returns.
+     */
+    UFUNCTION(BlueprintCallable, Category = "Looma|Camera")
+    void LookThrough(const FString& Camera);
+
+    /** What LookThrough was last given: a node id, `scene`, or empty for the player's own view. */
+    UFUNCTION(BlueprintPure, Category = "Looma|Camera")
+    FString GetLookingThrough() const { return LookingThrough; }
+
+    /** The camera node a LookThrough of `Camera` comes to now, or null for the player's own view. */
+    ALoomaSyncedActor* ResolveCamera(const FString& Camera) const;
+
+    /** LookThrough's word for the scene's camera. */
+    static const FString SceneCameraName;
+
+    /**
+     * The hub's wall clock now, in Unix seconds, as the `clock` message measures it
+     * (HAM-330). This machine's clock until the first answer arrives. Paths are
+     * placed on it, so every client puts a carriage in the same place at the same time.
+     */
+    UFUNCTION(BlueprintPure, Category = "Looma")
+    double GetHubTime() const;
+
+    /** The clock behind GetHubTime: whether it has an answer yet, its offset and round trip. */
+    const FLoomaHubClock& GetHubClock() const { return HubClock; }
 
     // --- Which scene this client is on (outbound `openScene`) -----------------
     //
@@ -1336,10 +1397,54 @@ private:
     void RefreshSkybox();
     UPROPERTY() TObjectPtr<class ALoomaSkyboxActor> SkyboxActor;
     bool bSkyboxDirty = true;
+
+    // --- Cameras, paths, aims and looks -----------------------------------------
+
+    /** Every tracked node, in document order (Order, then id). */
+    TArray<ALoomaSyncedActor*> NodesInOrder() const;
+
+    /**
+     * After any scene change, and after RefreshSkybox, whose hidden flags it reads:
+     * which nodes are driven, which camera is the scene's, and the looks.
+     */
+    void RefreshCameras();
+
+    /** Every frame: carriages along their paths on the hub's clock, then aims, in document order. */
+    void TickDrivers();
+
+    /** Every frame: the first local player's view onto the camera LookThrough names, or back off it. */
+    void TickView();
+
+    /** The global look on LookVolume, and each camera's own look on that camera. */
+    void RefreshLooks(const TArray<ALoomaSyncedActor*>& Ordered);
+
+    /** Send the next `clock` ping when it is due: five a quarter-second apart, then one every 15 s. */
+    void TickClock();
+    void HandleClock(const TSharedPtr<FJsonObject>& Msg);
+
+    bool bCamerasDirty = true;
+    /** Nodes with a `path` or a `lookAt`, in document order; rebuilt by RefreshCameras. */
+    TArray<TWeakObjectPtr<ALoomaSyncedActor>> DrivenNodes;
+    TWeakObjectPtr<ALoomaSyncedActor> SceneCamera;
+    /** The unbound volume carrying the global look. Spawned when a look first applies. */
+    UPROPERTY() TObjectPtr<class APostProcessVolume> LookVolume;
+    FString LookingThrough;
+    /** The actor this client put the player's view on, so only that is ever taken back. */
+    TWeakObjectPtr<AActor> ViewedCamera;
+
+    FLoomaHubClock HubClock;
+    int32 ClockBurstLeft = 0;
+    double NextClockPingMs = 0.0;
+
+    /** The next node's Order; restarted by each `scene` frame, which renumbers every node. */
+    int32 NextNodeOrder = 0;
+    bool bRenumberingNodes = false;
+
 #if WITH_DEV_AUTOMATION_TESTS
     // The fixture seeds a transient scene and feeds wire frames without opening a
     // socket or restoring a session. Production callers use the public scene API.
     friend struct FLoomaBorderRefreshTestFixture;
+    friend struct FLoomaCameraTestAccess;
     friend struct FLoomaComponentEnabledTestAccess;
     friend struct FLoomaLivePoseTestAccess;
     friend struct FLoomaAudioTestAccess;

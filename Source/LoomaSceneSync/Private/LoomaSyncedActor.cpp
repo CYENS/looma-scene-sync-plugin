@@ -12,9 +12,11 @@
 #include "Engine/Scene.h"
 #include "Engine/SkeletalMesh.h"
 #include "Engine/StaticMesh.h"
+#include "LoomaCameraComponent.h"
 #include "LoomaGenerationLibrary.h"
 #include "LoomaSceneSyncLog.h"
 #include "LoomaSceneSyncSubsystem.h"
+#include "LoomaWireConvert.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Materials/MaterialInterface.h"
 #include "glTFRuntimeAsset.h"
@@ -131,6 +133,14 @@ ALoomaSyncedActor::ALoomaSyncedActor()
     SceneRoot = CreateDefaultSubobject<USceneComponent>(TEXT("SceneRoot"));
     SceneRoot->SetMobility(EComponentMobility::Movable);
     RootComponent = SceneRoot;
+
+    // Both always there, so adding a `lookAt` or a `path` never re-attaches anything.
+    AimComponent = CreateDefaultSubobject<USceneComponent>(TEXT("Aim"));
+    AimComponent->SetMobility(EComponentMobility::Movable);
+    AimComponent->SetupAttachment(SceneRoot);
+    CarriageComponent = CreateDefaultSubobject<USceneComponent>(TEXT("Carriage"));
+    CarriageComponent->SetMobility(EComponentMobility::Movable);
+    CarriageComponent->SetupAttachment(AimComponent);
 }
 
 // --- Components ---------------------------------------------------------------
@@ -142,6 +152,8 @@ void ALoomaSyncedActor::ApplyComponents(const FLoomaNodeComponents& Next, const 
     ApplyMaterial(Next);
     ApplyLight(Next, Context);
     ApplyAudio(Next, Context);
+    ApplyCamera(Next);
+    ApplyDrivers(Next);
     // After ApplyModel. If the character is not built yet this is a no-op, and
     // BuildCharacter applies the clip itself once it is — so a clip chosen before the
     // GLB arrives still plays when it does.
@@ -347,7 +359,7 @@ void ALoomaSyncedActor::ApplyLight(const FLoomaNodeComponents& Next, const FLoom
             return;
         }
         Created->SetMobility(EComponentMobility::Movable);
-        Created->SetupAttachment(SceneRoot);
+        Created->SetupAttachment(AimComponent);
         Created->RegisterComponent();
         AddInstanceComponent(Created);
         LightComponent = Created;
@@ -558,6 +570,117 @@ void ALoomaSyncedActor::OnSoundDownloaded(const FString& Url, const TArray<uint8
     }
 }
 
+// --- `camera`, `path` and `lookAt` ---------------------------------------------
+
+void ALoomaSyncedActor::ApplyCamera(const FLoomaNodeComponents& Next)
+{
+    if (!Next.bHasCamera)
+    {
+        // Absent or switched off: it sees nothing and cannot be looked through. A view
+        // still on it falls back to the player's, see the subsystem's TickView.
+        DestroySlot(CameraComponent);
+        return;
+    }
+    if (!CameraComponent)
+    {
+        // NAME_None for the same reason as a light: a removed component keeps its name
+        // until the next GC.
+        ULoomaCameraComponent* Created = NewObject<ULoomaCameraComponent>(this, NAME_None);
+        if (!Created)
+        {
+            return;
+        }
+        Created->SetMobility(EComponentMobility::Movable);
+        // On the aim, with no turn of its own: the node's −Z is UE +X, which is where an
+        // Unreal camera looks, and the node's +Y is UE +Z, its up.
+        Created->SetupAttachment(AimComponent);
+        Created->RegisterComponent();
+        AddInstanceComponent(Created);
+        CameraComponent = Created;
+    }
+    CameraComponent->ApplySpec(Next.Camera);
+}
+
+void ALoomaSyncedActor::ApplyDrivers(const FLoomaNodeComponents& Next)
+{
+    if (!Next.bHasPath)
+    {
+        // Absent or switched off: the children stand where they would with no path, on
+        // the node itself. Its time is the hub's and runs on regardless, so switching it
+        // back on finds the carriage where the clock says.
+        PathCurve.Reset();
+        CarriageComponent->SetRelativeTransform(FTransform::Identity);
+    }
+    else if (!PathCurve.IsSet() || !Components.bHasPath || Components.Path.Points != Next.Path.Points
+        || Components.Path.bClosed != Next.Path.bClosed)
+    {
+        // The length table is the expensive part, and a play/pause or a duration edit
+        // does not change it.
+        PathCurve.Emplace(Next.Path.Points, Next.Path.bClosed);
+    }
+    if (!Next.bHasLookAt)
+    {
+        // The node shows its own rotation again; its stored `t` never moved.
+        AimComponent->SetRelativeRotation(FQuat::Identity);
+    }
+}
+
+void ALoomaSyncedActor::DriveCarriage(double HubNowSeconds)
+{
+    if (!Components.bHasPath || !PathCurve.IsSet())
+    {
+        return;
+    }
+    const FLoomaPathSpec& Path = Components.Path;
+    const double U = LoomaPathProgress(Path, LoomaPathTime(Path, HubNowSeconds));
+    FVector Position;
+    FQuat Rotation;
+    LoomaCarriageAt(Path, PathCurve.GetValue(), U, Position, Rotation);
+    // The curve is in the node's own frame, which LoomaWireConvert maps the same way it
+    // maps the node's `t`, so the carriage is converted like a pose.
+    CarriageComponent->SetRelativeLocationAndRotation(LoomaWirePointToUe(Position), LoomaWireQuatToUe(Rotation));
+}
+
+void ALoomaSyncedActor::DriveAim(const ALoomaSyncedActor* Target)
+{
+    if (!Components.bHasLookAt)
+    {
+        return;
+    }
+    // A target inside the node itself (the node or any descendant) aims nothing:
+    // turning towards something it carries would chase its own tail.
+    bool bWithin = false;
+    for (const AActor* At = Target; At; At = At->GetAttachParentActor())
+    {
+        if (At == this)
+        {
+            bWithin = true;
+            break;
+        }
+    }
+    if (!Target || bWithin)
+    {
+        AimComponent->SetRelativeRotation(FQuat::Identity);
+        return;
+    }
+
+    // In the wire's frame, where the format (and three.js's lookAt) defines the turn.
+    // The eye is the node's own transform, not the aim, and the point aimed at is the
+    // offset in the target's own frame, its scale included.
+    const FTransform& Node = SceneRoot->GetComponentTransform();
+    const FVector Eye = LoomaUePointToWire(Node.GetLocation());
+    const FVector At = LoomaUePointToWire(
+        Target->GetActorTransform().TransformPosition(LoomaWirePointToUe(Components.LookAt.Offset)));
+    FQuat World;
+    if (!LoomaAimRotation(Eye, At, Components.LookAt.Axis, World))
+    {
+        return; // the target is where the node is: no direction, so keep the last turn
+    }
+    // The aim sits inside the node, so its turn is the world one taken back out of the
+    // node's own rotation.
+    AimComponent->SetRelativeRotation(Node.GetRotation().Inverse() * LoomaWireQuatToUe(World));
+}
+
 UAudioComponent* ALoomaSyncedActor::EnsureAudioComponent()
 {
     if (UAudioComponent* Existing = AudioComponent.Get())
@@ -576,7 +699,7 @@ UAudioComponent* ALoomaSyncedActor::EnsureAudioComponent()
     Component->bAutoActivate = false;
     Component->bAutoDestroy = false;
     Component->SetMobility(EComponentMobility::Movable);
-    Component->SetupAttachment(SceneRoot);
+    Component->SetupAttachment(AimComponent);
     Component->RegisterComponent();
     AddInstanceComponent(Component);
     AudioComponent = Component;
@@ -595,7 +718,7 @@ UStaticMeshComponent* ALoomaSyncedActor::EnsureMeshComponent(TObjectPtr<UStaticM
         return nullptr;
     }
     Component->SetMobility(EComponentMobility::Movable);
-    Component->SetupAttachment(SceneRoot);
+    Component->SetupAttachment(AimComponent);
     Component->RegisterComponent();
     AddInstanceComponent(Component); // so it shows in the Details panel while running
     Slot = Component;
@@ -616,7 +739,7 @@ USkeletalMeshComponent* ALoomaSyncedActor::EnsureCharacterComponent()
         return nullptr;
     }
     Component->SetMobility(EComponentMobility::Movable);
-    Component->SetupAttachment(SceneRoot);
+    Component->SetupAttachment(AimComponent);
     Component->RegisterComponent();
     AddInstanceComponent(Component); // so it shows in the Details panel while running
     CharacterComponent = Component;
