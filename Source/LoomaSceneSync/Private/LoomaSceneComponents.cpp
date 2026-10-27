@@ -190,6 +190,10 @@ FLoomaNodeComponents LoomaParseComponents(const TArray<TSharedPtr<FJsonValue>>* 
             C->TryGetStringField(TEXT("source"), Out.LiveLinkSource);
             C->TryGetStringField(TEXT("stream"), Out.LiveLinkStream);
         }
+        else if (Type == TEXT("hidden"))
+        {
+            Out.bHidden = true; // no payload: being there is the whole of it
+        }
         else
         {
             // Skipped, but the node lives on. This is what makes a new component

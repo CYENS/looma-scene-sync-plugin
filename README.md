@@ -136,6 +136,7 @@ warning naming the actor. Component edits are not reported outbound yet.
 | `material` | A `UMaterialInstanceDynamic` on the sibling `mesh`, from `BasicShapeMaterial`: `color` (sRGB hex → linear) and `roughness`. Never applied to a `model`, which carries its own materials. `metalness` has no parameter to drive and is ignored |
 | `light` | `UPointLightComponent` / `USpotLightComponent` / `UDirectionalLightComponent`. Aim convention: **the node's local −Y is the beam direction** |
 | `audio` | `UAudioComponent` playing `<BackendUrl>/static/<assetId>.wav`, fetched through the same queue as the GLBs and decoded into a `ULoomaSoundWave`. `volume`, `pitch`, `loop`, `playing`, `spatial`, `minDistance`, `maxDistance` and `rolloff`, as below |
+| `hidden` | The node is switched off, and so is everything under it: `SetActorHiddenInGame(true)` and `SetActorEnableCollision(false)` on its actor and on every synced actor attached below, since UE hides one actor where the format hides a subtree (`ALoomaSyncedActor::RefreshHidden`, rerun after every component edit and change of parent). Lights on it go out with it, because a hidden owner's light is not added to the scene; its `audio` plays on. `bHiddenInScene` says whether a node is hidden, by its own switch or an ancestor's |
 | anything else | **Skipped, with the node kept** — logged once per type. That rule is what lets a new component type ship without a coordinated release across three clients |
 
 **`enabled: false` switches off one component**, leaving its definition on the node
@@ -846,6 +847,17 @@ job, so point it at a worktree backend in mock mode, never the everyday one:
 
 ```text
 UnrealEditor-Cmd.exe <host-project.uproject> -unattended -nullrhi -nosound -LoomaLiveBackend=http://127.0.0.1:8002 -LoomaLiveScene=demo-imported-set-model -ExecCmds="Automation RunTests Looma.Generation.Meta.Live; Quit"
+```
+
+`Looma.Hidden` checks the `hidden` component: parsed as the node's own switch, a hidden node
+hiding everything attached under it two levels down and showing it again, a child hidden in its
+own right staying hidden when its parent is shown, a reparent into and out of a hidden node, a
+hidden parent that arrives after its child, and a hidden lamp lighting nothing. Each node is
+checked for its flag, its actor's hidden-in-game, its collision and whether its mesh renders. No
+backend:
+
+```text
+UnrealEditor-Cmd.exe <host-project.uproject> -unattended -nullrhi -nosound -ExecCmds="Automation RunTests Looma.Hidden; Quit"
 ```
 
 ## Status

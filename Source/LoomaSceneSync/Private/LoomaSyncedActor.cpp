@@ -167,6 +167,37 @@ void ALoomaSyncedActor::ApplyComponents(const FLoomaNodeComponents& Next, const 
     }
 
     Components = Next;
+    RefreshHidden();
+}
+
+void ALoomaSyncedActor::RefreshHidden()
+{
+    const ALoomaSyncedActor* Parent = Cast<ALoomaSyncedActor>(GetAttachParentActor());
+    const bool bNext = Components.bHidden || (Parent && Parent->bHiddenInScene);
+    if (bNext == bHiddenInScene)
+    {
+        return; // nothing below depends on more than this actor's own answer
+    }
+    bHiddenInScene = bNext;
+
+    // Hidden in game takes the lights with the meshes, since a light whose owner is
+    // hidden is not added to the scene, and covers a GLB that finishes downloading
+    // later. The audio component is not drawn, so its sound plays on, as the format
+    // says.
+    SetActorHiddenInGame(bNext);
+    // And nothing hits it: a trace, a pawn or a click goes through, as a ray goes
+    // through a hidden object in the browser.
+    SetActorEnableCollision(!bNext);
+
+    TArray<AActor*> Attached;
+    GetAttachedActors(Attached);
+    for (AActor* Child : Attached)
+    {
+        if (ALoomaSyncedActor* Node = Cast<ALoomaSyncedActor>(Child))
+        {
+            Node->RefreshHidden();
+        }
+    }
 }
 
 // --- Generation meta ----------------------------------------------------------
