@@ -8,6 +8,7 @@
 
 #if WITH_DEV_AUTOMATION_TESTS
 
+#include "Components/LightComponent.h"
 #include "Dom/JsonObject.h"
 #include "Engine/GameInstance.h"
 #include "Engine/PostProcessVolume.h"
