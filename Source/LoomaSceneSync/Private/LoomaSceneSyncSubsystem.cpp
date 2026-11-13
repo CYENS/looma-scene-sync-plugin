@@ -239,7 +239,7 @@ const TCHAR* AuthStateText(ELoomaAuthState State)
  * The `detail` string FastAPI puts on an HTTPException body, or empty.
  *
  * One named field, never an excerpt of the body: echoing a response into the log is
- * how a token ends up in a shared file, and while no error body from /auth/* carries
+ * how a token ends up in a shared file, and while no error body from an auth endpoint carries
  * one today, "today" is not a property logging code should rest on. The backend's
  * own message is preferred over anything we could compose because it is the wording
  * the operator sees in every other client.
