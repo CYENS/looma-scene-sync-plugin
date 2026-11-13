@@ -42,7 +42,9 @@ been, it is saved by 5.8, and an engine cannot load a package saved by a newer o
 | `ULoomaSceneSyncSubsystem` | Owns the WebSocket connection, dispatches scene messages, loads GLBs at runtime, spawns synced assets |
 | `ULoomaSceneSyncSettings` | Project Settings > Plugins > Looma Scene Sync — the backend URL and the rendering knobs, read live |
 | `ALoomaSyncedActor` | One scene **node**: a transform, with the engine components its wire components ask for |
-| `LoomaSceneComponents` | The wire's `components` array parsed into keyed specs (`model` / `mesh` / `material` / `light` / `audio` / `skybox` / `camera` / `path` / `lookAt` / `postProcess`), with disabled and hidden handling |
+| `LoomaSceneComponents` | The wire's `components` array parsed into keyed specs (`model` / `mesh` / `material` / `light` / `audio` / `skybox` / `camera` / `path` / `lookAt` / `postProcess` / `terrain` / `ocean`), with disabled and hidden handling |
+| `LoomaTerrain` | The scene's ground: which node holds it (an Ocean's floor, else a terrain), its heights decoded from tiles, and the meshes and colours they make |
+| `ALoomaTerrainActor` | The ground drawn: a procedural mesh section per tile, updated in place as the web sculpts, tiles fetched once and kept, and a collision mesh cooked once the ground settles |
 | `ULoomaCameraComponent` | The `camera` component's lens on a `UCameraComponent`: vertical angle, letterboxed frame, its own near plane |
 | `LoomaDrivers` | A `path`'s curve, length table, clock and carriage, and a `lookAt`'s aim, in the wire's own frame |
 | `LoomaPostProcess` | `postProcess` volumes resolved into one look, and that look as `FPostProcessSettings` |
@@ -148,6 +150,8 @@ warning naming the actor. Component edits are not reported outbound yet.
 | `path` | The node's **children** ride its `CarriageComponent` along the curve, on the hub's clock |
 | `lookAt` | Turns the node's `AimComponent` to face another node; the stored `t` never moves |
 | `postProcess` | One resolved look: a global volume (`APostProcessVolume`, unbound) and each camera's own settings |
+| `terrain` | The scene's ground, drawn by one `ALoomaTerrainActor` on the node, level and unscaled. See *The ground* |
+| `ocean` | Its **floor** only, which is the scene's ground wherever an Ocean is switched on. The water itself is not drawn here |
 | anything else | **Skipped, with the node kept** — logged once per type. That rule is what lets a new component type ship without a coordinated release across three clients |
 
 **`enabled: false` switches off one component**, leaving its definition on the node
@@ -310,6 +314,43 @@ scales the whole image after that, sky included, so the two stack. Each componen
 tie-break: the active skybox is the smallest node id, whatever the document order; the scene's
 camera is the first `primary` in document order; global looks go by `priority`, then document
 order.
+
+### The ground
+
+Asset-demo `docs/scene-format.md`, "The `terrain` component" and "The sea floor". A scene has
+one ground. Where an `ocean` is switched on, its `floor` is the ground, over `floorSize` metres
+centred on the Ocean's node, with every unshaped tile at the `seabed` depth below the resting
+surface; otherwise the `terrain` with the highest `priority` (then the smallest node id) is. A
+terrain under an Ocean is not drawn, and neither is one on a hidden node. `LoomaChooseGround`
+is the web's `activeGround`.
+
+**The heights are tiles.** The component lists the ids of 64 × 64 tiles of heights, row by row
+along wire +z; the backend stores each tile once, under the SHA-256 of its bytes, and a tile
+never changes under its id. A sculpt stroke on the web stores the tiles it touched a few times
+a second and patches the component with their new ids, so it reaches Unreal as an ordinary
+`patch`. `ALoomaTerrainActor` then fetches only the ids it has not seen, in one
+`POST <BackendUrl>/terrain/tiles/fetch`, keeps every tile it fetches, and redraws only the
+sections those tiles move: the tile's own and the eight round it, whose edges and normals it
+shares. A tile on its way keeps showing what was there; an id the backend does not have is
+drawn flat at the base. Measured against a worktree backend, a stroke is drawn in Unreal
+about 40 ms after the hub applies the patch.
+
+**The mesh** is one `UProceduralMeshComponent` section per tile, 65 × 65 vertices so
+neighbours share their edge, plus a skirt round the square that hangs to the seabed under an
+Ocean and a metre below the lowest ground otherwise. Vertices stand where the web stands them,
+are lit with the same normal (the heights either side), and wound as the web winds them, which
+faces up in Unreal too. Each vertex is coloured by the web's surface rule: grass, rock past about
+40°, and with water a beach up to a metre or so above the waterline. `M_LoomaTerrain` draws the
+colour; `Scripts/create_terrain_material.py` rebuilds it.
+
+**The collision** is a second, hidden mesh of the whole ground (every other height past 512 a
+side), cooked off the game thread half a second after the ground stops changing, so a trace or
+a character meets the ground without a sculpt stroke cooking on every patch.
+`ALoomaTerrainActor::GetGroundHeight` gives the height under a point as the web interpolates
+it, and `ULoomaSceneSyncSubsystem::GetTerrainActor` finds the actor.
+
+Not drawn yet: the Ocean's water, and the flat seabed beyond the shaped square of an Ocean's
+floor. Sculpting from Unreal is not supported; the ground is the web's to shape.
 
 ### Coordinate conventions
 
@@ -919,6 +960,25 @@ One difference from the web is deliberate. On a **two-point open** path, three.j
 both ends into one scratch vector, so its pace along `t` is not the format's; the line is the
 same and the length table all but cancels it (0.23 mm at most on a 4 m path), and the plugin
 follows the format.
+
+`Looma.Terrain` checks the ground: parsing and the hub's repairs of `terrain` and `ocean`, which
+node holds the ground, the tile encoding and the heights between samples, the meshes (shared
+edges, every face up, faces agreeing with their normals, the skirt facing out) and real scene
+patches: a terrain sculpted tile by tile, an Ocean taking the ground over and giving it back, and
+a hidden or switched-off host. Headless, no backend.
+
+`Looma.Terrain.Live` follows a change made elsewhere, against a real backend. It plays in a
+blank map, opens a scene, waits for its ground, logs `LOOMA_TERRAIN_READY`, then waits for the
+height at a probe point to reach the one given, and for a line trace to meet the new ground's
+collision. Make the change from the web, or from anything that stores a tile and patches the
+component, once the ready line is logged:
+
+```text
+UnrealEditor-Cmd.exe <host-project.uproject> -unattended -nullrhi -nosound
+  -LoomaLiveBackend=http://127.0.0.1:8001 -LoomaLiveScene=<scene id>
+  -LoomaTerrainProbe=-25,-25 -LoomaTerrainExpect=10
+  -ExecCmds="Automation RunTests Looma.Terrain.Live; Quit"
+```
 
 After building the host's Editor target, run `Looma.Presence` through Unreal's
 Automation window, or from the command line:
