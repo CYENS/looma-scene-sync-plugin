@@ -3003,7 +3003,7 @@ void ULoomaSceneSyncSubsystem::TickOcean()
         FRotator ViewRotation;
         Player->GetPlayerViewPoint(ViewLocation, ViewRotation);
     }
-    OceanActor->UpdateSurface(*TerrainActor, ViewLocation);
+    OceanActor->UpdateSurface(*TerrainActor, ViewLocation, GetHubTime());
 }
 
 void ULoomaSceneSyncSubsystem::HandleScene(const TSharedPtr<FJsonObject>& Msg)

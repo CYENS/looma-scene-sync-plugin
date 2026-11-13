@@ -353,8 +353,12 @@ it, and `ULoomaSceneSyncSubsystem::GetTerrainActor` finds the actor.
 `swell` live. One camera-centered grid uses a world-space wave material, so moving the grid
 keeps crests anchored. The material uses the same decoded heights as the terrain mesh to flatten
 waves in shallows, colour the water near land, and expose raised ground. Off the tiled square it
-uses `seabed` for water depth. `Scripts/create_ocean_material.py` rebuilds `M_LoomaOcean`.
-Wave animation is local to Unreal and serves as a visual backdrop. Sculpting happens in the web editor.
+uses `seabed` for water depth. Unreal evolves the same four seeded wave bands as the
+browser's buoyancy sampler from the hub clock and uploads their horizontal and vertical
+displacement to `M_LoomaOcean`. The vertex shader filters waves to the local mesh spacing,
+and the pixel shader uses the screen footprint to filter the wave normals.
+The material can be generated with `Scripts/create_ocean_material.py` in a content-only
+project with a `LoomaSceneSync` plugin mount. Sculpting happens in the web editor.
 
 ### Coordinate conventions
 
@@ -970,6 +974,9 @@ node holds the ground, the tile encoding and the heights between samples, the me
 edges, every face up, faces agreeing with their normals, the skirt facing out) and real scene
 patches: a terrain sculpted tile by tile, an Ocean taking the ground over and giving it back, and
 a hidden or switched-off host. Headless, no backend.
+
+`Looma.Ocean.BrowserParity` checks all four bands against browser displacement at
+fixed hub timestamps and verifies the 600-second loop and calm water.
 
 `Looma.Ocean.Scene` checks that the water and floor follow the same active Ocean, live settings
 and height changes reach the renderer, new terrain tiles reach its height texture, and a scene

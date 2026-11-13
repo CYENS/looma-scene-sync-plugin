@@ -6,7 +6,9 @@
 #include "LoomaTerrainActor.h"
 #include "LoomaWireConvert.h"
 #include "Materials/MaterialInstanceDynamic.h"
+#include "Misc/App.h"
 #include "ProceduralMeshComponent.h"
+#include "TextureResource.h"
 #include "UObject/ConstructorHelpers.h"
 
 namespace
@@ -18,11 +20,68 @@ const FName SeaParameter(TEXT("Sea"));
 const FName FloorParameter(TEXT("Floor"));
 const FName FloorHeightsParameter(TEXT("FloorHeights"));
 
-struct FFloorUpload
+template <typename Pixel>
+struct FTextureUpload
 {
     FUpdateTextureRegion2D Region;
-    TArray<float> Heights;
+    TArray<Pixel> Pixels;
 };
+template <typename Pixel>
+void UploadTexture(UTexture2D& Texture, const TArrayView<const Pixel> Pixels, int32 MipIndex = 0)
+{
+    const int32 N = Texture.GetSizeX() >> MipIndex;
+    const auto Upload = MakeShared<FTextureUpload<Pixel>, ESPMode::ThreadSafe>();
+    Upload->Region = FUpdateTextureRegion2D(0, 0, 0, 0, N, N);
+    Upload->Pixels.Append(Pixels.GetData(), Pixels.Num());
+    Texture.UpdateTextureRegions(MipIndex, 1, &Upload->Region, N * sizeof(Pixel), sizeof(Pixel),
+        reinterpret_cast<uint8*>(Upload->Pixels.GetData()), [Upload](uint8*, const FUpdateTextureRegion2D*) {});
+}
+// A periodic box mip chain. Averaging 2x2 samples keeps the field's mean and
+// lets the GPU interpolate between levels using the same world-space UV.
+void DownsampleWaveMip(TArray<FFloat16Color>& Pixels, int32 Size)
+{
+    const int32 Half = Size / 2;
+    for (int32 Y = 0; Y < Half; ++Y)
+    {
+        for (int32 X = 0; X < Half; ++X)
+        {
+            const int32 I = 2 * (Y * Size + X);
+            const FLinearColor Average = (Pixels[I].GetFloats() + Pixels[I + 1].GetFloats()
+                + Pixels[I + Size].GetFloats() + Pixels[I + Size + 1].GetFloats()) * 0.25f;
+            Pixels[Y * Half + X] = FFloat16Color(Average);
+        }
+    }
+    Pixels.SetNum(Half * Half, EAllowShrinking::No);
+}
+
+void WriteWaveMips(UTexture2D& Texture, const TArray<FFloat16Color>& Field, bool bInitialize)
+{
+    TArray<FFloat16Color> Pixels = Field;
+    for (int32 Size = Texture.GetSizeX(), Level = 0; Size > 0; Size /= 2, ++Level)
+    {
+        if (bInitialize)
+        {
+            FTexturePlatformData* Platform = Texture.GetPlatformData();
+            if (Level > 0)
+            {
+                Platform->Mips.Add(new FTexture2DMipMap(Size, Size, 1));
+            }
+            FByteBulkData& Bulk = Platform->Mips[Level].BulkData;
+            Bulk.Lock(LOCK_READ_WRITE);
+            const int64 Bytes = Pixels.Num() * sizeof(FFloat16Color);
+            FMemory::Memcpy(Bulk.Realloc(Bytes), Pixels.GetData(), Bytes);
+            Bulk.Unlock();
+        }
+        else
+        {
+            UploadTexture(Texture, TArrayView<const FFloat16Color>(Pixels), Level);
+        }
+        if (Size > 1)
+        {
+            DownsampleWaveMip(Pixels, Size);
+        }
+    }
+}
 } // namespace
 
 ALoomaOceanActor::ALoomaOceanActor()
@@ -53,6 +112,7 @@ void ALoomaOceanActor::Show(AActor& Host, const FLoomaOceanSpec& Spec)
         Mesh->SetMaterial(0, Surface);
     }
     OceanHost = &Host;
+    Waves.SetSea(Spec);
 
     // Wind direction is where the wave travels, in wire +X towards wire +Z.
     const double Radians = FMath::DegreesToRadians(Spec.WindDir);
@@ -73,7 +133,7 @@ void ALoomaOceanActor::Clear()
     // source and refreshes it before revealing the mesh.
 }
 
-void ALoomaOceanActor::UpdateSurface(ALoomaTerrainActor& Terrain, const FVector& ViewLocation)
+void ALoomaOceanActor::UpdateSurface(ALoomaTerrainActor& Terrain, const FVector& ViewLocation, double HubSeconds)
 {
     const AActor* Host = OceanHost.Get();
     if (!Host || !Surface || !Terrain.IsShowing() || !Terrain.IsSeaFloor() || Terrain.GetAttachParentActor() != Host)
@@ -101,6 +161,7 @@ void ALoomaOceanActor::UpdateSurface(ALoomaTerrainActor& Terrain, const FVector&
     const FVector2D FloorOrigin = FVector2D(HostLocation) / CentimetersPerMeter;
     Surface->SetVectorParameterValue(FloorParameter, FLinearColor(FloorOrigin.X, FloorOrigin.Y,
         FloorSize > 0.0f ? 1.0f / FloorSize : 0.0f, FloorSize > 0.0f ? static_cast<float>(FloorTexture->GetSizeX()) : 0.0f));
+    UpdateWaveTextures(HubSeconds);
     Mesh->SetHiddenInGame(false);
 }
 
@@ -131,15 +192,26 @@ void ALoomaOceanActor::BuildSurface()
     const int32 N = Axis.Num();
     TArray<FVector> Vertices;
     TArray<FVector> Normals;
+    TArray<FVector2D> SampleSpacing;
     TArray<int32> Triangles;
     Vertices.Reserve(N * N);
     Normals.Init(FVector::UpVector, N * N);
+    SampleSpacing.Reserve(N * N);
     Triangles.Reserve(6 * (N - 1) * (N - 1));
-    for (const double Y : Axis)
+    TArray<double> Spacing;
+    Spacing.Reserve(N);
+    for (int32 I = 0; I < N; ++I)
     {
-        for (const double X : Axis)
+        const double Left = Axis[I] - Axis[FMath::Max(I - 1, 0)];
+        const double Right = Axis[FMath::Min(I + 1, N - 1)] - Axis[I];
+        Spacing.Add(FMath::Max(Left, Right) / CentimetersPerMeter);
+    }
+    for (int32 Y = 0; Y < N; ++Y)
+    {
+        for (int32 X = 0; X < N; ++X)
         {
-            Vertices.Emplace(X, Y, 0.0);
+            Vertices.Emplace(Axis[X], Axis[Y], 0.0);
+            SampleSpacing.Emplace(FMath::Max(Spacing[X], Spacing[Y]), 0.0);
         }
     }
     for (int32 J = 0; J < N - 1; ++J)
@@ -153,7 +225,7 @@ void ALoomaOceanActor::BuildSurface()
             Triangles.Append({A, C, B, B, C, D});
         }
     }
-    Mesh->CreateMeshSection_LinearColor(0, Vertices, Triangles, Normals, {}, {}, {}, false, false);
+    Mesh->CreateMeshSection_LinearColor(0, Vertices, Triangles, Normals, SampleSpacing, {}, {}, false, false);
 }
 
 void ALoomaOceanActor::UpdateFloorTexture(const ALoomaTerrainActor& Terrain)
@@ -191,11 +263,47 @@ void ALoomaOceanActor::UpdateFloorTexture(const ALoomaTerrainActor& Terrain)
     {
         // Keep the texture and its material binding through sculpt edits. The
         // render command owns this copy until the upload completes on the RHI.
-        const TSharedRef<FFloorUpload, ESPMode::ThreadSafe> Upload = MakeShared<FFloorUpload, ESPMode::ThreadSafe>();
-        Upload->Region = FUpdateTextureRegion2D(0, 0, 0, 0, N, N);
-        Upload->Heights.Append(Heights.GetData(), Heights.Num());
-        FloorTexture->UpdateTextureRegions(0, 1, &Upload->Region, N * sizeof(float), sizeof(float),
-            reinterpret_cast<uint8*>(Upload->Heights.GetData()), [Upload](uint8*, const FUpdateTextureRegion2D*) {});
+        UploadTexture(*FloorTexture, Heights);
     }
     FloorSize = Field.GetSize();
+}
+
+void ALoomaOceanActor::UpdateWaveTextures(double HubSeconds)
+{
+    // NullRHI automation exercises the scene lifecycle without allocating render resources.
+    if (!FApp::CanEverRender())
+    {
+        return;
+    }
+
+    Waves.Evaluate(HubSeconds);
+    constexpr int32 N = FLoomaOceanWaves::Size;
+    WaveTextures.SetNum(FLoomaOceanWaves::BandCount);
+    for (int32 Band = 0; Band < WaveTextures.Num(); ++Band)
+    {
+        const TArray<FFloat16Color>& Pixels = Waves.GetDisplacements(Band);
+        if (WaveTextures[Band])
+        {
+            if (WaveTextures[Band]->GetResource())
+            {
+                WriteWaveMips(*WaveTextures[Band], Pixels, false);
+            }
+            continue;
+        }
+
+        UTexture2D* Texture = UTexture2D::CreateTransient(N, N, PF_FloatRGBA);
+        if (!Texture)
+        {
+            continue;
+        }
+        Texture->SRGB = false;
+        Texture->Filter = TF_Trilinear;
+        Texture->AddressX = TA_Wrap;
+        Texture->AddressY = TA_Wrap;
+        Texture->NeverStream = true;
+        WriteWaveMips(*Texture, Pixels, true);
+        Texture->UpdateResource();
+        WaveTextures[Band] = Texture;
+        Surface->SetTextureParameterValue(FName(*FString::Printf(TEXT("Wave%d"), Band)), Texture);
+    }
 }

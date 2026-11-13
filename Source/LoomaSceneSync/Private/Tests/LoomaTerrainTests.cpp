@@ -12,6 +12,7 @@
 #include "Engine/World.h"
 #include "LoomaOceanActor.h"
 #include "Materials/MaterialInstanceDynamic.h"
+#include "Misc/App.h"
 #include "Misc/AutomationTest.h"
 #include "ProceduralMeshComponent.h"
 #include "Serialization/JsonReader.h"
@@ -420,7 +421,7 @@ struct FLoomaTerrainTestAccess
     ALoomaTerrainActor* Terrain() const { return Sync->GetTerrainActor(); }
     ALoomaOceanActor* Ocean() const { return Sync->OceanActor.Get(); }
     const AActor* OceanHost() const { return Ocean()->OceanHost.Get(); }
-    const UProceduralMeshComponent* OceanMesh() const { return Ocean()->Mesh.Get(); }
+    UProceduralMeshComponent* OceanMesh() const { return Ocean()->Mesh.Get(); }
     UMaterialInstanceDynamic* OceanSurface() const { return Ocean()->Surface.Get(); }
     const UTexture2D* OceanFloor() const { return Ocean()->FloorTexture.Get(); }
     uint64 OceanFloorRevision() const { return Ocean()->FloorRevision; }
@@ -450,6 +451,28 @@ bool FLoomaOceanSceneTest::RunTest(const FString& Parameters)
     }
     TestTrue(TEXT("the water is shown"), !Access.OceanMesh()->bHiddenInGame);
     TestEqual(TEXT("one water section"), Access.OceanMesh()->GetNumSections(), 1);
+    for (int32 Band = 0; Band < FLoomaOceanWaves::BandCount; ++Band)
+    {
+        UTexture* Parameter = Access.OceanSurface()->K2_GetTextureParameterValue(
+            FName(*FString::Printf(TEXT("Wave%d"), Band)));
+        TestNotNull(TEXT("the packaged material declares every displacement texture"), Parameter);
+        if (FApp::CanEverRender())
+        {
+            const UTexture2D* Texture = Cast<UTexture2D>(Parameter);
+            if (TestNotNull(TEXT("the material uses a runtime displacement texture"), Texture))
+            {
+                TestEqual(TEXT("the wave texture includes all eight mip levels"), Texture->GetNumMips(), 8);
+                TestEqual(TEXT("the wave texture filters between mip levels"), Texture->Filter.GetValue(), TF_Trilinear);
+            }
+        }
+    }
+    const FProcMeshSection* Section = Access.OceanMesh()->GetProcMeshSection(0);
+    if (TestNotNull(TEXT("the water has a mesh section"), Section) && !Section->ProcVertexBuffer.IsEmpty())
+    {
+        const TArray<FProcMeshVertex>& Vertices = Section->ProcVertexBuffer;
+        TestEqual(TEXT("the central vertex reports one metre of spacing"), Vertices[Vertices.Num() / 2].UV0.X, 1.0);
+        TestTrue(TEXT("outer vertices report the wider spacing"), Vertices[0].UV0.X > 1.0);
+    }
     TestEqual(TEXT("water is visual only"), Access.OceanMesh()->GetCollisionEnabled(), ECollisionEnabled::NoCollision);
     TestEqual(TEXT("the mesh uses the water instance"), Access.OceanMesh()->GetMaterial(0),
         static_cast<UMaterialInterface*>(Access.OceanSurface()));
