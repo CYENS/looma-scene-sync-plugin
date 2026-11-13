@@ -126,11 +126,14 @@ bool FLoomaTerrainParseTest::RunTest(const FString& Parameters)
     TestFalse(TEXT("switched off: no terrain"),
         ParseTerrainJson(TEXT(R"([{"type":"terrain","enabled":false}])")).bHasTerrain);
 
-    // The Ocean's floor.
+    // The Ocean's sea state and floor.
     const FLoomaNodeComponents Sea = ParseTerrainJson(FString::Printf(TEXT(R"([{"type":"ocean","seabed":12,"floorSize":300,
-        "wind":9,"floor":["%s",null,null,null],"priority":-1}])"), *A));
+        "wind":9,"windDir":45,"swell":1.25,"floor":["%s",null,null,null],"priority":-1}])"), *A));
     TestTrue(TEXT("an ocean is read"), Sea.bHasOcean);
     TestFalse(TEXT("and is not an unknown type"), Sea.UnknownTypes.Contains(TEXT("ocean")));
+    TestEqual(TEXT("wind speed"), Sea.Ocean.Wind, 9.0f);
+    TestEqual(TEXT("wind direction"), Sea.Ocean.WindDir, 45.0);
+    TestEqual(TEXT("swell"), Sea.Ocean.Swell, 1.25f);
     TestEqual(TEXT("seabed"), Sea.Ocean.Seabed, 12.0f);
     TestEqual(TEXT("floor size"), Sea.Ocean.FloorSize, 300.0f);
     TestEqual(TEXT("priority"), Sea.Ocean.Priority, -1.0f);
@@ -143,8 +146,29 @@ bool FLoomaTerrainParseTest::RunTest(const FString& Parameters)
     TestEqual(TEXT("and flat everywhere"), Unshaped.Floor.Num(), 64);
     TestEqual(TEXT("seabed at least 1"), Unshaped.Seabed, 1.0f);
     TestEqual(TEXT("seabed at most 100"), ParseTerrainJson(TEXT(R"([{"type":"ocean","seabed":500}])")).Ocean.Seabed, 100.0f);
-    TestEqual(TEXT("defaults: seabed"), ParseTerrainJson(TEXT(R"([{"type":"ocean"}])")).Ocean.Seabed, 8.0f);
-    TestEqual(TEXT("defaults: floor size"), ParseTerrainJson(TEXT(R"([{"type":"ocean"}])")).Ocean.FloorSize, 200.0f);
+    const FLoomaNodeComponents Default = ParseTerrainJson(TEXT(R"([{"type":"ocean"}])"));
+    TestEqual(TEXT("defaults: seabed"), Default.Ocean.Seabed, 8.0f);
+    TestEqual(TEXT("defaults: floor size"), Default.Ocean.FloorSize, 200.0f);
+    TestEqual(TEXT("defaults: wind speed"), Default.Ocean.Wind, 5.0f);
+    TestEqual(TEXT("defaults: wind direction"), Default.Ocean.WindDir, 118.0);
+    TestEqual(TEXT("defaults: swell"), Default.Ocean.Swell, 0.4f);
+    const FLoomaNodeComponents Malformed = ParseTerrainJson(TEXT(R"([{"type":"ocean","wind":"9","windDir":null,"swell":true}])"));
+    TestTrue(TEXT("unreadable sea state uses defaults"), Malformed == Default);
+
+    const FLoomaOceanSpec High = ParseTerrainJson(TEXT(R"([{"type":"ocean","wind":20,"windDir":450,"swell":3}])")).Ocean;
+    TestEqual(TEXT("wind at most 15"), High.Wind, 15.0f);
+    TestEqual(TEXT("positive direction wraps"), High.WindDir, 90.0);
+    TestEqual(TEXT("swell at most 2"), High.Swell, 2.0f);
+    const FLoomaOceanSpec Low = ParseTerrainJson(TEXT(R"([{"type":"ocean","wind":-5,"windDir":-90,"swell":-1}])")).Ocean;
+    TestEqual(TEXT("wind at least zero"), Low.Wind, 0.0f);
+    TestEqual(TEXT("negative direction wraps"), Low.WindDir, 270.0);
+    TestEqual(TEXT("swell at least zero"), Low.Swell, 0.0f);
+
+    for (const TCHAR* Edit : {TEXT(R"("wind":9)"), TEXT(R"("windDir":45)"), TEXT(R"("swell":1.25)")})
+    {
+        const FLoomaNodeComponents Changed = ParseTerrainJson(FString::Printf(TEXT(R"([{"type":"ocean",%s}])"), Edit));
+        TestTrue(FString::Printf(TEXT("%s changes the components"), Edit), !(Changed == Default));
+    }
 
     TestTrue(TEXT("a tile id is 64 lower-case hex digits"), LoomaIsTerrainTileId(A));
     TestFalse(TEXT("not upper case"), LoomaIsTerrainTileId(FString::ChrN(64, 'A')));

@@ -662,15 +662,26 @@ struct FLoomaTerrainSpec
 };
 
 /**
- * `ocean`, as far as this plugin reads it: the sea floor, which is the scene's ground
- * wherever an Ocean is switched on (scene-format.md, "The sea floor"). The water, the
- * wind and the fluid are kept on the node for the other clients and not read here.
+ * `ocean`: the sea state and the floor that provides the scene's ground wherever
+ * an Ocean is switched on (scene-format.md, "The `ocean` component").
  * Defaults and clamps are the web's (frontend/src/scene/oceanSettings.js).
  */
 USTRUCT(BlueprintType)
 struct FLoomaOceanSpec
 {
     GENERATED_BODY()
+
+    /** Wind speed in metres per second, 0…15. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    float Wind = 5.0f;
+
+    /** Direction the wind sea travels, degrees in [0, 360), from wire +X towards +Z. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    double WindDir = 118.0;
+
+    /** Significant height of the swell in wire metres, 0…2. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    float Swell = 0.4f;
 
     /** How far below the resting surface (the host) the unshaped floor lies, wire metres, 1…100. */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
@@ -698,7 +709,9 @@ struct FLoomaOceanSpec
 
     bool operator==(const FLoomaOceanSpec& Other) const
     {
-        return FMath::IsNearlyEqual(Seabed, Other.Seabed) && FMath::IsNearlyEqual(FloorSize, Other.FloorSize)
+        return FMath::IsNearlyEqual(Wind, Other.Wind) && FMath::IsNearlyEqual(WindDir, Other.WindDir)
+            && FMath::IsNearlyEqual(Swell, Other.Swell)
+            && FMath::IsNearlyEqual(Seabed, Other.Seabed) && FMath::IsNearlyEqual(FloorSize, Other.FloorSize)
             && Across == Other.Across && Floor == Other.Floor && bShaped == Other.bShaped
             && FMath::IsNearlyEqual(Priority, Other.Priority);
     }
