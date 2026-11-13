@@ -12,6 +12,7 @@
 #include "LoomaLivePoseBuffer.h"
 #include "LoomaSceneSyncSubsystem.generated.h"
 
+class ALoomaOceanActor;
 class IWebSocket;
 class IHttpRequest;
 class IHttpResponse;
@@ -1415,7 +1416,9 @@ private:
      * which node holds the scene's ground, and the ground shown on it.
      */
     void RefreshGround();
+    void TickOcean();
     UPROPERTY() TObjectPtr<ALoomaTerrainActor> TerrainActor;
+    UPROPERTY() TObjectPtr<ALoomaOceanActor> OceanActor;
     bool bGroundDirty = true;
 
     // --- Cameras, paths, aims and looks -----------------------------------------
