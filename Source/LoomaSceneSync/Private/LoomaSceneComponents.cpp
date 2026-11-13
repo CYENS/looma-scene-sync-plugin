@@ -356,7 +356,115 @@ void ParsePostProcess(const TSharedPtr<FJsonObject>& C, FLoomaNodeComponents& Ou
         Look.bDepthOfField = DepthOfField->AsBool();
     }
 }
+
+// The ground's ranges: frontend/src/scene/terrain/format.js TERRAIN_RANGES and
+// oceanSettings.js OCEAN_RANGES, which are the hub's (backend/app/scenegraph.py).
+constexpr double TerrainMinSize = 10.0;
+constexpr double TerrainMaxSize = 2000.0;
+constexpr double TerrainMinBase = -128.0;
+constexpr double TerrainMaxBase = 127.99;
+constexpr int32 TerrainMaxAcross = 16;
+constexpr int32 TerrainDefaultAcross = 8;
+constexpr double OceanMinSeabed = 1.0;
+constexpr double OceanMaxSeabed = 100.0;
+
+/**
+ * A square list of tile ids, 1 to 16 a side, into `Tiles` and `Across`, or false. An
+ * entry that is not a tile id is a null tile (an empty string). A list of the wrong
+ * length says nothing about where any tile goes, so it is no list at all, as on the
+ * hub and the web (`terrainOptions`).
+ */
+bool ReadTileList(const TSharedPtr<FJsonObject>& C, const TCHAR* Field, TArray<FString>& Tiles, int32& Across)
+{
+    const TArray<TSharedPtr<FJsonValue>>* Values = nullptr;
+    if (!C->TryGetArrayField(Field, Values) || !Values)
+    {
+        return false;
+    }
+    const int32 Count = Values->Num();
+    const int32 Side = FMath::RoundToInt(FMath::Sqrt(static_cast<double>(Count)));
+    if (Side < 1 || Side > TerrainMaxAcross || Side * Side != Count)
+    {
+        return false;
+    }
+    Tiles.Reset(Count);
+    for (const TSharedPtr<FJsonValue>& Value : *Values)
+    {
+        const bool bId = Value.IsValid() && Value->Type == EJson::String && LoomaIsTerrainTileId(Value->AsString());
+        Tiles.Add(bId ? Value->AsString() : FString());
+    }
+    Across = Side;
+    return true;
+}
+
+void ParseTerrain(const TSharedPtr<FJsonObject>& C, FLoomaNodeComponents& Out)
+{
+    Out.bHasTerrain = true;
+    FLoomaTerrainSpec& Terrain = Out.Terrain;
+    double Number = 0.0;
+    if (ReadNumber(C, TEXT("size"), Number))
+    {
+        Terrain.Size = static_cast<float>(FMath::Clamp(Number, TerrainMinSize, TerrainMaxSize));
+    }
+    if (ReadNumber(C, TEXT("base"), Number))
+    {
+        Terrain.Base = static_cast<float>(FMath::Clamp(Number, TerrainMinBase, TerrainMaxBase));
+    }
+    if (ReadNumber(C, TEXT("priority"), Number))
+    {
+        Terrain.Priority = static_cast<float>(Number);
+    }
+    if (!ReadTileList(C, TEXT("tiles"), Terrain.Tiles, Terrain.Across))
+    {
+        // Absent or unreadable: all flat, at the default number of tiles.
+        Terrain.Across = TerrainDefaultAcross;
+        Terrain.Tiles.Init(FString(), TerrainDefaultAcross * TerrainDefaultAcross);
+    }
+}
+
+void ParseOcean(const TSharedPtr<FJsonObject>& C, FLoomaNodeComponents& Out)
+{
+    Out.bHasOcean = true;
+    FLoomaOceanSpec& Ocean = Out.Ocean;
+    double Number = 0.0;
+    if (ReadNumber(C, TEXT("seabed"), Number))
+    {
+        Ocean.Seabed = static_cast<float>(FMath::Clamp(Number, OceanMinSeabed, OceanMaxSeabed));
+    }
+    if (ReadNumber(C, TEXT("floorSize"), Number))
+    {
+        Ocean.FloorSize = static_cast<float>(FMath::Clamp(Number, TerrainMinSize, TerrainMaxSize));
+    }
+    if (ReadNumber(C, TEXT("priority"), Number))
+    {
+        Ocean.Priority = static_cast<float>(Number);
+    }
+    Ocean.bShaped = ReadTileList(C, TEXT("floor"), Ocean.Floor, Ocean.Across);
+    if (!Ocean.bShaped)
+    {
+        // Never shaped: the floor lies at the seabed's depth everywhere.
+        Ocean.Across = TerrainDefaultAcross;
+        Ocean.Floor.Init(FString(), TerrainDefaultAcross * TerrainDefaultAcross);
+    }
+}
 } // namespace
+
+bool LoomaIsTerrainTileId(const FString& Value)
+{
+    // The hex SHA-256 of a tile's bytes, lower case: backend/app/terrain.py TILE_ID.
+    if (Value.Len() != 64)
+    {
+        return false;
+    }
+    for (const TCHAR Char : Value)
+    {
+        if (!((Char >= TCHAR('0') && Char <= TCHAR('9')) || (Char >= TCHAR('a') && Char <= TCHAR('f'))))
+        {
+            return false;
+        }
+    }
+    return true;
+}
 
 void FLoomaPostProcessSpec::Overlay(const FLoomaPostProcessSpec& Above)
 {
@@ -456,6 +564,8 @@ FLoomaNodeComponents LoomaParseComponents(const TArray<TSharedPtr<FJsonValue>>* 
         else if (Type == TEXT("path"))     { ParsePath(C, Out); }
         else if (Type == TEXT("lookAt"))   { ParseLookAt(C, Out); }
         else if (Type == TEXT("postProcess")) { ParsePostProcess(C, Out); }
+        else if (Type == TEXT("terrain"))  { ParseTerrain(C, Out); }
+        else if (Type == TEXT("ocean"))    { ParseOcean(C, Out); }
         else if (Type == TEXT("livelink"))
         {
             C->TryGetStringField(TEXT("subject"), Out.LiveLinkSubject);
