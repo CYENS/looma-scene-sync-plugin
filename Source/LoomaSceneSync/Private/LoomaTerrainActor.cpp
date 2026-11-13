@@ -264,6 +264,7 @@ void ALoomaTerrainActor::AddTiles(const TArray<FString>& Ids, const TArray<uint8
 
 void ALoomaTerrainActor::Redraw(const TArray<int32>& Changed, bool bAll)
 {
+    ++HeightfieldRevision;
     const int32 Across = Ground.Across;
     const int32 Count = Across * Across;
     // A tile's heights also light its neighbours' edges, and the sections before it

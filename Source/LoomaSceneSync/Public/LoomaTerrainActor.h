@@ -75,6 +75,7 @@ public:
 
     const FLoomaGround& GetGround() const { return Ground; }
     const FLoomaHeightfield& GetHeightfield() const { return Field; }
+    uint64 GetHeightfieldRevision() const { return HeightfieldRevision; }
 
     /** Tiles listed whose heights are not drawn yet, because they are still being fetched. */
     int32 GetWaitingTiles() const;
@@ -117,6 +118,7 @@ private:
     FLoomaGround Ground;
     FString RestBase;
     FLoomaHeightfield Field;
+    uint64 HeightfieldRevision = 0;
 
     /** Per tile, the id whose heights it holds now: empty for flat at the base, Unfilled for nothing yet. */
     TArray<FString> Shown;
