@@ -357,7 +357,7 @@ void ParsePostProcess(const TSharedPtr<FJsonObject>& C, FLoomaNodeComponents& Ou
     }
 }
 
-// The ground's ranges: frontend/src/scene/terrain/format.js TERRAIN_RANGES and
+// The terrain and Ocean ranges: frontend/src/scene/terrain/format.js TERRAIN_RANGES and
 // oceanSettings.js OCEAN_RANGES, which are the hub's (backend/app/scenegraph.py).
 constexpr double TerrainMinSize = 10.0;
 constexpr double TerrainMaxSize = 2000.0;
@@ -367,6 +367,8 @@ constexpr int32 TerrainMaxAcross = 16;
 constexpr int32 TerrainDefaultAcross = 8;
 constexpr double OceanMinSeabed = 1.0;
 constexpr double OceanMaxSeabed = 100.0;
+constexpr double OceanMaxWind = 15.0;
+constexpr double OceanMaxSwell = 2.0;
 
 /**
  * A square list of tile ids, 1 to 16 a side, into `Tiles` and `Across`, or false. An
@@ -427,6 +429,18 @@ void ParseOcean(const TSharedPtr<FJsonObject>& C, FLoomaNodeComponents& Out)
     Out.bHasOcean = true;
     FLoomaOceanSpec& Ocean = Out.Ocean;
     double Number = 0.0;
+    if (ReadNumber(C, TEXT("wind"), Number))
+    {
+        Ocean.Wind = static_cast<float>(FMath::Clamp(Number, 0.0, OceanMaxWind));
+    }
+    if (ReadNumber(C, TEXT("windDir"), Number))
+    {
+        Ocean.WindDir = FMath::Fmod(FMath::Fmod(Number, 360.0) + 360.0, 360.0);
+    }
+    if (ReadNumber(C, TEXT("swell"), Number))
+    {
+        Ocean.Swell = static_cast<float>(FMath::Clamp(Number, 0.0, OceanMaxSwell));
+    }
     if (ReadNumber(C, TEXT("seabed"), Number))
     {
         Ocean.Seabed = static_cast<float>(FMath::Clamp(Number, OceanMinSeabed, OceanMaxSeabed));
