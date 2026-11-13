@@ -33,6 +33,9 @@ public class LoomaSceneSync : ModuleRules
             "ImageCore",
             "RenderCore",
             "RHI",
+            // The scene's ground (`terrain`, and an Ocean's floor): one mesh section per
+            // tile of heights, updated in place as the web sculpts it, and its collision.
+            "ProceduralMeshComponent",
         });
 
         // The plugin's only editor dependency, and it must stay editor-only: UnrealEd

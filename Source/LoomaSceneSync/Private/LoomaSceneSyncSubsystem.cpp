@@ -25,6 +25,8 @@
 #include "LoomaGlbCache.h"
 #include "LoomaSceneComponents.h"
 #include "LoomaSkyboxActor.h"
+#include "LoomaTerrain.h"
+#include "LoomaTerrainActor.h"
 #include "LoomaSceneSyncLog.h"
 #include "LoomaSceneSyncSettings.h"
 #include "LoomaSyncedActor.h"
@@ -393,6 +395,8 @@ void ULoomaSceneSyncSubsystem::Deinitialize()
     Tracked.Empty();
     if (SkyboxActor) SkyboxActor->Destroy();
     SkyboxActor = nullptr;
+    if (TerrainActor) TerrainActor->Destroy();
+    TerrainActor = nullptr;
     if (LookVolume) LookVolume->Destroy();
     LookVolume = nullptr;
     DrivenNodes.Empty();
@@ -2812,7 +2816,7 @@ void ULoomaSceneSyncSubsystem::OnRawMessage(const FString& Text)
     }
     const FString Type = Msg->GetStringField(TEXT("type"));
     if (Type == TEXT("scene") || Type == TEXT("spawn") || Type == TEXT("despawn") ||
-        Type == TEXT("patch") || Type == TEXT("reparent")) bSkyboxDirty = bCamerasDirty = true;
+        Type == TEXT("patch") || Type == TEXT("reparent")) bSkyboxDirty = bCamerasDirty = bGroundDirty = true;
 
     bApplyingRemote = true;
     if (Type == TEXT("scene"))
@@ -2915,6 +2919,44 @@ void ULoomaSceneSyncSubsystem::RefreshSkybox()
     }
     if (!SkyboxActor && GetWorld()) SkyboxActor = GetWorld()->SpawnActor<ALoomaSkyboxActor>();
     if (SkyboxActor) SkyboxActor->Apply(Url, Chosen->GetComponents().Skybox);
+}
+
+void ULoomaSceneSyncSubsystem::RefreshGround()
+{
+    // Hidden is read off the actor, which RefreshSkybox has just set from the node and
+    // every node above it: a ground on a hidden object, or under one, is no ground.
+    TArray<FLoomaGroundCandidate> Candidates;
+    for (const auto& Pair : Tracked)
+    {
+        ALoomaSyncedActor* Actor = Pair.Value.Actor.Get();
+        if (!Actor || Actor->IsHidden())
+        {
+            continue;
+        }
+        const FLoomaNodeComponents& Components = Actor->GetComponents();
+        if (Components.bHasTerrain || Components.bHasOcean)
+        {
+            Candidates.Add({Actor->Id, &Components});
+        }
+    }
+    FLoomaGround Ground;
+    ALoomaSyncedActor* Host = LoomaChooseGround(Candidates, Ground) ? FindSyncedActor(Ground.NodeId) : nullptr;
+    if (!Host)
+    {
+        if (TerrainActor)
+        {
+            TerrainActor->Clear();
+        }
+        return;
+    }
+    if (!TerrainActor && Host->GetWorld())
+    {
+        TerrainActor = Host->GetWorld()->SpawnActor<ALoomaTerrainActor>();
+    }
+    if (TerrainActor)
+    {
+        TerrainActor->Show(Ground, Host, GetRestBase());
+    }
 }
 
 void ULoomaSceneSyncSubsystem::HandleScene(const TSharedPtr<FJsonObject>& Msg)
@@ -3701,7 +3743,7 @@ void ULoomaSceneSyncSubsystem::OnSyncedActorDestroyed(AActor* DestroyedActor)
         return;
     }
     const bool bWasTracked = Tracked.Remove(Actor->Id) > 0;
-    bSkyboxDirty = bCamerasDirty = true;
+    bSkyboxDirty = bCamerasDirty = bGroundDirty = true;
     MarkBordersDirty();
     if (bWasTracked && !bApplyingRemote)
     {
@@ -3746,6 +3788,11 @@ void ULoomaSceneSyncSubsystem::Tick(float DeltaTime)
     // remote border on a node we had just taken.
     TickBorders();
     if (bSkyboxDirty) { bSkyboxDirty = false; RefreshSkybox(); }
+    // After the skybox for the same reason as the looks below: it reads the hidden flags.
+    // Its tick runs whatever the socket is doing, so a fetch retry and the collision
+    // still come due while a reconnect is backing off.
+    if (bGroundDirty) { bGroundDirty = false; RefreshGround(); }
+    if (TerrainActor) TerrainActor->TickTerrain(DeltaTime);
     // After the skybox, whose pass is the one that sets each node's hidden flag, which
     // the looks read. Then the drivers, every frame and whatever the socket is doing:
     // a carriage runs on the hub's clock, and the clock keeps its last offset while
