@@ -105,6 +105,8 @@ public:
     int32 GetN() const { return N; }
     float GetSize() const { return Size; }
     float GetBase() const { return Base; }
+    /** Decoded heights in row-major order, columns along wire +X and rows along +Z. */
+    TArrayView<const float> GetHeights() const { return Heights; }
     /** Wire metres between neighbouring heights. */
     float GetSpacing() const { return N > 1 ? Size / static_cast<float>(N - 1) : 0.0f; }
     /** Wire x (or z) of height column (or row) `Index`, from the host. */

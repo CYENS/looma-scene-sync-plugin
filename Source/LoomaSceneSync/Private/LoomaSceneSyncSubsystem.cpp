@@ -23,6 +23,7 @@
 #include "LoomaGenerationHandle.h"
 #include "LoomaGenerationTypes.h"
 #include "LoomaGlbCache.h"
+#include "LoomaOceanActor.h"
 #include "LoomaSceneComponents.h"
 #include "LoomaSkyboxActor.h"
 #include "LoomaTerrain.h"
@@ -395,6 +396,8 @@ void ULoomaSceneSyncSubsystem::Deinitialize()
     Tracked.Empty();
     if (SkyboxActor) SkyboxActor->Destroy();
     SkyboxActor = nullptr;
+    if (IsValid(OceanActor)) OceanActor->Destroy();
+    OceanActor = nullptr;
     if (TerrainActor) TerrainActor->Destroy();
     TerrainActor = nullptr;
     if (LookVolume) LookVolume->Destroy();
@@ -2941,22 +2944,66 @@ void ULoomaSceneSyncSubsystem::RefreshGround()
     }
     FLoomaGround Ground;
     ALoomaSyncedActor* Host = LoomaChooseGround(Candidates, Ground) ? FindSyncedActor(Ground.NodeId) : nullptr;
+    if (IsValid(OceanActor) && Host && OceanActor->GetWorld() != Host->GetWorld())
+    {
+        OceanActor->Destroy();
+        OceanActor = nullptr;
+    }
+    if (IsValid(TerrainActor) && Host && TerrainActor->GetWorld() != Host->GetWorld())
+    {
+        TerrainActor->Destroy();
+        TerrainActor = nullptr;
+    }
     if (!Host)
     {
-        if (TerrainActor)
+        if (IsValid(TerrainActor))
         {
             TerrainActor->Clear();
         }
+        if (IsValid(OceanActor)) OceanActor->Clear();
         return;
     }
-    if (!TerrainActor && Host->GetWorld())
+    UWorld* World = Host->GetWorld();
+    if (!IsValid(TerrainActor) && World)
     {
-        TerrainActor = Host->GetWorld()->SpawnActor<ALoomaTerrainActor>();
+        TerrainActor = World->SpawnActor<ALoomaTerrainActor>();
     }
-    if (TerrainActor)
+    if (IsValid(TerrainActor))
     {
         TerrainActor->Show(Ground, Host, GetRestBase());
     }
+    if (Ground.bOcean && World && IsValid(TerrainActor))
+    {
+        if (!IsValid(OceanActor)) OceanActor = World->SpawnActor<ALoomaOceanActor>();
+        if (IsValid(OceanActor)) OceanActor->Show(*Host, Host->GetComponents().Ocean);
+    }
+    else if (IsValid(OceanActor))
+    {
+        OceanActor->Clear();
+    }
+}
+
+void ULoomaSceneSyncSubsystem::TickOcean()
+{
+    if (!IsValid(OceanActor))
+    {
+        return;
+    }
+    if (!IsValid(TerrainActor))
+    {
+        OceanActor->Clear();
+        return;
+    }
+
+    FVector ViewLocation = TerrainActor->GetActorLocation();
+    const UGameInstance* GameInstance = GetGameInstance();
+    const APlayerController* Player = GameInstance ? GameInstance->GetFirstLocalPlayerController() : nullptr;
+    if (Player && Player->GetWorld() == OceanActor->GetWorld())
+    {
+        FRotator ViewRotation;
+        Player->GetPlayerViewPoint(ViewLocation, ViewRotation);
+    }
+    OceanActor->UpdateSurface(*TerrainActor, ViewLocation);
 }
 
 void ULoomaSceneSyncSubsystem::HandleScene(const TSharedPtr<FJsonObject>& Msg)
@@ -3792,7 +3839,7 @@ void ULoomaSceneSyncSubsystem::Tick(float DeltaTime)
     // Its tick runs whatever the socket is doing, so a fetch retry and the collision
     // still come due while a reconnect is backing off.
     if (bGroundDirty) { bGroundDirty = false; RefreshGround(); }
-    if (TerrainActor) TerrainActor->TickTerrain(DeltaTime);
+    if (IsValid(TerrainActor)) TerrainActor->TickTerrain(DeltaTime);
     // After the skybox, whose pass is the one that sets each node's hidden flag, which
     // the looks read. Then the drivers, every frame and whatever the socket is doing:
     // a carriage runs on the hub's clock, and the clock keeps its last offset while
@@ -3802,6 +3849,7 @@ void ULoomaSceneSyncSubsystem::Tick(float DeltaTime)
     TickDrivers();
     TickView();
     TickSkyAngle();
+    TickOcean();
 
     if (ReconnectCooldown > 0.0f)
     {

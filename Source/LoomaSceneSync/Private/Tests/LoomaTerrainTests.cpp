@@ -8,7 +8,10 @@
 
 #include "Dom/JsonValue.h"
 #include "Engine/GameInstance.h"
+#include "Engine/Texture2D.h"
 #include "Engine/World.h"
+#include "LoomaOceanActor.h"
+#include "Materials/MaterialInstanceDynamic.h"
 #include "Misc/AutomationTest.h"
 #include "ProceduralMeshComponent.h"
 #include "Serialization/JsonReader.h"
@@ -384,6 +387,7 @@ struct FLoomaTerrainTestAccess
     {
         Sync->Tracked.Reset();
         Sync->TerrainActor = nullptr;
+        Sync->OceanActor = nullptr;
         World->DestroyWorld(false);
     }
 
@@ -405,15 +409,100 @@ struct FLoomaTerrainTestAccess
         Sync->OnRawMessage(FString::Printf(TEXT(R"({"type":"patch","nodes":[{"id":"%s","components":%s}]})"), Id, *Components));
     }
 
-    /** What the subsystem's Tick does for the ground. */
+    /** What the subsystem's Tick does for the ground and Ocean. */
     void Frame()
     {
         Sync->RefreshSkybox();
         Sync->RefreshGround();
+        Sync->TickOcean();
     }
 
     ALoomaTerrainActor* Terrain() const { return Sync->GetTerrainActor(); }
+    ALoomaOceanActor* Ocean() const { return Sync->OceanActor.Get(); }
+    const AActor* OceanHost() const { return Ocean()->OceanHost.Get(); }
+    const UProceduralMeshComponent* OceanMesh() const { return Ocean()->Mesh.Get(); }
+    UMaterialInstanceDynamic* OceanSurface() const { return Ocean()->Surface.Get(); }
+    const UTexture2D* OceanFloor() const { return Ocean()->FloorTexture.Get(); }
+    uint64 OceanFloorRevision() const { return Ocean()->FloorRevision; }
+    void TickOcean() { Sync->TickOcean(); }
+    void Send(const FString& Message) { Sync->OnRawMessage(Message); }
 };
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoomaOceanSceneTest, "Looma.Ocean.Scene",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoomaOceanSceneTest::RunTest(const FString& Parameters)
+{
+    FLoomaTerrainTestAccess Access;
+    ALoomaSyncedActor* Parent = Access.Seed(TEXT("parent"), FTransform(FVector(0, 0, 100)));
+    ALoomaSyncedActor* Sea = Access.Seed(TEXT("sea"), FTransform(FVector(0, 0, 200)));
+    ALoomaSyncedActor* Other = Access.Seed(TEXT("other"), FTransform(FVector(0, 0, 900)));
+    Access.Send(TEXT(R"({"type":"reparent","nodes":[{"id":"sea","parent":"parent"}]})"));
+    Access.Patch(TEXT("sea"), TEXT(R"([{"type":"ocean","priority":5,"wind":0,"swell":0}])"));
+    Access.Patch(TEXT("other"), TEXT(R"([{"type":"ocean","priority":4}])"));
+    Access.Frame();
+
+    ALoomaOceanActor* Ocean = Access.Ocean();
+    if (!TestNotNull(TEXT("the active Ocean creates a water actor"), Ocean)
+        || !TestNotNull(TEXT("the cooked material creates a runtime instance"), Access.OceanSurface()))
+    {
+        return false;
+    }
+    TestTrue(TEXT("the water is shown"), !Access.OceanMesh()->bHiddenInGame);
+    TestEqual(TEXT("one water section"), Access.OceanMesh()->GetNumSections(), 1);
+    TestEqual(TEXT("water is visual only"), Access.OceanMesh()->GetCollisionEnabled(), ECollisionEnabled::NoCollision);
+    TestEqual(TEXT("the mesh uses the water instance"), Access.OceanMesh()->GetMaterial(0),
+        static_cast<UMaterialInterface*>(Access.OceanSurface()));
+    TestEqual(TEXT("the winner also owns the floor"), Access.Terrain()->GetHostId(), FString(TEXT("sea")));
+    TestTrue(TEXT("the water follows the winning host"), Access.OceanHost() == Sea);
+    TestTrue(TEXT("the host is parented"), Sea->GetAttachParentActor() == Parent);
+    TestEqual(TEXT("sea level follows the host's world Z"), Ocean->GetActorLocation().Z, 300.0);
+    TestEqual(TEXT("calm wind"), Access.OceanSurface()->K2_GetVectorParameterValue(TEXT("Wind")).B, 0.0f);
+    TestEqual(TEXT("calm swell"), Access.OceanSurface()->K2_GetVectorParameterValue(TEXT("Wind")).A, 0.0f);
+
+    const double BeforeMove = Ocean->GetActorLocation().Z;
+    Parent->AddActorWorldOffset(FVector(0, 0, 175));
+    Access.TickOcean();
+    TestEqual(TEXT("moving an ancestor updates sea level without a component patch"), Ocean->GetActorLocation().Z, BeforeMove + 175.0);
+
+    const FString CoastId = FakeTileId('c');
+    Access.Patch(TEXT("sea"), FString::Printf(TEXT(R"([{"type":"ocean","priority":5,"wind":10,"windDir":90,"swell":1.25,
+        "floorSize":60,"floor":["%s"]}])"), *CoastId));
+    Access.Frame();
+    TestTrue(TEXT("live edits retain the same renderer"), Access.Ocean() == Ocean);
+    const FLinearColor Wind = Access.OceanSurface()->K2_GetVectorParameterValue(TEXT("Wind"));
+    TestTrue(TEXT("wind settings reach the material in UE axes"), Wind.Equals(FLinearColor(-1, 0, 10, 1.25f)));
+    const uint64 BeforeTile = Access.OceanFloorRevision();
+    const UTexture2D* BeforeTexture = Access.OceanFloor();
+    const TArray<uint8> Coast = EncodeTile([](int32 I, int32) { return I < 32 ? -1.0f : 1.0f; });
+    Access.Terrain()->AddTiles({CoastId}, Coast);
+    Access.TickOcean();
+    TestTrue(TEXT("the water reads the new rendered heights"), Access.OceanFloorRevision() > BeforeTile);
+    TestTrue(TEXT("the same-resolution edit reuses the height texture"), Access.OceanFloor() == BeforeTexture);
+    TestEqual(TEXT("floor texture resolution reaches the material"), Access.OceanSurface()->K2_GetVectorParameterValue(TEXT("Floor")).A, 64.0f);
+    if (TestNotNull(TEXT("a shaped Ocean uploads its terrain field"), Access.OceanFloor()))
+    {
+        TestEqual(TEXT("one tile's heights a side"), Access.OceanFloor()->GetSizeX(), 64);
+    }
+
+    Access.Patch(TEXT("parent"), TEXT(R"([{"type":"hidden"}])"));
+    Access.Frame();
+    TestTrue(TEXT("a hidden ancestor hands the Ocean to the next host"), Access.OceanHost() == Other);
+    Access.Patch(TEXT("parent"), TEXT("[]"));
+    Access.Patch(TEXT("sea"), TEXT(R"([{"type":"ocean","priority":5,"enabled":false}])"));
+    Access.Frame();
+    TestTrue(TEXT("a disabled Ocean also yields"), Access.OceanHost() == Other);
+    Access.Patch(TEXT("other"), TEXT("[]"));
+    Access.Frame();
+    TestTrue(TEXT("removing the last enabled Ocean hides the water"), Access.OceanMesh()->bHiddenInGame);
+    Access.Patch(TEXT("sea"), TEXT(R"([{"type":"ocean"}])"));
+    Access.Frame();
+    TestTrue(TEXT("a new active Ocean reuses the water"), !Access.OceanMesh()->bHiddenInGame);
+    Access.Send(TEXT(R"({"type":"scene","sceneId":"empty","nodes":[]})"));
+    Access.Frame();
+    TestTrue(TEXT("a replacement scene without Ocean hides the water"), Access.OceanMesh()->bHiddenInGame);
+    return true;
+}
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoomaTerrainSceneTest, "Looma.Terrain.Scene",
     EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
