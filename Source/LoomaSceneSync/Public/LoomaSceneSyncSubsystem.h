@@ -6,6 +6,7 @@
 #include "LoomaHubClock.h"
 #include "LoomaPresenceTypes.h"
 #include "LoomaSyncedActor.h"
+#include "LoomaTerrainActor.h"
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "Tickable.h"
 #include "LoomaLivePoseBuffer.h"
@@ -337,6 +338,17 @@ public:
 
     UFUNCTION(BlueprintPure, Category = "Looma")
     bool IsSyncConnected() const;
+
+    // --- Ground (scene-format.md, "The `terrain` component", "The sea floor") ---
+    //
+    // A scene has one ground: an Ocean's floor where an Ocean is switched on, or else
+    // its terrain. It is drawn by one ALoomaTerrainActor, spawned when a scene first
+    // has a ground and kept for the session, and follows sculpting on the web as it
+    // happens: each stroke reaches here as a `patch` naming new tiles.
+
+    /** The actor drawing the scene's ground, or null before any scene has had one. */
+    UFUNCTION(BlueprintPure, Category = "Looma|Terrain")
+    ALoomaTerrainActor* GetTerrainActor() const { return TerrainActor.Get(); }
 
     // --- Cameras (scene-format.md, "Cameras, paths, aims and looks") ---------
     //
@@ -1398,6 +1410,14 @@ private:
     UPROPERTY() TObjectPtr<class ALoomaSkyboxActor> SkyboxActor;
     bool bSkyboxDirty = true;
 
+    /**
+     * After any scene change, and after RefreshSkybox, whose hidden flags it reads:
+     * which node holds the scene's ground, and the ground shown on it.
+     */
+    void RefreshGround();
+    UPROPERTY() TObjectPtr<ALoomaTerrainActor> TerrainActor;
+    bool bGroundDirty = true;
+
     // --- Cameras, paths, aims and looks -----------------------------------------
 
     /** Every tracked node, in document order (Order, then id). */
@@ -1452,6 +1472,7 @@ private:
     // socket or restoring a session. Production callers use the public scene API.
     friend struct FLoomaBorderRefreshTestFixture;
     friend struct FLoomaCameraTestAccess;
+    friend struct FLoomaTerrainTestAccess;
     friend struct FLoomaComponentEnabledTestAccess;
     friend struct FLoomaLivePoseTestAccess;
     friend struct FLoomaAudioTestAccess;
