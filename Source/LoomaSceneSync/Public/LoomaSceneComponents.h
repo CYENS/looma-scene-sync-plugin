@@ -617,6 +617,94 @@ struct FLoomaPostProcessSpec
     bool operator!=(const FLoomaPostProcessSpec& Other) const { return !(*this == Other); }
 };
 
+/**
+ * `terrain`: the ground of a scene with no water, a square of heights centred on the
+ * node (looma-xr-asset-demo docs/scene-format.md, "The `terrain` component"). The
+ * heights themselves are tiles stored on the backend by the hash of their bytes; this
+ * carries only their ids. LoomaTerrain.h says which ground a scene has and how it is
+ * drawn. Defaults and clamps are the web's (frontend/src/scene/terrain/format.js,
+ * `terrainOptions`), which are the hub's (`_clean_terrain`).
+ */
+USTRUCT(BlueprintType)
+struct FLoomaTerrainSpec
+{
+    GENERATED_BODY()
+
+    /** Wire metres across the square, 10…2000. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    float Size = 200.0f;
+
+    /** Height of a null tile, wire metres above the host, −128…127.99. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    float Base = 0.0f;
+
+    /** Tiles a side, 1…16. Tiles has Across² entries. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    int32 Across = 8;
+
+    /**
+     * The tile ids, row by row along wire +z, each row along +x. An empty string is a
+     * null tile, flat at Base. An absent or unreadable list is all null.
+     */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    TArray<FString> Tiles;
+
+    /** Which terrain is the scene's when there are several: higher wins, then the smallest node id. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    float Priority = 0.0f;
+
+    bool operator==(const FLoomaTerrainSpec& Other) const
+    {
+        return FMath::IsNearlyEqual(Size, Other.Size) && FMath::IsNearlyEqual(Base, Other.Base)
+            && Across == Other.Across && Tiles == Other.Tiles && FMath::IsNearlyEqual(Priority, Other.Priority);
+    }
+    bool operator!=(const FLoomaTerrainSpec& Other) const { return !(*this == Other); }
+};
+
+/**
+ * `ocean`, as far as this plugin reads it: the sea floor, which is the scene's ground
+ * wherever an Ocean is switched on (scene-format.md, "The sea floor"). The water, the
+ * wind and the fluid are kept on the node for the other clients and not read here.
+ * Defaults and clamps are the web's (frontend/src/scene/oceanSettings.js).
+ */
+USTRUCT(BlueprintType)
+struct FLoomaOceanSpec
+{
+    GENERATED_BODY()
+
+    /** How far below the resting surface (the host) the unshaped floor lies, wire metres, 1…100. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    float Seabed = 8.0f;
+
+    /** Wire metres across the shaped square of floor, 10…2000. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    float FloorSize = 200.0f;
+
+    /** Tiles a side of the floor, 1…16. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    int32 Across = 8;
+
+    /** The floor's tile ids, as FLoomaTerrainSpec::Tiles, heights relative to the resting surface. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    TArray<FString> Floor;
+
+    /** Whether the floor has been shaped at all. Until it has, it is flat at the seabed. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    bool bShaped = false;
+
+    /** Which ocean is the scene's when there are several, as a terrain's priority. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    float Priority = 0.0f;
+
+    bool operator==(const FLoomaOceanSpec& Other) const
+    {
+        return FMath::IsNearlyEqual(Seabed, Other.Seabed) && FMath::IsNearlyEqual(FloorSize, Other.FloorSize)
+            && Across == Other.Across && Floor == Other.Floor && bShaped == Other.bShaped
+            && FMath::IsNearlyEqual(Priority, Other.Priority);
+    }
+    bool operator!=(const FLoomaOceanSpec& Other) const { return !(*this == Other); }
+};
+
 /** Every component on one node, keyed by type. */
 /** The `source` of a `livelink` component the backend's own Live Link drives (HAM-328, HAM-329). */
 inline constexpr const TCHAR* LoomaLiveLinkHubSource = TEXT("hub");
@@ -702,6 +790,18 @@ struct FLoomaNodeComponents
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
     FLoomaPostProcessSpec PostProcess;
 
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    bool bHasTerrain = false;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    FLoomaTerrainSpec Terrain;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    bool bHasOcean = false;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Looma")
+    FLoomaOceanSpec Ocean;
+
     /**
      * The `livelink` component's subject: the Live Link subject that drives this
      * node, or empty for nobody (HAM-316; docs/rig-format.md, "Who drives a
@@ -740,7 +840,7 @@ struct FLoomaNodeComponents
     bool IsEmpty() const
     {
         return !bHasModel && !bHasMesh && !bHasLight && !bHasAudio && !bHasSkybox && !bHasCamera && !bHasPath
-            && !bHasLookAt && !bHasPostProcess;
+            && !bHasLookAt && !bHasPostProcess && !bHasTerrain && !bHasOcean;
     }
 
     bool operator==(const FLoomaNodeComponents& Other) const
@@ -757,6 +857,8 @@ struct FLoomaNodeComponents
             && bHasPath == Other.bHasPath && (!bHasPath || Path == Other.Path)
             && bHasLookAt == Other.bHasLookAt && (!bHasLookAt || LookAt == Other.LookAt)
             && bHasPostProcess == Other.bHasPostProcess && (!bHasPostProcess || PostProcess == Other.PostProcess)
+            && bHasTerrain == Other.bHasTerrain && (!bHasTerrain || Terrain == Other.Terrain)
+            && bHasOcean == Other.bHasOcean && (!bHasOcean || Ocean == Other.Ocean)
             && LiveLinkSubject == Other.LiveLinkSubject && LiveLinkSource == Other.LiveLinkSource
             && LiveLinkStream == Other.LiveLinkStream;
     }
@@ -776,6 +878,9 @@ LOOMASCENESYNC_API FLoomaNodeComponents LoomaParseComponents(const TArray<TShare
  * Anything else returns `Fallback` — the wire is repaired, never rejected.
  */
 LOOMASCENESYNC_API FLinearColor LoomaParseColor(const FString& Hex, const FLinearColor& Fallback);
+
+/** Whether `Value` names a stored terrain tile: 64 lower-case hex digits, a SHA-256. */
+LOOMASCENESYNC_API bool LoomaIsTerrainTileId(const FString& Value);
 
 /**
  * Build the `model` component a spawn originating in Unreal puts on the wire.
