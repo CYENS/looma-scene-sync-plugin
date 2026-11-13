@@ -1,4 +1,4 @@
-"""Rebuild the animated backdrop material in Unreal's Python editor.
+"""Rebuild the synchronized Ocean material in Unreal's Python editor.
 
 UnrealEditor-Cmd <project> -EnablePlugins=PythonScriptPlugin -run=pythonscript
   -script=<this file> -SCCProvider=None -unattended -NullRHI -NoAudio
@@ -17,7 +17,7 @@ assert material
 material.set_editor_property("shading_model", unreal.MaterialShadingModel.MSM_DEFAULT_LIT)
 material.set_editor_property("blend_mode", unreal.BlendMode.BLEND_MASKED)
 material.set_editor_property("tangent_space_normal", False)
-material.set_editor_property("max_world_position_offset_displacement", 200.0)
+material.set_editor_property("max_world_position_offset_displacement", 400.0)
 
 
 def expression(kind):
@@ -58,14 +58,20 @@ def connect(node, prop):
 position = expression(unreal.MaterialExpressionWorldPosition)
 position.set_editor_property("world_position_shader_offset", unreal.WorldPositionIncludedOffsets.WPT_EXCLUDE_ALL_SHADER_OFFSETS)
 camera = expression(unreal.MaterialExpressionCameraVectorWS)
-time = expression(unreal.MaterialExpressionTime)
 wind = vector("Wind", (-0.883, -0.469, 5.0, 0.4))
 sea = vector("Sea", (8.0, 0.9, 0.0, 0.0))
 floor = vector("Floor", (0.0, 0.0, 0.0, 0.0))
-heights = expression(unreal.MaterialExpressionTextureObjectParameter)
-heights.set_editor_property("parameter_name", "FloorHeights")
-heights.set_editor_property("texture", unreal.load_asset("/Engine/EngineResources/Black"))
-heights.set_editor_property("sampler_type", unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR)
+
+
+def texture(name):
+    node = expression(unreal.MaterialExpressionTextureObjectParameter)
+    node.set_editor_property("parameter_name", name)
+    node.set_editor_property("texture", unreal.load_asset("/Engine/EngineResources/Black"))
+    node.set_editor_property("sampler_type", unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR)
+    return node
+
+
+heights = texture("FloorHeights")
 
 # The grid samples the same heightfield as the terrain. World XY in centimetres
 # becomes wire (X, Z) in metres, and the outer height samples are at texel centres.
@@ -78,46 +84,62 @@ depth = custom("Depth above the synced floor", [("World", position), ("Sea", sea
     return -Texture2DSampleLevel(Heights, HeightsSampler, uv, 0).r;
 """, unreal.CustomMaterialOutputType.CMOT_FLOAT1)
 
-# Three waves give displacement and analytic slopes from the same phases. Only
-# the nearby grid is dense enough to displace. Pixel slopes retain longer waves
-# past that range, and drop their fine detail before it becomes subpixel noise.
-waves_code = """
-    float2 p = World.xy * 0.01;
-    float2 crossWind = float2(-Wind.y, Wind.x);
-    float2 oblique = normalize(Wind.xy * 0.89 + crossWind * 0.46);
-    float2 swellDir = normalize(Wind.xy * 0.92 - crossWind * 0.39);
-    float3 k = float3(0.46, 1.09, 0.22);
-    float3 phase = k * float3(dot(p, Wind.xy), dot(p, oblique), dot(p, swellDir))
-        - Seconds * float3(2.12, 3.27, 1.47);
-    float3 amplitude = float3(Wind.z * 0.028, Wind.z * 0.010, Wind.w * 0.5);
-    amplitude *= smoothstep(0.0, Sea.y, Depth);
-    float distanceToCamera = length(Camera.xy - World.xy) * 0.01;
+# Wave texels hold (Dx, height, Dz) in wire metres. Both paths use the
+# same periodic samples, with different footprints for vertices and pixels.
+spacing = expression(unreal.MaterialExpressionTextureCoordinate)
+wave_inputs = [("World", position), ("Sea", sea), ("Depth", depth)]
+wave_inputs += [(f"Wave{i}", texture(f"Wave{i}")) for i in range(4)]
+lengths = (1103.0, 211.3, 39.7, 7.43)
+wave_coords = """
+    float2 xz = float2(World.y, -World.x) * 0.01;
+    float centre = 0.5 / 128.0;
 """
-wave_inputs = [("World", position), ("Wind", wind), ("Sea", sea), ("Depth", depth), ("Seconds", time),
-               ("Camera", expression(unreal.MaterialExpressionCameraPositionWS))]
-offset = custom("Wave displacement", wave_inputs, waves_code + """
-    float fade = 1.0 - smoothstep(25.0, 100.0, distanceToCamera);
-    return float3(0.0, 0.0, 100.0 * fade * dot(amplitude, sin(phase)));
+geometry = wave_coords + """
+    float3 disp = 0.0;
+"""
+lighting = wave_coords + """
+    float footprint = max(length(ddx(xz)), length(ddy(xz)));
+    float3 dx = 0.0;
+    float3 dz = 0.0;
+"""
+for i, length in enumerate(lengths):
+    geometry += f"""
+    float lod{i} = log2(max(Spacing.x * (128.0 / {length}), 1.0)) + 0.5;
+    disp += Texture2DSampleLevel(Wave{i}, Wave{i}Sampler, xz / {length} + centre, lod{i}).rgb;
+"""
+    lighting += f"""
+    float lod{i} = min(7.0, log2(max(footprint * (128.0 / {length}), 1.0)));
+    float step{i} = exp2(lod{i}) / 128.0;
+    float2 uv{i} = xz / {length} + centre;
+    float2 u{i} = float2(step{i}, 0.0);
+    float2 v{i} = u{i}.yx;
+    float scale{i} = 0.5 / (step{i} * {length});
+    dx += (Texture2DSampleLevel(Wave{i}, Wave{i}Sampler, uv{i} + u{i}, lod{i}).rgb
+         - Texture2DSampleLevel(Wave{i}, Wave{i}Sampler, uv{i} - u{i}, lod{i}).rgb) * scale{i};
+    dz += (Texture2DSampleLevel(Wave{i}, Wave{i}Sampler, uv{i} + v{i}, lod{i}).rgb
+         - Texture2DSampleLevel(Wave{i}, Wave{i}Sampler, uv{i} - v{i}, lod{i}).rgb) * scale{i};
+"""
+offset = custom("FFT displacement filtered to mesh spacing", wave_inputs + [("Spacing", spacing)], geometry + """
+    disp *= smoothstep(0.0, Sea.y, Depth);
+    return 100.0 * float3(-disp.z, disp.x, disp.y);
 """)
-normal = custom("World-space wave normal", wave_inputs, waves_code + """
-    float3 slope = amplitude * k * cos(phase);
-    slope *= 1.0 - smoothstep(float3(80.0, 40.0, 150.0), float3(360.0, 200.0, 700.0), distanceToCamera);
-    float2 rippleDir = normalize(Wind.xy + 0.68 * crossWind);
-    float ripple = 0.020 * Wind.z * cos(4.8 * dot(p, rippleDir) - 6.86 * Seconds);
-    ripple *= (1.0 - smoothstep(25.0, 100.0, distanceToCamera)) * smoothstep(0.0, Sea.y, Depth);
-    float2 slopeXY = slope.x * Wind.xy + slope.y * oblique + slope.z * swellDir + ripple * rippleDir;
-    return normalize(float3(-slopeXY, 1.0));
+normal = custom("Wave normals filtered to pixel footprint", wave_inputs, lighting + """
+    float shoal = smoothstep(0.0, Sea.y, Depth);
+    float3 tangentX = float3(1.0, 0.0, 0.0) + dx * shoal;
+    float3 tangentZ = float3(0.0, 0.0, 1.0) + dz * shoal;
+    float3 n = normalize(cross(tangentZ, tangentX));
+    if (n.y < 0.0) n = -n;
+    return float3(-n.z, n.x, n.y);
 """)
 color = custom("Shallow colour, surf and sky at grazing angles", [
-    ("World", position), ("Camera", camera), ("Depth", depth), ("Wind", wind), ("Normal", normal), ("Seconds", time)
+    ("Camera", camera), ("Depth", depth), ("Wind", wind), ("Normal", normal), ("Offset", offset)
 ], """
-    float2 p = World.xy * 0.01;
     float3 shallow = float3(0.028, 0.20, 0.16);
     float3 deep = float3(0.008, 0.046, 0.066);
     float3 water = lerp(shallow, deep, smoothstep(0.0, 7.0, Depth));
     float grazing = pow(1.0 - saturate(dot(Camera, Normal)), 5.0);
     water = lerp(water, float3(0.09, 0.17, 0.24), 0.75 * grazing);
-    float wash = 0.5 + 0.5 * sin(1.7 * dot(p, Wind.xy) - 1.6 * Seconds);
+    float wash = saturate(0.5 + Offset.z * 0.04);
     float agitation = saturate(Wind.z * 0.1 + Wind.w);
     float surf = agitation * (1.0 - smoothstep(0.025, 0.10 + 0.16 * wash, Depth));
     return lerp(water, float3(0.28, 0.39, 0.38), surf);

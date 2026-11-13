@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
+#include "LoomaOceanWaves.h"
 #include "LoomaOceanActor.generated.h"
 
 class ALoomaTerrainActor;
@@ -11,7 +12,7 @@ class UProceduralMeshComponent;
 class UTexture2D;
 struct FLoomaOceanSpec;
 
-/** The active Ocean's water surface. Its waves are a local visual effect. */
+/** The active Ocean's water surface. Its waves follow the shared scene clock. */
 UCLASS(NotBlueprintable)
 class ALoomaOceanActor : public AActor
 {
@@ -22,10 +23,11 @@ public:
 
     void Show(AActor& Host, const FLoomaOceanSpec& Spec);
     void Clear();
-    void UpdateSurface(ALoomaTerrainActor& Terrain, const FVector& ViewLocation);
+    void UpdateSurface(ALoomaTerrainActor& Terrain, const FVector& ViewLocation, double HubSeconds);
 
 private:
     void BuildSurface();
+    void UpdateWaveTextures(double HubSeconds);
     void UpdateFloorTexture(const ALoomaTerrainActor& Terrain);
 
     UPROPERTY() TObjectPtr<UProceduralMeshComponent> Mesh;
@@ -33,6 +35,9 @@ private:
     UPROPERTY() TObjectPtr<UMaterialInstanceDynamic> Surface;
     UPROPERTY() TObjectPtr<UTexture2D> FloorTexture;
 
+    UPROPERTY() TArray<TObjectPtr<UTexture2D>> WaveTextures;
+
+    FLoomaOceanWaves Waves;
     TWeakObjectPtr<AActor> OceanHost;
     TWeakObjectPtr<ALoomaTerrainActor> FloorSource;
     uint64 FloorRevision = 0;
