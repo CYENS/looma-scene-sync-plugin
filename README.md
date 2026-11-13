@@ -151,7 +151,7 @@ warning naming the actor. Component edits are not reported outbound yet.
 | `lookAt` | Turns the node's `AimComponent` to face another node; the stored `t` never moves |
 | `postProcess` | One resolved look: a global volume (`APostProcessVolume`, unbound) and each camera's own settings |
 | `terrain` | The scene's ground, drawn by one `ALoomaTerrainActor` on the node, level and unscaled. See *The ground* |
-| `ocean` | Its **floor** only, which is the scene's ground wherever an Ocean is switched on. The water itself is not drawn here |
+| `ocean` | One animated water surface on the active Ocean's node. Its `floor` is the scene's ground. See *The ground* |
 | anything else | **Skipped, with the node kept** — logged once per type. That rule is what lets a new component type ship without a coordinated release across three clients |
 
 **`enabled: false` switches off one component**, leaving its definition on the node
@@ -349,8 +349,12 @@ a character meets the ground without a sculpt stroke cooking on every patch.
 `ALoomaTerrainActor::GetGroundHeight` gives the height under a point as the web interpolates
 it, and `ULoomaSceneSyncSubsystem::GetTerrainActor` finds the actor.
 
-Not drawn yet: the Ocean's water, and the flat seabed beyond the shaped square of an Ocean's
-floor. Sculpting from Unreal is not supported; the ground is the web's to shape.
+**The water** follows the winning Ocean's world height and reads its `wind`, `windDir`, and
+`swell` live. One camera-centered grid uses a world-space wave material, so moving the grid
+keeps crests anchored. The material uses the same decoded heights as the terrain mesh to flatten
+waves in shallows, colour the water near land, and expose raised ground. Off the tiled square it
+uses `seabed` for water depth. `Scripts/create_ocean_material.py` rebuilds `M_LoomaOcean`.
+Wave animation is local to Unreal and serves as a visual backdrop. Sculpting happens in the web editor.
 
 ### Coordinate conventions
 
@@ -966,6 +970,11 @@ node holds the ground, the tile encoding and the heights between samples, the me
 edges, every face up, faces agreeing with their normals, the skirt facing out) and real scene
 patches: a terrain sculpted tile by tile, an Ocean taking the ground over and giving it back, and
 a hidden or switched-off host. Headless, no backend.
+
+`Looma.Ocean.Scene` checks that the water and floor follow the same active Ocean, live settings
+and height changes reach the renderer, new terrain tiles reach its height texture, and a scene
+change clears the water. It also checks the mesh and its packaged material reference. Headless,
+no backend.
 
 `Looma.Terrain.Live` follows a change made elsewhere, against a real backend. It plays in a
 blank map, opens a scene, waits for its ground, logs `LOOMA_TERRAIN_READY`, then waits for the
